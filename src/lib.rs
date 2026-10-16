@@ -36,6 +36,7 @@ pub mod ratchet_tagset;
 pub mod router_context;
 pub mod router_info;
 pub mod router_info_address;
+pub mod short_tunnel_build;
 pub mod signature;
 pub mod siphash;
 pub mod tag;
@@ -81,6 +82,7 @@ pub use router_info::{
     Congestion, MAX_RI_BUFFER_SIZE, RouterInfo, RouterInfoCaps, extract_param, extract_string,
 };
 pub use router_info_address::{I2PAddress, Introducer, SsuExt, TransportStyle};
+pub use short_tunnel_build::{SHORT_TUNNEL_BUILD_HEADER_SIZE, ShortTunnelBuildBody};
 pub use signature::{CryptoKeyType, SigningKeyType};
 pub use tag::{I2PAesKey, I2PTag, IdentHash, SessionTag};
 pub use tunnel_build_record::{
