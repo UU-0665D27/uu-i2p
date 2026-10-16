@@ -21,6 +21,7 @@
 //!   маршрутизации в роутере; на уровне wire-формата его нет.
 
 use crate::{
+    data_message::DataBody,
     database_lookup::DatabaseLookup,
     database_search_reply::DatabaseSearchReply,
     database_store::DatabaseStore,
@@ -29,6 +30,9 @@ use crate::{
     garlic_body::GarlicBody,
     hash::I2PHash,
     i2np::{I2NP_HEADER_SIZE, I2npHeader, I2npMessageType},
+    short_tunnel_build::ShortTunnelBuildBody,
+    tunnel_messages::{TunnelDataBody, TunnelGatewayBody, TunnelTestBody},
+    variable_tunnel_build::VariableTunnelBuildBody,
 };
 
 /// I2NP-сообщение: заголовок + payload.
@@ -250,8 +254,9 @@ impl I2npMessage {
 /// соответствующий вариант. Для остальных — [`Self::Raw`] с сырым
 /// payload'ом, который caller может разобрать сам или проигнорировать.
 ///
-/// Список typed-вариантов будет расти по мере добавления парсеров
-/// для `DatabaseSearchReply`, `DeliveryStatus`, `Garlic`, ...
+/// Typed-парсеры есть для всех актуальных типов. Без парсера остаются
+/// только устаревшие `TunnelBuild` (21) и `TunnelBuildReply` (22)
+/// с ElGamal-записями.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum I2npBody {
     /// `DatabaseStore` (type=1): RI или `LeaseSet`.
@@ -271,7 +276,24 @@ pub enum I2npBody {
     /// диспетчеризация — по session-tag. Этот вариант хранит
     /// только сырые байты с wire.
     Garlic(GarlicBody),
-    /// Тип без typed-парсера. Payload сохраняется как есть.
+    /// `TunnelData` (type=18): зашифрованное tunnel-сообщение.
+    TunnelData(TunnelDataBody),
+    /// `TunnelGateway` (type=19): сообщение для gateway'я туннеля.
+    TunnelGateway(TunnelGatewayBody),
+    /// `Data` (type=20): длина и непрозрачные данные.
+    Data(DataBody),
+    /// `VariableTunnelBuild` (type=23): записи по 528 байт.
+    VariableTunnelBuild(VariableTunnelBuildBody),
+    /// `VariableTunnelBuildReply` (type=24): ответ на предыдущий.
+    VariableTunnelBuildReply(VariableTunnelBuildBody),
+    /// `ShortTunnelBuild` (type=25): записи по 218 байт.
+    ShortTunnelBuild(ShortTunnelBuildBody),
+    /// `ShortTunnelBuildReply` (type=26): ответ на предыдущий.
+    ShortTunnelBuildReply(ShortTunnelBuildBody),
+    /// `TunnelTest` (type=231): проверка туннеля.
+    TunnelTest(TunnelTestBody),
+    /// Тип без typed-парсера (в частности, устаревшие
+    /// `TunnelBuild` / `TunnelBuildReply` с ElGamal-записями). Payload сохраняется как есть.
     Raw {
         /// Тип исходного I2NP-сообщения.
         type_id: I2npMessageType,
@@ -290,6 +312,14 @@ impl I2npBody {
             Self::DatabaseSearchReply(_) => I2npMessageType::DatabaseSearchReply,
             Self::DeliveryStatus(_) => I2npMessageType::DeliveryStatus,
             Self::Garlic(_) => I2npMessageType::Garlic,
+            Self::TunnelData(_) => I2npMessageType::TunnelData,
+            Self::TunnelGateway(_) => I2npMessageType::TunnelGateway,
+            Self::Data(_) => I2npMessageType::Data,
+            Self::VariableTunnelBuild(_) => I2npMessageType::VariableTunnelBuild,
+            Self::VariableTunnelBuildReply(_) => I2npMessageType::VariableTunnelBuildReply,
+            Self::ShortTunnelBuild(_) => I2npMessageType::ShortTunnelBuild,
+            Self::ShortTunnelBuildReply(_) => I2npMessageType::ShortTunnelBuildReply,
+            Self::TunnelTest(_) => I2npMessageType::TunnelTest,
             Self::Raw { type_id, .. } => *type_id,
         }
     }
@@ -307,6 +337,12 @@ impl I2npBody {
             Self::DatabaseSearchReply(b) => b.to_buffer(),
             Self::DeliveryStatus(b) => Ok(b.to_buffer().to_vec()),
             Self::Garlic(b) => b.to_buffer(),
+            Self::TunnelData(b) => Ok(b.to_buffer()),
+            Self::TunnelGateway(b) => b.to_buffer(),
+            Self::Data(b) => b.to_buffer(),
+            Self::VariableTunnelBuild(b) | Self::VariableTunnelBuildReply(b) => b.to_buffer(),
+            Self::ShortTunnelBuild(b) | Self::ShortTunnelBuildReply(b) => b.to_buffer(),
+            Self::TunnelTest(b) => Ok(b.to_buffer().to_vec()),
             Self::Raw { payload, .. } => Ok(payload.clone()),
         }
     }
@@ -327,6 +363,12 @@ impl I2npBody {
             Self::DatabaseSearchReply(b) => b.to_buffer(),
             Self::DeliveryStatus(b) => Ok(b.to_buffer().to_vec()),
             Self::Garlic(b) => b.to_buffer(),
+            Self::TunnelData(b) => Ok(b.to_buffer()),
+            Self::TunnelGateway(b) => b.to_buffer(),
+            Self::Data(b) => b.to_buffer(),
+            Self::VariableTunnelBuild(b) | Self::VariableTunnelBuildReply(b) => b.to_buffer(),
+            Self::ShortTunnelBuild(b) | Self::ShortTunnelBuildReply(b) => b.to_buffer(),
+            Self::TunnelTest(b) => Ok(b.to_buffer().to_vec()),
             Self::Raw { payload, .. } => Ok(payload),
         }
     }
@@ -362,6 +404,28 @@ impl I2npMessage {
             I2npMessageType::Garlic => {
                 Ok(I2npBody::Garlic(GarlicBody::from_buffer(&self.payload)?))
             }
+            I2npMessageType::TunnelData => Ok(I2npBody::TunnelData(TunnelDataBody::from_buffer(
+                &self.payload,
+            )?)),
+            I2npMessageType::TunnelGateway => Ok(I2npBody::TunnelGateway(
+                TunnelGatewayBody::from_buffer(&self.payload)?,
+            )),
+            I2npMessageType::Data => Ok(I2npBody::Data(DataBody::from_buffer(&self.payload)?)),
+            I2npMessageType::VariableTunnelBuild => Ok(I2npBody::VariableTunnelBuild(
+                VariableTunnelBuildBody::from_buffer(&self.payload)?,
+            )),
+            I2npMessageType::VariableTunnelBuildReply => Ok(I2npBody::VariableTunnelBuildReply(
+                VariableTunnelBuildBody::from_buffer(&self.payload)?,
+            )),
+            I2npMessageType::ShortTunnelBuild => Ok(I2npBody::ShortTunnelBuild(
+                ShortTunnelBuildBody::from_buffer(&self.payload)?,
+            )),
+            I2npMessageType::ShortTunnelBuildReply => Ok(I2npBody::ShortTunnelBuildReply(
+                ShortTunnelBuildBody::from_buffer(&self.payload)?,
+            )),
+            I2npMessageType::TunnelTest => Ok(I2npBody::TunnelTest(TunnelTestBody::from_buffer(
+                &self.payload,
+            )?)),
             other => Ok(I2npBody::Raw {
                 type_id: other,
                 payload: self.payload,

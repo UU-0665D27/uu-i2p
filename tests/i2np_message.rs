@@ -262,16 +262,16 @@ mod tests {
 
     #[test]
     fn body_raw_preserves_unknown_type() {
-        // TunnelData (type 18) — нет typed-парсера
+        // TunnelBuild (type 21, устаревший ElGamal) — нет typed-парсера
         let payload = vec![0x01_u8, 0x02, 0x03];
-        let msg = I2npMessage::new(I2npMessageType::TunnelData, payload.clone());
+        let msg = I2npMessage::new(I2npMessageType::TunnelBuild, payload.clone());
         let body = msg.parse_body().unwrap();
         match body {
             I2npBody::Raw {
                 type_id,
                 payload: p,
             } => {
-                assert_eq!(type_id, I2npMessageType::TunnelData);
+                assert_eq!(type_id, I2npMessageType::TunnelBuild);
                 assert_eq!(p, payload);
             }
             other => panic!("expected Raw, got {other:?}"),
@@ -532,5 +532,139 @@ mod tests {
         buf[0] = 0xFF;
         let r = I2npMessage::from_ntcp2_bytes(&buf);
         assert_eq!(r, Err(I2PError::UnknownI2npType(0xFF)));
+    }
+
+    // ---- typed tunnel bodies -------------------------------------------
+
+    fn roundtrip_body(body: &I2npBody, ty: I2npMessageType) {
+        assert_eq!(body.message_type(), ty);
+        let msg = I2npMessage::from_body(body.clone()).unwrap();
+        assert_eq!(msg.message_type(), ty);
+        // через wire целиком
+        let wire = msg.to_buffer().unwrap();
+        let parsed = I2npMessage::from_buffer(&wire)
+            .unwrap()
+            .parse_body()
+            .unwrap();
+        assert_eq!(&parsed, body);
+        // to_payload == into_payload
+        assert_eq!(
+            body.to_payload().unwrap(),
+            body.clone().into_payload().unwrap()
+        );
+    }
+
+    #[test]
+    fn body_tunnel_data_roundtrip() {
+        let b = uu_i2p::TunnelDataBody {
+            tunnel_id: 5,
+            iv: [1; 16],
+            encrypted: Box::new([2; 1008]),
+        };
+        roundtrip_body(&I2npBody::TunnelData(b), I2npMessageType::TunnelData);
+    }
+
+    #[test]
+    fn body_tunnel_gateway_roundtrip() {
+        let b = uu_i2p::TunnelGatewayBody {
+            tunnel_id: 9,
+            data: vec![1, 2, 3, 4],
+        };
+        roundtrip_body(&I2npBody::TunnelGateway(b), I2npMessageType::TunnelGateway);
+    }
+
+    #[test]
+    fn body_data_roundtrip() {
+        let b = uu_i2p::DataBody { data: vec![7; 20] };
+        roundtrip_body(&I2npBody::Data(b), I2npMessageType::Data);
+    }
+
+    #[test]
+    fn body_tunnel_test_roundtrip() {
+        let b = uu_i2p::TunnelTestBody {
+            msg_id: 1,
+            timestamp: 2,
+        };
+        roundtrip_body(&I2npBody::TunnelTest(b), I2npMessageType::TunnelTest);
+    }
+
+    #[test]
+    fn body_short_tunnel_build_and_reply_roundtrip() {
+        let rec = uu_i2p::EncryptedShortRecord {
+            to_peer: [1; 16],
+            ephemeral_key: [2; 32],
+            ciphertext: [3; 170],
+        };
+        let b = uu_i2p::ShortTunnelBuildBody::new(vec![rec.clone(), rec]).unwrap();
+        roundtrip_body(
+            &I2npBody::ShortTunnelBuild(b.clone()),
+            I2npMessageType::ShortTunnelBuild,
+        );
+        roundtrip_body(
+            &I2npBody::ShortTunnelBuildReply(b),
+            I2npMessageType::ShortTunnelBuildReply,
+        );
+    }
+
+    #[test]
+    fn body_variable_tunnel_build_and_reply_roundtrip() {
+        let rec = uu_i2p::EncryptedLongRecord {
+            to_peer: [1; 16],
+            ephemeral_key: [2; 32],
+            ciphertext: [3; 480],
+        };
+        let b = uu_i2p::VariableTunnelBuildBody::new(vec![rec]).unwrap();
+        roundtrip_body(
+            &I2npBody::VariableTunnelBuild(b.clone()),
+            I2npMessageType::VariableTunnelBuild,
+        );
+        roundtrip_body(
+            &I2npBody::VariableTunnelBuildReply(b),
+            I2npMessageType::VariableTunnelBuildReply,
+        );
+    }
+
+    #[test]
+    fn parse_body_malformed_tunnel_types_fail() {
+        for ty in [
+            I2npMessageType::TunnelData,
+            I2npMessageType::TunnelGateway,
+            I2npMessageType::Data,
+            I2npMessageType::TunnelTest,
+            I2npMessageType::ShortTunnelBuild,
+            I2npMessageType::ShortTunnelBuildReply,
+            I2npMessageType::VariableTunnelBuild,
+            I2npMessageType::VariableTunnelBuildReply,
+        ] {
+            let msg = I2npMessage::new(ty, vec![]);
+            assert!(msg.parse_body().is_err(), "{ty:?} with empty payload");
+        }
+    }
+
+    #[test]
+    fn legacy_tunnel_build_stays_raw() {
+        for ty in [
+            I2npMessageType::TunnelBuild,
+            I2npMessageType::TunnelBuildReply,
+        ] {
+            let msg = I2npMessage::new(ty, vec![1, 2, 3]);
+            assert!(matches!(msg.parse_body().unwrap(), I2npBody::Raw { .. }));
+        }
+    }
+
+    #[test]
+    fn nested_gateway_carries_full_i2np_message() {
+        // TunnelGateway.data — I2NP-сообщение целиком (заголовок + payload)
+        let inner = I2npMessage::new(I2npMessageType::DeliveryStatus, vec![0; 12]);
+        let gw = uu_i2p::TunnelGatewayBody {
+            tunnel_id: 42,
+            data: inner.to_buffer().unwrap(),
+        };
+        let outer = I2npMessage::from_body(I2npBody::TunnelGateway(gw)).unwrap();
+        let I2npBody::TunnelGateway(parsed) = outer.parse_body().unwrap() else {
+            panic!("expected TunnelGateway");
+        };
+        let inner_back = I2npMessage::from_buffer(&parsed.data).unwrap();
+        assert_eq!(inner_back, inner);
     }
 }
