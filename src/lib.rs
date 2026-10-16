@@ -41,6 +41,7 @@ pub mod siphash;
 pub mod tag;
 pub mod timestamp;
 pub mod tunnel_build_record;
+pub mod tunnel_config;
 
 pub use config::{
     DEFAULT_NET_ID, DEFAULT_VERSION, ListenEndpoint, RouterConfig, RouterConfigBuilder,
