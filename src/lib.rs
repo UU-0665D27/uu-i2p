@@ -88,6 +88,7 @@ pub use tunnel_build_record::{
     SHORT_REQUEST_RECORD_CLEAR_TEXT_SIZE, SHORT_RESPONSE_PLAINTEXT_SIZE,
     SHORT_TUNNEL_BUILD_RECORD_SIZE, ShortBuildRequestRecord, ShortBuildResponseRecord,
 };
+pub use tunnel_config::{TunnelConfig, TunnelHopConfig};
 
 /// Версия библиотеки.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
