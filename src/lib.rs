@@ -40,6 +40,7 @@ pub mod signature;
 pub mod siphash;
 pub mod tag;
 pub mod timestamp;
+pub mod tunnel_build_record;
 
 pub use config::{
     DEFAULT_NET_ID, DEFAULT_VERSION, ListenEndpoint, RouterConfig, RouterConfigBuilder,
@@ -81,6 +82,11 @@ pub use router_info::{
 pub use router_info_address::{I2PAddress, Introducer, SsuExt, TransportStyle};
 pub use signature::{CryptoKeyType, SigningKeyType};
 pub use tag::{I2PAesKey, I2PTag, IdentHash, SessionTag};
+pub use tunnel_build_record::{
+    BuildOptions, BuildRetCode, EncryptedShortRecord, NUM_TUNNEL_BUILD_RECORDS,
+    SHORT_REQUEST_RECORD_CLEAR_TEXT_SIZE, SHORT_RESPONSE_PLAINTEXT_SIZE,
+    SHORT_TUNNEL_BUILD_RECORD_SIZE, ShortBuildRequestRecord, ShortBuildResponseRecord,
+};
 
 /// Версия библиотеки.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
