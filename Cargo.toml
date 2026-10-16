@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 #anyhow = "1.0.104"
-rand = "0.8"
+rand = "0.10"
 sha2 = "0.11.1"
 tokio = { version = "1.53.3", features = ["full"] }
 
@@ -15,13 +15,13 @@ chacha20poly1305 = "0.11"
 hkdf = "0.13"
 x25519-dalek = { version = "3", features = ["static_secrets", "getrandom"] }
 zeroize = "1"
-ed25519-dalek = "2"
-p256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = "3"
+p256 = { version = "0.14", features = ["ecdsa"] }
 # RustCrypto: AES-256-CBC для NTCP2 handshake и tunnels
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
 
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 
 
