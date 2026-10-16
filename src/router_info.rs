@@ -116,7 +116,7 @@ impl RouterInfoCaps {
         for &c in s {
             match c {
                 b'f' => bits |= ri_caps::FLOODFILL,
-                b'K' | b'L' | b'M' | b'N' => bandwidth_cap = Some(c),
+                b'K'..=b'N' => bandwidth_cap = Some(c),
                 b'O' => {
                     bits |= ri_caps::HIGH_BANDWIDTH;
                     bandwidth_cap = Some(c);
