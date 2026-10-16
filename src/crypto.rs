@@ -32,7 +32,7 @@ use cbc::cipher::block_padding::NoPadding;
 // его анонимно один раз — метод-резолюция сама найдёт impl.
 use cbc::cipher::KeyIvInit as _;
 use chacha20::ChaCha20 as ChaCha20Raw;
-use chacha20::cipher::StreamCipher;
+use chacha20::cipher::{StreamCipher, StreamCipherSeek as _};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305 as ChaCha20Poly1305Raw, Key, Nonce};
 use hkdf::Hkdf;
@@ -60,6 +60,20 @@ pub fn chacha20(key: &[u8; 32], nonce: &[u8; 12], data: &mut [u8]) {
     // nonce с counter=1. Мы принимаем nonce как есть — caller
     // сам решает, какой counter внутри.
     let mut cipher = ChaCha20Raw::new(key.into(), nonce.into());
+    cipher.apply_keystream(data);
+}
+
+/// `ChaCha20` с начальным счётчиком **1** — как `ChaCha20()` в i2pd.
+///
+/// i2pd кладёт в IV `htole32(1) || nonce`, т.е. keystream начинается
+/// со второго блока. [`chacha20`] начинает с блока 0, поэтому для
+/// совместимости с i2pd (tunnel build reply layers и т.п.) нужна
+/// именно эта функция. Шифрование и расшифровка — одна и та же
+/// операция (XOR).
+pub fn chacha20_counter1(key: &[u8; 32], nonce: &[u8; 12], data: &mut [u8]) {
+    let mut cipher = ChaCha20Raw::new(key.into(), nonce.into());
+    // 64 байта = один блок ChaCha20, т.е. counter = 1
+    cipher.seek(64_u32);
     cipher.apply_keystream(data);
 }
 
@@ -509,4 +523,21 @@ pub fn init_noise_ik_state(state: &mut NoiseSymmetricState, pub_key: &[u8; 32]) 
         0x3b, 0x5c,
     ];
     *state = NoiseSymmetricState::new(&PROTOCOL_NAME_HASH, &HH, pub_key);
+}
+
+/// Инициализирует [`NoiseSymmetricState`] для протокола
+/// `Noise_N_25519_ChaChaPoly_SHA256` (tunnel build records).
+///
+/// Соответствует `InitNoiseNState` из `Crypto.cpp`. `pub_key` — статический
+/// публичный ключ получателя (хопа).
+pub fn init_noise_n_state(state: &mut NoiseSymmetricState, pub_key: &[u8; 32]) {
+    // "Noise_N_25519_ChaChaPoly_SHA256" (31 символ) + нулевой байт
+    const PROTOCOL_NAME: [u8; 32] = *b"Noise_N_25519_ChaChaPoly_SHA256\0";
+    // SHA256(PROTOCOL_NAME)
+    const HH: [u8; 32] = [
+        0x69, 0x4d, 0x52, 0x44, 0x5a, 0x27, 0xd9, 0xad, 0xfa, 0xd2, 0x9c, 0x76, 0x32, 0x39, 0x5d,
+        0xc1, 0xe4, 0x35, 0x4c, 0x69, 0xb4, 0xf9, 0x2e, 0xac, 0x8a, 0x1e, 0xe4, 0x6a, 0x9e, 0xd2,
+        0x15, 0x54,
+    ];
+    *state = NoiseSymmetricState::new(&PROTOCOL_NAME, &HH, pub_key);
 }
