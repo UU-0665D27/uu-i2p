@@ -141,7 +141,7 @@ impl I2PSigner {
         // `SigningKey::from_bytes` принимает seed, а `rand 0.8`
         // даёт `fill_bytes`. Так мы не тянем `rand_core` отдельно.
         let mut seed = [0u8; PRIVATE_KEY_LEN];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         Self {
             inner: SigningKey::from_bytes(&seed),
         }

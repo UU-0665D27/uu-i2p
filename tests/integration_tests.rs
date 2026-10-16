@@ -21,7 +21,7 @@ mod tests {
 
     #[test]
     fn ident_hash_b64_b32_roundtrip_100x() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for i in 0..100 {
             let h = IdentHash::random(&mut rng);
             assert_eq!(
@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn one_hundred_random_idents_are_unique() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
             assert!(

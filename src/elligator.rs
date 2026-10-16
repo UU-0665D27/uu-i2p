@@ -51,7 +51,7 @@
 
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
-use rand::RngCore;
+use rand::Rng;
 use std::sync::OnceLock;
 
 // --- константы -----------------------------------------------------------
@@ -259,7 +259,7 @@ pub fn encode(key: &[u8; 32], high_y: bool) -> Option<[u8; 32]> {
 /// в i2pd — именно так это используется в
 /// `ECIESX25519AEADRatchetSession::GenerateEphemeralKeysAndEncode`.
 #[must_use]
-pub fn encode_random(key: &[u8; 32], rng: &mut impl RngCore) -> Option<[u8; 32]> {
+pub fn encode_random(key: &[u8; 32], rng: &mut impl Rng) -> Option<[u8; 32]> {
     let rb = (rng.next_u32() & 0xFF) as u8;
     let high_y = rb & 0x01 != 0;
     let mut out = encode(key, high_y)?;

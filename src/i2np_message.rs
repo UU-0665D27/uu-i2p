@@ -57,7 +57,7 @@ impl I2npMessage {
         let size = u16::try_from(payload.len())
             .expect("i2np: payload > 64KB — не должно случаться на уровне I2NP");
         let mut msg_id_bytes = [0u8; 4];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut msg_id_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut msg_id_bytes);
         let msg_id = u32::from_be_bytes(msg_id_bytes);
         let header = I2npHeader::new(message_type, msg_id, size);
         Self { header, payload }

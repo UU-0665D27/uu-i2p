@@ -87,7 +87,7 @@ impl PeerOrdering {
     #[must_use]
     pub fn new() -> Self {
         let mut key = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut key);
         Self {
             key,
             groups: HashMap::new(),

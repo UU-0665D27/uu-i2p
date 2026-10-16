@@ -26,7 +26,7 @@
 //! Больше [`NUM_TUNNEL_BUILD_RECORDS`] хопов — ошибка (в i2pd лимит
 //! проверяется выше по стеку).
 
-use rand::RngCore;
+use rand::Rng;
 
 use crate::error::{I2PError, Result};
 use crate::tag::IdentHash;
@@ -58,7 +58,7 @@ pub struct TunnelHopConfig {
 }
 
 /// Случайный tunnel ID; 0 заменяется на 1 — как в i2pd.
-fn random_tunnel_id(rng: &mut impl RngCore) -> u32 {
+fn random_tunnel_id(rng: &mut impl Rng) -> u32 {
     match rng.next_u32() {
         0 => 1,
         id => id,
@@ -69,7 +69,7 @@ impl TunnelHopConfig {
     /// Новый хоп: одиночный (и gateway, и endpoint), со случайным
     /// `tunnel_id`.
     #[must_use]
-    pub fn new(ident: IdentHash, rng: &mut impl RngCore) -> Self {
+    pub fn new(ident: IdentHash, rng: &mut impl Rng) -> Self {
         Self {
             ident,
             next_ident: IdentHash::from_array([0; 32]),
@@ -86,7 +86,7 @@ impl TunnelHopConfig {
 
     /// Следующий узел вне туннеля: хоп перестаёт быть endpoint, для
     /// него выбирается случайный `next_tunnel_id`.
-    pub fn set_next_ident(&mut self, ident: IdentHash, rng: &mut impl RngCore) {
+    pub fn set_next_ident(&mut self, ident: IdentHash, rng: &mut impl Rng) {
         self.next_ident = ident;
         self.is_endpoint = false;
         self.next_tunnel_id = random_tunnel_id(rng);
@@ -113,11 +113,7 @@ impl TunnelConfig {
     ///
     /// [`I2PError::Malformed`], если `peers` пуст или хопов больше
     /// [`NUM_TUNNEL_BUILD_RECORDS`].
-    pub fn inbound(
-        peers: &[IdentHash],
-        our_ident: IdentHash,
-        rng: &mut impl RngCore,
-    ) -> Result<Self> {
+    pub fn inbound(peers: &[IdentHash], our_ident: IdentHash, rng: &mut impl Rng) -> Result<Self> {
         let mut hops = Self::create_hops(peers, rng)?;
         if let Some(last) = hops.last_mut() {
             last.set_next_ident(our_ident, rng);
@@ -134,7 +130,7 @@ impl TunnelConfig {
         peers: &[IdentHash],
         reply_tunnel_id: u32,
         reply_ident: IdentHash,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> Result<Self> {
         let mut hops = Self::create_hops(peers, rng)?;
         if let Some(first) = hops.first_mut() {
@@ -146,7 +142,7 @@ impl TunnelConfig {
         Ok(Self { hops })
     }
 
-    fn create_hops(peers: &[IdentHash], rng: &mut impl RngCore) -> Result<Vec<TunnelHopConfig>> {
+    fn create_hops(peers: &[IdentHash], rng: &mut impl Rng) -> Result<Vec<TunnelHopConfig>> {
         if peers.is_empty() {
             return Err(I2PError::Malformed("tunnel config: no peers"));
         }

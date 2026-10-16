@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn random_fills_all_bytes() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..100 {
             let t = I2PTag::<32>::random(&mut rng);
             assert!(!t.is_zero(), "rng produced all-zero tag (32 bytes)");
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn random_zero_len_never_panics() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let t = I2PTag::<0>::random(&mut rng);
         assert!(t.is_zero());
     }

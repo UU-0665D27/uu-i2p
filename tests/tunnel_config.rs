@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use core::convert::Infallible;
     use rand::SeedableRng;
+    use rand::TryRng;
     use rand::rngs::StdRng;
-    use rand::{Error, RngCore};
     use uu_i2p::tunnel_build_record::NUM_TUNNEL_BUILD_RECORDS;
     use uu_i2p::tunnel_config::{TunnelConfig, TunnelHopConfig};
     use uu_i2p::{I2PError, IdentHash};
@@ -18,17 +19,18 @@ mod tests {
     /// ГСЧ, всегда возвращающий нули.
     struct ZeroRng;
 
-    impl RngCore for ZeroRng {
-        fn next_u32(&mut self) -> u32 {
-            0
+    impl TryRng for ZeroRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+            Ok(0)
         }
-        fn next_u64(&mut self) -> u64 {
-            0
+
+        fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+            Ok(0)
         }
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
-            dest.fill(0);
-        }
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Infallible> {
             dest.fill(0);
             Ok(())
         }

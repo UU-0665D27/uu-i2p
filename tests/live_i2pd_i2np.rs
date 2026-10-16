@@ -20,7 +20,7 @@
 //!
 //! ```
 
-use rand::RngCore as _;
+use rand::Rng;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{net::TcpStream, time::timeout};
 use tracing::{info, warn};
@@ -80,7 +80,7 @@ async fn send_database_store_and_receive_delivery_status() {
     let our_ntcp2_static = I2PX25519Keys::generate();
     let our_ntcp2_iv: [u8; 16] = {
         let mut iv = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut iv);
+        rand::rng().fill_bytes(&mut iv);
         iv
     };
     let cfg = RouterConfig::builder()

@@ -19,7 +19,7 @@
 //! - `UpdateRouterProfile` (postponed updates) — глобальный стейт,
 //!   ему не место в этом модуле.
 
-use rand::RngCore;
+use rand::Rng;
 
 // --- константы -----------------------------------------------------------
 
@@ -347,7 +347,7 @@ impl RouterProfile {
         &mut self,
         now_s: u64,
         tunnel_creation_success_rate: f64,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> bool {
         if self.is_unreachable(now_s) || self.is_duplicated {
             return true;

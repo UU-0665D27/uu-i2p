@@ -12,7 +12,7 @@ const SEED: [u8; 32] = [0x42u8; 32];
 /// Публичный ключ, соответствующий `SEED`.
 fn family_key() -> FamilyKey {
     let sk = SigningKey::from_slice(&SEED).expect("valid seed");
-    let sec1 = sk.verifying_key().to_encoded_point(false);
+    let sec1 = sk.verifying_key().to_sec1_point(false);
     FamilyKey::from_sec1(sec1.as_bytes()).expect("valid public key")
 }
 const fn ident(seed: u8) -> IdentHash {
@@ -25,14 +25,14 @@ const fn ident(seed: u8) -> IdentHash {
 #[test]
 fn family_key_accepts_uncompressed() {
     let sk = SigningKey::from_slice(&SEED).unwrap();
-    let uncompressed = sk.verifying_key().to_encoded_point(false);
+    let uncompressed = sk.verifying_key().to_sec1_point(false);
     assert!(FamilyKey::from_sec1(uncompressed.as_bytes()).is_ok());
 }
 
 #[test]
 fn family_key_accepts_compressed() {
     let sk = SigningKey::from_slice(&SEED).unwrap();
-    let compressed = sk.verifying_key().to_encoded_point(true);
+    let compressed = sk.verifying_key().to_sec1_point(true);
     assert!(FamilyKey::from_sec1(compressed.as_bytes()).is_ok());
 }
 
@@ -51,7 +51,7 @@ fn family_key_rejects_wrong_length() {
 #[test]
 fn family_key_roundtrips_bytes() {
     let sk = SigningKey::from_slice(&SEED).unwrap();
-    let sec1 = sk.verifying_key().to_encoded_point(false);
+    let sec1 = sk.verifying_key().to_sec1_point(false);
     let fk = FamilyKey::from_sec1(sec1.as_bytes()).unwrap();
     assert_eq!(fk.as_sec1(), sec1.as_bytes());
 }
@@ -188,7 +188,7 @@ fn verify_fails_for_wrong_key() {
     let mut fams = Families::new();
     let wrong_key = {
         let sk = SigningKey::from_slice(&[0xABu8; 32]).unwrap();
-        let sec1 = sk.verifying_key().to_encoded_point(false);
+        let sec1 = sk.verifying_key().to_sec1_point(false);
         FamilyKey::from_sec1(sec1.as_bytes()).unwrap()
     };
     fams.insert("alpha", wrong_key).unwrap();

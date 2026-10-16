@@ -13,7 +13,7 @@
 //!     UU_I2P_LIVE_RI=/tmp/i2pd-debug.ri \
 //!         cargo test --test live_i2pd_ntcp2 -- --ignored --nocapture
 
-use rand::RngCore as _;
+use rand::Rng;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{net::TcpStream, time::timeout};
 use tracing::{info, warn};
@@ -89,7 +89,7 @@ async fn connect_to_live_i2pd_and_receive_router_info() {
     let our_ntcp2_static = I2PX25519Keys::generate();
     let our_ntcp2_iv: [u8; 16] = {
         let mut iv = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut iv);
+        rand::rng().fill_bytes(&mut iv);
         iv
     };
 

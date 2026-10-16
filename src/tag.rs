@@ -9,7 +9,7 @@ use crate::{
     base32, base64,
     error::{I2PError, Result},
 };
-use rand::RngCore;
+use rand::Rng;
 use std::fmt;
 
 /// Массив из ровно `N` байт.
@@ -100,7 +100,7 @@ impl<const N: usize> I2PTag<N> {
 
     /// Заполнить случайными байтами из `rng`.
     #[must_use]
-    pub fn random(rng: &mut impl RngCore) -> Self {
+    pub fn random(rng: &mut impl Rng) -> Self {
         let mut b = [0u8; N];
         rng.fill_bytes(&mut b);
         Self(b)

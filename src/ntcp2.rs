@@ -27,7 +27,10 @@ use crate::{
     router_info_address::I2PAddress,
     siphash::siphash24,
 };
-use rand::{RngCore, SeedableRng};
+use rand::{
+    Rng, SeedableRng,
+    rngs::{StdRng, SysRng},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -1643,7 +1646,7 @@ impl Ntcp2Establisher {
         local_ident_hash: &[u8; 32],
         expected_net_id: u8,
         now_s: u64,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> Result<Vec<u8>> {
         trace!("create_session_created: enter (Bob)");
         // 1. Новый эфемерный ключ Bob'а.
@@ -1995,7 +1998,7 @@ impl Ntcp2Establisher {
         &mut self,
         local_ri_bytes: &[u8],
         net_id: u8,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> Result<Vec<u8>> {
         trace!(
             ri_len = local_ri_bytes.len(),
@@ -2444,7 +2447,8 @@ impl Ntcp2Session {
         //
         //    `StdRng::from_entropy()` вместо `thread_rng()`: future
         //    остаётся Send через `.await`.
-        let mut rng = rand::rngs::StdRng::from_entropy();
+        let mut rng = StdRng::try_from_rng(&mut SysRng)
+            .map_err(|e| I2PError::Io(format!("ntcp2: failed to seed RNG: {e}")))?;
         let req = est.create_session_request(local.ri_bytes, local.net_id, &mut rng)?;
         info!(len = req.len(), "connect: sending SessionRequest");
         write_handshake(&mut stream, &req).await?;
@@ -2524,7 +2528,8 @@ impl Ntcp2Session {
         }
 
         // 2. SessionCreated — голые байты.
-        let mut rng = rand::rngs::StdRng::from_entropy();
+        let mut rng = StdRng::try_from_rng(&mut SysRng)
+            .map_err(|e| I2PError::Io(format!("ntcp2: failed to seed RNG: {e}")))?;
         let created =
             est.create_session_created(&local.ident_hash, local.net_id, now_s, &mut rng)?;
         info!(len = created.len(), "accept: sending SessionCreated");

@@ -3,7 +3,7 @@
 //! `IsBad` детерминированно тестируется через [`SeqRng`] — Rng,
 //! возвращающий заранее заданную последовательность `u32`.
 
-use rand::RngCore;
+use core::convert::Infallible;
 use uu_i2p::profiling::{
     PEER_PROFILE_DECLINED_RECENTLY_INTERVAL, PEER_PROFILE_UNREACHABLE_INTERVAL, RouterProfile,
 };
@@ -29,27 +29,25 @@ impl SeqRng {
     }
 }
 
-impl RngCore for SeqRng {
-    fn next_u32(&mut self) -> u32 {
+impl rand::TryRng for SeqRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
         let v = self.values[self.pos];
         self.pos += 1;
-        v
+        Ok(v)
     }
-    fn next_u64(&mut self) -> u64 {
-        let hi = u64::from(self.next_u32());
-        let lo = u64::from(self.next_u32());
-        (hi << 32) | lo
+
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        let hi = u64::from(self.try_next_u32()?);
+        let lo = u64::from(self.try_next_u32()?);
+        Ok((hi << 32) | lo)
     }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Infallible> {
         for b in dest.iter_mut() {
-            // Младший байт `next_u32()`. Не `as u8` — clippy
-            // справедливо считает такой cast неявным сужением;
-            // `to_le_bytes` делает то же самое явно.
-            *b = self.next_u32().to_le_bytes()[0];
+            *b = self.try_next_u32()?.to_le_bytes()[0];
         }
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }

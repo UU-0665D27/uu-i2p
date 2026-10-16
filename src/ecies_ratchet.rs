@@ -166,7 +166,7 @@ impl RatchetSession {
     /// Elligator-eligible ключа. Вероятность ≈ 2⁻²⁵, на практике
     /// недостижимо, но оставляем ошибкой, а не `panic`.
     fn generate_elligator_ephemeral() -> Result<(I2PX25519Keys, [u8; 32])> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..25 {
             let sk = I2PX25519Keys::generate();
             if let Some(encoded) = elligator::encode_random(sk.public_key(), &mut rng) {
