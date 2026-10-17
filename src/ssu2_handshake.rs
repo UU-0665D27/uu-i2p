@@ -1,4 +1,4 @@
-//! SSU2 — handshake (Noise XK), первые два сообщения.
+//! SSU2 — handshake (Noise XK), три сообщения.
 //!
 //! Слой поверх [`crate::ssu2_header`] и [`crate::ssu2_crypto`]: он связывает
 //! разбор/обфускацию заголовков, крипто-примитивы и блоки payload'а в
@@ -9,11 +9,15 @@
 //! - `SessionRequest` (Alice -> Bob): [`InitiatorHandshake::build_session_request`]
 //!   и [`ResponderHandshake::handle_session_request`];
 //! - `SessionCreated` (Bob -> Alice): [`ResponderHandshake::build_session_created`]
-//!   и [`InitiatorHandshake::handle_session_created`].
+//!   и [`InitiatorHandshake::handle_session_created`];
+//! - `SessionConfirmed` (Alice -> Bob, с фрагментацией на 2 пакета):
+//!   [`InitiatorHandshake::build_session_confirmed`] и
+//!   [`ResponderHandshake::handle_session_confirmed`].
 //!
 //! Функции повторяют i2pd (`SendSessionRequest` / `ProcessSessionRequest` /
-//! `SendSessionCreated` / `ProcessSessionCreated`) с точностью до порядка
-//! `MixHash` / `MixKey` / `Encrypt`.
+//! `SendSessionCreated` / `ProcessSessionCreated` / `SendSessionConfirmed` /
+//! `ProcessSessionConfirmed`) с точностью до порядка `MixHash` / `MixKey` /
+//! `Encrypt`.
 //!
 //! ## Разделение ответственности
 //!
@@ -21,15 +25,22 @@
 //! payload'а: вызывающий передаёт уже собранные блоки (`extra_blocks`), а
 //! `DateTime` и `Padding` добавляются внутри. Решение о размере padding'а
 //! берётся из [`Ssu2Policy`], поэтому handshake параметризован политикой.
+//! `SessionConfirmed` принимает «сырой» `RouterInfo`: блок собирается внутри.
+//!
+//! ## Ключи data phase
+//!
+//! После завершения handshake обе стороны выводят ключи data phase
+//! ([`derive_data_phase_keys`](crate::ssu2_crypto::derive_data_phase_keys)):
+//! Alice — после сборки `SessionConfirmed`, Bob — после его разбора; доступны
+//! через `data_keys()` обоих хэндшейков.
 //!
 //! ## Что дальше
 //!
-//! - TODO(ssu2-scf): `SessionConfirmed` (part 1 + part 2, фрагментация) —
-//!   следующая итерация;
-//! - TODO(ssu2-data-keys): вывод ключей data phase на стороне Bob'а — вместе
-//!   с `SessionConfirmed` (у Alice
-//!   [`derive_data_phase_keys`](crate::ssu2_crypto::derive_data_phase_keys)
-//!   применим уже после `SessionCreated`).
+//! - TODO(ssu2-scf-multifrag): > 2 фрагментов `SessionConfirmed` (i2pd тоже
+//!   ограничен двумя);
+//! - TODO(ssu2-blocks): разбор `RouterInfo` (подпись, адрес, статический ключ),
+//!   `RelayRequest` / `RelayResponse` / `RelayIntro`, `PeerTest`, `Congestion`,
+//!   `NextNonce`.
 //!
 //! ## Замечание по длине
 //!
@@ -41,18 +52,25 @@
 
 use crate::crypto::{I2PX25519Keys, NoiseSymmetricState};
 use crate::error::{I2PError, Result};
-use crate::ssu2_block::{write_block, DateTimeBlock, Ssu2Block, Ssu2BlockType};
-use crate::ssu2_crypto::{init_noise_ssu2_state, sess_create_header_key};
-use crate::ssu2_header::{
-    obfuscate_header, ConnectionId, LongHeader, Ssu2MessageType, SSU2_LONG_HEADER_SIZE,
-    SSU2_VERSION,
+use crate::ssu2_block::{DateTimeBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType, write_block};
+use crate::ssu2_crypto::{
+    DataPhaseKeys, derive_data_phase_keys, init_noise_ssu2_state, sess_create_header_key,
+    session_confirmed_header_key,
 };
-use crate::ssu2_policy::{Ssu2Policy, SSU2_MAX_PACKET_SIZE};
+use crate::ssu2_header::{
+    ConnectionId, LongHeader, SSU2_HEADER_SIZE, SSU2_LONG_HEADER_SIZE, SSU2_MIN_PACKET_SIZE,
+    SSU2_VERSION, ShortHeader, Ssu2MessageType, obfuscate_header,
+};
+use crate::ssu2_policy::{SSU2_MAX_PACKET_SIZE, Ssu2Policy};
 
 /// Минимальная длина `SessionRequest` (i2pd: `len < 90`).
 pub const SSU2_SESSION_REQUEST_MIN_LEN: usize = 90;
 /// Минимальная длина `SessionCreated` (i2pd: `len < 80`).
 pub const SSU2_SESSION_CREATED_MIN_LEN: usize = 80;
+/// Минимальная длина собранного `SessionConfirmed` (i2pd: `len < 83`).
+pub const SSU2_SESSION_CONFIRMED_MIN_LEN: usize = 83;
+/// Минимальная длина одного фрагмента `SessionConfirmed` (i2pd: `len < 32`).
+pub const SSU2_SESSION_CONFIRMED_FRAGMENT_MIN_LEN: usize = 32;
 /// Размер extended-заголовка `SessionRequest` / `SessionCreated`:
 /// source id (8) + token (8) + эфемерный ключ (32).
 pub const SSU2_HANDSHAKE_EXT_HEADER_SIZE: usize = 48;
@@ -62,6 +80,16 @@ const HANDSHAKE_EXTRA_OVERHEAD: usize = SSU2_HANDSHAKE_EXT_HEADER_SIZE;
 const SESSION_REQUEST_MAX_PADDING: usize = 32;
 /// Максимум padding'а в `SessionCreated`.
 const SESSION_CREATED_MAX_PADDING: usize = 64;
+/// Размер зашифрованного статического ключа `SessionConfirmed` part 1: 32 + 16.
+const SESSION_CONFIRMED_PART1_SIZE: usize = 48;
+/// Флаг `SessionConfirmed`: один фрагмент.
+const CONFIRMED_FLAG_SINGLE: u8 = 0x01;
+/// Флаг `SessionConfirmed`: первый из двух фрагментов (frag 0, total 2).
+const CONFIRMED_FLAG_FIRST: u8 = 0x02;
+/// Флаг `SessionConfirmed`: второй из двух фрагментов (frag 1, total 2).
+const CONFIRMED_FLAG_SECOND: u8 = 0x12;
+/// Минимальный «хвост» второго фрагмента `SessionConfirmed` (i2pd: `>= 24`).
+const CONFIRMED_SECOND_FRAGMENT_MIN: usize = 24;
 
 // --- параметры ----------------------------------------------------------
 
@@ -126,6 +154,28 @@ pub struct SessionCreatedParams<'a> {
     pub pad_roll: u8,
 }
 
+/// Параметры сборки `SessionConfirmed`.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionConfirmedParams<'a> {
+    /// Destination connection id (id Bob'а).
+    pub dest_conn_id: ConnectionId,
+    /// `RouterInfo` отправителя (не блок, а «сырой» `RouterInfo`).
+    pub router_info: &'a [u8],
+    /// «Бросок» для выбора размера padding'а.
+    pub pad_roll: u8,
+    /// «Бросок» для регулировки границы фрагментов (`% 16`).
+    pub frag_roll: u8,
+}
+
+/// Пакеты `SessionConfirmed`: первый фрагмент и, при нехватке места, второй.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionConfirmedPackets {
+    /// Первый фрагмент (содержит part 1 и начало part 2).
+    pub first: Vec<u8>,
+    /// Второй фрагмент (продолжение part 2), если `RouterInfo` не влез.
+    pub second: Option<Vec<u8>>,
+}
+
 // --- результаты разбора -------------------------------------------------
 
 /// Результат разбора `SessionRequest`.
@@ -154,6 +204,24 @@ pub struct ReceivedSessionCreated {
     pub ephemeral: [u8; 32],
     /// Расшифрованный payload.
     pub payload: Vec<u8>,
+}
+
+/// Результат разбора полного `SessionConfirmed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedSessionConfirmed {
+    /// Статический ключ Alice (S), расшифрованный из part 1.
+    pub static_key: [u8; 32],
+    /// Расшифрованный payload part 2 (начинается с блока `RouterInfo`).
+    pub payload: Vec<u8>,
+}
+
+/// Итог обработки пакета `SessionConfirmed` ответчиком.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmedOutcome {
+    /// Пакет собран полностью; handshake завершён на стороне Bob'а.
+    Complete(ReceivedSessionConfirmed),
+    /// Получен первый (или второй) фрагмент; ждём оставшийся.
+    Incomplete,
 }
 
 // --- вспомогательное ----------------------------------------------------
@@ -204,6 +272,29 @@ fn append_padding<P: Ssu2Policy>(
     Ok(())
 }
 
+/// Собирает блок `RouterInfo` (`flags`/`frag` = 0/1) в `out`.
+///
+/// `frag = 1` означает «frag 0 из 1» — блок никогда не фрагментируется на
+/// уровне SSU2. Совпадает с `CreateRouterInfoBlock` из i2pd (без gzip).
+fn write_router_info_block(out: &mut Vec<u8>, router_info: &[u8]) -> Result<()> {
+    RouterInfoBlock {
+        flags: 0,
+        frag: 1,
+        router_info,
+    }
+    .write(out)
+}
+
+/// Незавершённая сборка `SessionConfirmed` из фрагментов (сторона Bob'а).
+struct PendingConfirmed {
+    /// Заголовок первого фрагмента (уже деобфусцированный).
+    header: [u8; SSU2_HEADER_SIZE],
+    /// Байты после cover-заголовка (part 1 + часть part 2).
+    data: Vec<u8>,
+    /// `true`, если сохранён **второй** фрагмент (пришёл раньше первого).
+    is_second: bool,
+}
+
 // --- Alice (инициатор) --------------------------------------------------
 
 /// Состояние handshake инициатора (Alice).
@@ -215,6 +306,7 @@ pub struct InitiatorHandshake {
     config: HandshakeConfig,
     ephemeral: Option<I2PX25519Keys>,
     remote_ephemeral_pub: Option<[u8; 32]>,
+    data_keys: Option<DataPhaseKeys>,
 }
 
 impl InitiatorHandshake {
@@ -237,7 +329,14 @@ impl InitiatorHandshake {
             config,
             ephemeral: None,
             remote_ephemeral_pub: None,
+            data_keys: None,
         }
+    }
+
+    /// Ключи data phase (доступны после `SessionCreated`/`SessionConfirmed`).
+    #[must_use]
+    pub const fn data_keys(&self) -> Option<&DataPhaseKeys> {
+        self.data_keys.as_ref()
     }
 
     /// Текущий chaining key (для кросс-проверки с ответчиком).
@@ -388,12 +487,112 @@ impl InitiatorHandshake {
         })
     }
 
-    // TODO(ssu2-scf): `build_session_confirmed` — part 1 (зашифрованный
-    // статический ключ Alice) + part 2 (RouterInfo + padding), KDF
-    // `k_header_2 = HKDF(ck, "", "SessionConfirmed", 32)`, при нехватке места
-    // разбиение на 2 фрагмента.
-    // TODO(ssu2-data-keys): после `SessionCreated` сохранить
-    // `derive_data_phase_keys(&self.noise.ck)` как ключи направления ab.
+    /// Собирает `SessionConfirmed` (part 1 + part 2) и при нехватке места
+    /// разбивает на два фрагмента.
+    ///
+    /// После вызова доступны [`InitiatorHandshake::data_keys`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`], если `RouterInfo` не влезает даже в два
+    /// фрагмента, key agreement не удался или `SessionCreated` не обработан;
+    /// ошибки обфускации заголовка и сборки блоков.
+    pub fn build_session_confirmed<P: Ssu2Policy>(
+        &mut self,
+        policy: &P,
+        params: &SessionConfirmedParams<'_>,
+    ) -> Result<SessionConfirmedPackets> {
+        let kh2 = session_confirmed_header_key(&self.noise.ck);
+        let max_payload = policy.max_payload_size(self.config.ipv6, self.config.mtu);
+        let max_single = max_payload.saturating_sub(HANDSHAKE_EXTRA_OVERHEAD);
+
+        let mut block = Vec::new();
+        write_router_info_block(&mut block, params.router_info)?;
+        // i2pd: блок считается влезающим лишь при `size + 5 < len` (строго).
+        let (max_used, flags0) = if block.len() < max_single {
+            (max_single, CONFIRMED_FLAG_SINGLE)
+        } else {
+            (max_single + max_payload, CONFIRMED_FLAG_FIRST)
+        };
+        if block.len() >= max_used {
+            // TODO(ssu2-scf-multifrag): i2pd тоже не умеет > 2 фрагментов
+            // (там даже нет проверки — отправился бы пустой payload).
+            return Err(I2PError::Malformed(
+                "ssu2: RouterInfo does not fit in two SessionConfirmed fragments",
+            ));
+        }
+        if let Some(size) = policy.padding_size(params.pad_roll, max_used - block.len(), 0) {
+            let zeros = vec![0u8; size];
+            write_block(&mut block, Ssu2BlockType::Padding, &zeros)?;
+        }
+
+        let header = ShortHeader {
+            dest_conn_id: params.dest_conn_id,
+            packet_num: 0,
+            msg_type: Ssu2MessageType::SessionConfirmed,
+            flags: [flags0, 0, 0],
+        };
+        self.noise.mix_hash(&header.to_bytes());
+
+        // part 1: зашифрованный статический ключ Alice.
+        let part1 = encrypt_into(&mut self.noise, self.local_static.public_key())?;
+        self.noise.mix_hash(&part1);
+
+        // part 2 KDF: DH(a_s, Y).
+        let remote = self.remote_ephemeral_pub.ok_or(I2PError::Malformed(
+            "ssu2: SessionConfirmed before SessionCreated",
+        ))?;
+        let shared = agree(&self.local_static, &remote)?;
+        self.noise.mix_key(&shared);
+
+        let ciphertext = encrypt_into(&mut self.noise, &block)?;
+        self.noise.mix_hash(&ciphertext);
+
+        // Граница двух фрагментов (i2pd: `max1 - rand%16`, хвост >= 24).
+        let mut first_part2 = ciphertext.len();
+        if flags0 == CONFIRMED_FLAG_FIRST && ciphertext.len() > max_single {
+            first_part2 = max_single - usize::from(params.frag_roll % 16);
+            if ciphertext.len().saturating_sub(first_part2) < CONFIRMED_SECOND_FRAGMENT_MIN {
+                first_part2 = first_part2.saturating_sub(CONFIRMED_SECOND_FRAGMENT_MIN);
+            }
+        }
+
+        let mut first = Vec::with_capacity(16 + SESSION_CONFIRMED_PART1_SIZE + first_part2);
+        first.extend_from_slice(&header.to_bytes());
+        first.extend_from_slice(&part1);
+        first.extend_from_slice(&ciphertext[..first_part2]);
+        obfuscate_header(
+            Ssu2MessageType::SessionConfirmed,
+            &self.intro_key,
+            &kh2,
+            &mut first,
+        )?;
+
+        let second = if first_part2 < ciphertext.len() {
+            let header2 = ShortHeader {
+                dest_conn_id: params.dest_conn_id,
+                packet_num: 0,
+                msg_type: Ssu2MessageType::SessionConfirmed,
+                flags: [CONFIRMED_FLAG_SECOND, 0, 0],
+            };
+            let mut second =
+                Vec::with_capacity(SSU2_HEADER_SIZE + (ciphertext.len() - first_part2));
+            second.extend_from_slice(&header2.to_bytes());
+            second.extend_from_slice(&ciphertext[first_part2..]);
+            obfuscate_header(
+                Ssu2MessageType::SessionConfirmed,
+                &self.intro_key,
+                &kh2,
+                &mut second,
+            )?;
+            Some(second)
+        } else {
+            None
+        };
+
+        self.data_keys = Some(derive_data_phase_keys(&self.noise.ck));
+        Ok(SessionConfirmedPackets { first, second })
+    }
 }
 
 // --- Bob (ответчик) -----------------------------------------------------
@@ -406,6 +605,8 @@ pub struct ResponderHandshake {
     config: HandshakeConfig,
     ephemeral: Option<I2PX25519Keys>,
     remote_ephemeral_pub: Option<[u8; 32]>,
+    data_keys: Option<DataPhaseKeys>,
+    pending_confirmed: Option<PendingConfirmed>,
 }
 
 impl ResponderHandshake {
@@ -421,6 +622,8 @@ impl ResponderHandshake {
             config,
             ephemeral: None,
             remote_ephemeral_pub: None,
+            data_keys: None,
+            pending_confirmed: None,
         }
     }
 
@@ -428,6 +631,12 @@ impl ResponderHandshake {
     #[must_use]
     pub const fn chain_key(&self) -> &[u8; 32] {
         &self.noise.ck
+    }
+
+    /// Ключи data phase (доступны после полного `SessionConfirmed`).
+    #[must_use]
+    pub const fn data_keys(&self) -> Option<&DataPhaseKeys> {
+        self.data_keys.as_ref()
     }
 
     /// Публичный эфемерный ключ Bob'а (Y из `SessionCreated`).
@@ -565,9 +774,156 @@ impl ResponderHandshake {
         Ok(packet)
     }
 
-    // TODO(ssu2-scf): `handle_session_confirmed` — разбор part 1 / part 2,
-    // сборка фрагментов (frag/total в коротком заголовке), проверка
-    // RouterInfo и статического ключа.
-    // TODO(ssu2-data-keys): после part 2 сохранить
-    // `derive_data_phase_keys(&self.noise.ck)` как ключи направления ba.
+    /// Разбирает `SessionConfirmed` (в т.ч. из двух фрагментов).
+    ///
+    /// Возвращает [`ConfirmedOutcome::Incomplete`], если получен лишь один
+    /// фрагмент. После [`ConfirmedOutcome::Complete`] доступны
+    /// [`ResponderHandshake::data_keys`].
+    ///
+    /// Пакет деобфусцируется **на месте**. Проверка `RouterInfo` (подпись,
+    /// адрес, статический ключ) — задача уровня сессии.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidLength`] при слишком коротком пакете/собранном
+    /// сообщении; [`Error::Malformed`] при неверном типе, номере пакета,
+    /// числе фрагментов, ключе или теге.
+    pub fn handle_session_confirmed<P: Ssu2Policy>(
+        &mut self,
+        policy: &P,
+        packet: &mut [u8],
+    ) -> Result<ConfirmedOutcome> {
+        if packet.len() < SSU2_MIN_PACKET_SIZE {
+            return Err(I2PError::InvalidLength {
+                expected: SSU2_MIN_PACKET_SIZE,
+                got: packet.len(),
+            });
+        }
+        if packet.len() > policy.max_packet_size() {
+            return Err(I2PError::Malformed("ssu2: SessionConfirmed too long"));
+        }
+
+        let kh2 = session_confirmed_header_key(&self.noise.ck);
+        obfuscate_header(
+            Ssu2MessageType::SessionConfirmed,
+            &self.intro_key,
+            &kh2,
+            packet,
+        )?;
+        let header = ShortHeader::parse(&packet[..SSU2_HEADER_SIZE])?;
+        if header.msg_type != Ssu2MessageType::SessionConfirmed {
+            return Err(I2PError::Malformed("ssu2: expected SessionConfirmed"));
+        }
+        if header.packet_num != 0 {
+            return Err(I2PError::Malformed(
+                "ssu2: non-zero packet number in SessionConfirmed",
+            ));
+        }
+        if header.num_fragments() > 2 {
+            return Err(I2PError::Malformed(
+                "ssu2: too many SessionConfirmed fragments",
+            ));
+        }
+
+        let data = &packet[SSU2_HEADER_SIZE..];
+        let assembled = if header.num_fragments() > 1 {
+            self.assemble_fragment(&header, data)?
+        } else {
+            Some((header.to_bytes(), data.to_vec()))
+        };
+        let Some((header_bytes, data)) = assembled else {
+            return Ok(ConfirmedOutcome::Incomplete);
+        };
+
+        self.finish_confirmed(&header_bytes, &data)
+            .map(ConfirmedOutcome::Complete)
+    }
+
+    /// Собирает два фрагмента `SessionConfirmed`.
+    ///
+    /// Возвращает `None`, пока не хватает второго фрагмента; иначе —
+    /// заголовок первого фрагмента и байты после cover (part 1 + part 2).
+    fn assemble_fragment(
+        &mut self,
+        header: &ShortHeader,
+        data: &[u8],
+    ) -> Result<Option<([u8; SSU2_HEADER_SIZE], Vec<u8>)>> {
+        let is_second = header.frag_number() != 0;
+        match self.pending_confirmed.take() {
+            None => {
+                self.pending_confirmed = Some(PendingConfirmed {
+                    header: header.to_bytes(),
+                    data: data.to_vec(),
+                    is_second,
+                });
+                Ok(None)
+            }
+            Some(pending) if pending.is_second == is_second => {
+                // Дубликат фрагмента: игнорируем (в i2pd повтор второго
+                // фрагмента ошибочно дописывается — здесь строже).
+                self.pending_confirmed = Some(pending);
+                Ok(None)
+            }
+            Some(pending) => {
+                // Пришли оба фрагмента.
+                let (head, tail) = if is_second {
+                    (pending.data, data)
+                } else {
+                    (data.to_vec(), &pending.data[..])
+                };
+                if head.len() + tail.len() > SSU2_MAX_PACKET_SIZE * 2 {
+                    return Err(I2PError::Malformed(
+                        "ssu2: SessionConfirmed fragments too long",
+                    ));
+                }
+                let mut combined = head;
+                combined.extend_from_slice(tail);
+                let header_bytes = if is_second {
+                    pending.header
+                } else {
+                    header.to_bytes()
+                };
+                Ok(Some((header_bytes, combined)))
+            }
+        }
+    }
+
+    /// Завершает обработку собранного `SessionConfirmed`: part 1 + part 2.
+    fn finish_confirmed(
+        &mut self,
+        header_bytes: &[u8; SSU2_HEADER_SIZE],
+        data: &[u8],
+    ) -> Result<ReceivedSessionConfirmed> {
+        let len = SSU2_HEADER_SIZE + data.len();
+        if len < SSU2_SESSION_CONFIRMED_MIN_LEN {
+            return Err(I2PError::InvalidLength {
+                expected: SSU2_SESSION_CONFIRMED_MIN_LEN,
+                got: len,
+            });
+        }
+
+        self.noise.mix_hash(header_bytes);
+        // part 1: статический ключ Alice.
+        let static_vec = decrypt_from(&mut self.noise, &data[..SESSION_CONFIRMED_PART1_SIZE])?;
+        let mut static_key = [0u8; 32];
+        static_key.copy_from_slice(&static_vec);
+        self.noise.mix_hash(&data[..SESSION_CONFIRMED_PART1_SIZE]);
+
+        // part 2 KDF: DH(b_s... b_e, S).
+        let ephemeral = self.ephemeral.as_ref().ok_or(I2PError::Malformed(
+            "ssu2: SessionConfirmed before SessionCreated",
+        ))?;
+        let shared = agree(ephemeral, &static_key)?;
+        self.noise.mix_key(&shared);
+        self.data_keys = Some(derive_data_phase_keys(&self.noise.ck));
+
+        // part 2: payload.
+        let payload = decrypt_from(&mut self.noise, &data[SESSION_CONFIRMED_PART1_SIZE..])?;
+        self.noise.mix_hash(&data[SESSION_CONFIRMED_PART1_SIZE..]);
+
+        Ok(ReceivedSessionConfirmed {
+            static_key,
+            payload,
+        })
+    }
 }
