@@ -78,6 +78,8 @@ pub const SSU2_RESEND_ATTEMPT_MIN_INTERVAL: Duration = Duration::from_millis(3);
 pub const SSU2_SEND_DATETIME_NUM_PACKETS: u32 = 256;
 /// Максимум фрагментов I2NP-сообщения.
 pub const SSU2_MAX_NUM_FRAGMENTS: u8 = 64;
+/// Через сколько секунд удаляется недособранное I2NP-сообщение (`CleanUp`).
+pub const SSU2_INCOMPLETE_MESSAGES_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Маска случайного байта для выбора размера padding'а (`0..=31`).
 pub const SSU2_PADDING_ROLL_MASK: u8 = 0x1F;
 
@@ -303,6 +305,11 @@ pub trait Ssu2Policy: Send + Sync {
     /// Максимум фрагментов I2NP-сообщения.
     fn max_num_fragments(&self) -> u8 {
         SSU2_MAX_NUM_FRAGMENTS
+    }
+
+    /// Через сколько недособранное I2NP-сообщение удаляется.
+    fn incomplete_messages_cleanup_timeout(&self) -> Duration {
+        SSU2_INCOMPLETE_MESSAGES_CLEANUP_TIMEOUT
     }
 
     // --- завершение ---
