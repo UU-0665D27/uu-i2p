@@ -40,6 +40,7 @@ pub mod router_info_address;
 pub mod short_tunnel_build;
 pub mod signature;
 pub mod siphash;
+pub mod ssu2_ack;
 pub mod ssu2_block;
 pub mod ssu2_crypto;
 pub mod ssu2_header;
