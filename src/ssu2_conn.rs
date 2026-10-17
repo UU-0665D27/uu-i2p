@@ -37,11 +37,11 @@ use tracing::{debug, trace, warn};
 use crate::error::{I2PError, Result};
 use crate::ssu2_block::{
     AddressBlock, Blocks, NewTokenBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType,
-    Ssu2TerminationReason,
+    Ssu2TerminationReason, TerminationBlock,
 };
 use crate::ssu2_crypto::DataPhaseKeys;
 use crate::ssu2_engine::{
-    DataSessionParams, DataSessionRole, RecvReport, SendContext, Ssu2DataSession,
+    DataSessionParams, DataSessionRole, RecvReport, SendContext, Ssu2DataSession, handshake_phase,
 };
 use crate::ssu2_handshake::{
     ConfirmedOutcome, HandshakeConfig, InitiatorHandshake, ResponderHandshake, RetryParams,
@@ -52,7 +52,8 @@ use crate::ssu2_header::{
     ConnectionId, SSU2_LONG_HEADER_SIZE, Ssu2MessageType, header_mask, obfuscate_extended_header,
 };
 use crate::ssu2_lifecycle::{SessionLifecycle, Ssu2SessionState};
-use crate::ssu2_policy::{Ssu2CongestionPolicy, Ssu2Policy};
+use crate::ssu2_policy::{DateTimeAction, DateTimeSession, Ssu2CongestionPolicy, Ssu2Policy};
+use crate::ssu2_recv::handle_datetime;
 use crate::ssu2_send::RandomSource;
 use crate::ssu2_timers::SessionTimers;
 
@@ -132,6 +133,19 @@ pub struct ConnReport {
     /// `RouterInfo` (i2pd `ProcessSessionConfirmed`, `SSU2Session.cpp:1415`:
     /// `memcmp (S, m_Address->s, 32)`).
     pub remote_static_key: Option<[u8; 32]>,
+    /// Наш внешний адрес, каким его видит собеседник (блок `Address` в
+    /// payload'е `Retry` или `SessionCreated`; i2pd `HandlePayload` →
+    /// `HandleAddress`, `SSU2Session.cpp:2104` → `i2p::context.UpdateAddress`).
+    ///
+    /// Пакет по своей инициативе адрес не обновляет — это решение уровня
+    /// роутера (какой адрес публиковать в своём `RouterInfo`).
+    pub external_address: Option<AddressBlock>,
+    /// Решение по блоку `DateTime` из payload'а handshake-пакета
+    /// (i2pd `HandleDateTime`, `SSU2Session.cpp:1964`).
+    ///
+    /// Как и [`RecvReport::datetime`], ничего не применяет само: коррекцию
+    /// часов (`AdjustTimeOffset`) и ошибку `ClockSkew` решает вызывающий.
+    pub datetime: Option<DateTimeAction>,
     /// Собеседник отказал (`Retry` с нулевым токеном).
     pub rejected: bool,
     /// Ответчику нужно отправить `QuickAck` (i2pd `SendQuickAck` в конце
@@ -579,6 +593,7 @@ impl Ssu2Connection {
         role: DataSessionRole,
         data_keys: DataPhaseKeys,
         congestion: &C,
+        now: Duration,
     ) -> Ssu2DataSession {
         Ssu2DataSession::new(
             DataSessionParams {
@@ -593,6 +608,7 @@ impl Ssu2Connection {
                 sync_clock_from_peers: self.params.sync_clock_from_peers,
             },
             congestion,
+            now,
         )
     }
 
@@ -741,6 +757,24 @@ impl Ssu2Connection {
             == Some(Ssu2MessageType::SessionCreated)
     }
 
+    /// Решение по блоку `DateTime` из payload'а handshake-пакета
+    /// (i2pd `HandleDateTime`, `SSU2Session.cpp:1964`): фаза берётся из текущего
+    /// состояния сессии, семейство адреса и `sync_clock_from_peers` — из
+    /// [`ConnParams`].
+    fn datetime_action<P: Ssu2Policy>(
+        &self,
+        policy: &P,
+        body: &[u8],
+        now_secs: u32,
+    ) -> DateTimeAction {
+        let session = DateTimeSession {
+            phase: handshake_phase(self.state()),
+            testing: self.params.testing,
+            sync_clock_from_peers: self.params.sync_clock_from_peers,
+        };
+        handle_datetime(policy, body, u64::from(now_secs), &session)
+    }
+
     fn recv_retry<P: Ssu2Policy, R: RandomSource>(
         &mut self,
         policy: &P,
@@ -750,6 +784,41 @@ impl Ssu2Connection {
         let received = handle_retry(&self.params.remote_intro_key, packet)?;
         self.set_state(Ssu2SessionState::TokenReceived);
         let mut report = ConnReport::default();
+        // i2pd `ProcessRetry` → `HandlePayload` (`:1638`): в payload'е `Retry`
+        // приходят `DateTime`, `Address` (наш внешний адрес) и `Termination`
+        // (ответчик отказал, например по версии протокола). Payload
+        // разбирается и при нулевом токене — i2pd это отдельно оговаривает
+        // («to handle Datetime block and adjust clock in case of clock skew»).
+        let mut termination = None;
+        for block in Blocks::new(&received.payload) {
+            let Ok(block) = block else { break };
+            match block.kind() {
+                Some(Ssu2BlockType::DateTime) => {
+                    report.datetime = Some(self.datetime_action(policy, block.body, ctx.now_secs));
+                }
+                Some(Ssu2BlockType::Address) => {
+                    report.external_address = AddressBlock::parse(block.body).ok();
+                }
+                Some(Ssu2BlockType::Termination) => {
+                    termination = TerminationBlock::parse(block.body).ok();
+                }
+                _ => {}
+            }
+        }
+        if let Some(termination) = termination {
+            // i2pd `HandlePayload` (`:1843`): `Termination` в неустановленной
+            // сессии → `Done ()`. Токен в таком `Retry` нулевой
+            // (`SendRetry` кладёт его только при `NormalClose`), так что
+            // переспрашивать ответчика не о чем.
+            warn!(
+                reason = termination.reason,
+                reason_kind = ?termination.reason_kind(),
+                "recv_retry: Retry with Termination; connection rejected"
+            );
+            report.rejected = true;
+            self.set_state(Ssu2SessionState::Failed);
+            return Ok(report);
+        }
         if received.token == 0 {
             warn!("recv_retry: Retry with zero token; connection rejected");
             report.rejected = true;
@@ -757,8 +826,6 @@ impl Ssu2Connection {
             return Ok(report);
         }
         debug!(token = received.token, "recv_retry: token received");
-        // TODO(ssu2-conn-retry-payload): разобрать payload `Retry`
-        // (`HandlePayload`: `DateTime`, `Termination`) — i2pd `:1645`.
         self.token = received.token;
         report.token = Some(received.token);
         report.packets = self.send_session_request(policy, ctx)?;
@@ -794,21 +861,29 @@ impl Ssu2Connection {
         // `SessionCreated` приходят `DateTime`, `Address` (наш внешний адрес),
         // `New Token` и `Padding`. Токен отдаём вызывающему: он положит его в
         // исходящее хранилище и следующий `SessionRequest` уйдёт без `Retry`.
-        //
-        // TODO(ssu2-conn-session-created-address): `Address` из payload'а —
-        // внешний адрес для `i2p::context.UpdateAddress`
-        // (`SSU2Session::HandleAddress`, `:2104`); решение уровня роутера.
+        // `Address` и `DateTime` — тоже вызывающему (решения уровня роутера).
         let mut new_token = None;
+        let mut external_address = None;
+        let mut datetime = None;
         for block in Blocks::new(&received.payload) {
             let Ok(block) = block else { break };
-            if block.kind() == Some(Ssu2BlockType::NewToken)
-                && let Ok(token) = NewTokenBlock::parse(block.body)
-            {
-                debug!(
-                    expires = token.expires,
-                    "recv_session_created: NewToken for outgoing requests"
-                );
-                new_token = Some((token.expires, token.token));
+            match block.kind() {
+                Some(Ssu2BlockType::NewToken) => {
+                    if let Ok(token) = NewTokenBlock::parse(block.body) {
+                        debug!(
+                            expires = token.expires,
+                            "recv_session_created: NewToken for outgoing requests"
+                        );
+                        new_token = Some((token.expires, token.token));
+                    }
+                }
+                Some(Ssu2BlockType::Address) => {
+                    external_address = AddressBlock::parse(block.body).ok();
+                }
+                Some(Ssu2BlockType::DateTime) => {
+                    datetime = Some(self.datetime_action(policy, block.body, ctx.now_secs));
+                }
+                _ => {}
             }
         }
 
@@ -832,7 +907,7 @@ impl Ssu2Connection {
 
         // Data-сессия создаётся сразу: i2pd в состоянии `SessionConfirmedSent`
         // уже обрабатывает data-пакеты (`ProcessData`) и ждёт `Ack`.
-        let mut data = self.data_session(DataSessionRole::Initiator, keys, congestion);
+        let mut data = self.data_session(DataSessionRole::Initiator, keys, congestion, ctx.now);
         // i2pd `SendSessionConfirmed`: `m_SendPacketNum++`; номер `0` i2pd не
         // учитывает в приёме, поэтому первый data-пакет инициатора — `1`.
         data.set_send_packet_num(1);
@@ -851,6 +926,8 @@ impl Ssu2Connection {
         Ok(ConnReport {
             packets: out,
             new_token,
+            external_address,
+            datetime,
             ..ConnReport::default()
         })
     }
@@ -1026,8 +1103,11 @@ impl Ssu2Connection {
             router_info_len = router_info.len(),
             "recv_session_confirmed: SessionConfirmed complete"
         );
-        // TODO(ssu2-conn-ri-checks): проверки i2pd `:1360` (подпись/адрес/
-        // статический ключ/версия) — уровень netdb, не соединения.
+        // Проверки `RouterInfo` (i2pd `:1360`: подпись, свежесть, версия, адрес
+        // семейства, `s=` против ключа handshake) делает вызывающий — они
+        // требуют netdb, которого у соединения нет. Сюда же уходит статический
+        // ключ `S` ([`ConnReport::remote_static_key`]), чтобы сверить его с
+        // `s=` из `RouterInfo` (см. `Ssu2Pool::accept_remote_router_info`).
 
         let keys = {
             let handshake = self
@@ -1038,7 +1118,7 @@ impl Ssu2Connection {
                 "ssu2: no data keys after SessionConfirmed",
             ))?
         };
-        let mut data = self.data_session(DataSessionRole::Responder, keys, congestion);
+        let mut data = self.data_session(DataSessionRole::Responder, keys, congestion, ctx.now);
         data.set_state(Ssu2SessionState::Established);
         // i2pd `:1453`: Established(). `QuickAck` шлёт вызывающий — после
         // того как задаст intro-ключ инициатора из полученного `RouterInfo`

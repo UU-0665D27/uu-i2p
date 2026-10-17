@@ -60,7 +60,7 @@ fn params() -> DataSessionParams {
 }
 
 fn session() -> Ssu2DataSession {
-    Ssu2DataSession::new(params(), &I2pdCongestionPolicy)
+    Ssu2DataSession::new(params(), &I2pdCongestionPolicy, Duration::ZERO)
 }
 
 /// Кодирует data-пакет «от собеседника» ключом приёма сессии (`ba`).
@@ -427,6 +427,15 @@ fn recv_updates_last_activity() {
     assert_eq!(session.last_activity(), now);
 }
 
+/// Свежая сессия не должна выглядеть простаивающей: «время последней
+/// активности» стартует временем создания (i2pd `TransportSession`).
+#[test]
+fn new_session_starts_with_creation_time_as_activity() {
+    let created = Duration::from_secs(1_700_000_000);
+    let session = Ssu2DataSession::new(params(), &I2pdCongestionPolicy, created);
+    assert_eq!(session.last_activity(), created);
+}
+
 // ---- Отправка -----------------------------------------------------------
 
 /// Постоянный «бросок» для паддинга (i2pd `GetRng` в тестах).
@@ -461,6 +470,7 @@ fn side(role: DataSessionRole, source: ConnectionId, dest: ConnectionId) -> Ssu2
             sync_clock_from_peers: false,
         },
         &I2pdCongestionPolicy,
+        Duration::ZERO,
     )
 }
 

@@ -34,6 +34,23 @@
 use crate::IdentHash;
 use crate::router_info::FullRouterInfo;
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Минимальный срок годности `RouterInfo` (`NETDB_MIN_EXPIRATION_TIMEOUT`):
+/// RI старше этого с момента `timestamp` не принимается.
+pub const NETDB_MIN_EXPIRATION_TIMEOUT: Duration = Duration::from_mins(90);
+
+/// Допустимый запас «в будущее» для `timestamp` `RouterInfo`
+/// (`NETDB_EXPIRATION_TIMEOUT_THRESHOLD`): RI из более далёкого будущего
+/// не принимается.
+pub const NETDB_EXPIRATION_TIMEOUT_THRESHOLD: Duration = Duration::from_mins(2);
+
+/// Минимальная версия роутера (`NETDB_MIN_ALLOWED_VERSION`, 0.9.58).
+///
+/// Как и в i2pd, версия — это склейка цифр из property `router.version`
+/// (`MAKE_VERSION_NUMBER` там используется только для констант): роутер
+/// старее этой версии принимается, лишь если он high-bandwidth.
+pub const NETDB_MIN_ALLOWED_VERSION: u32 = 958;
 
 /// Хранилище `RouterInfo` других роутеров.
 ///

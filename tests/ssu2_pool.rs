@@ -19,9 +19,9 @@ use uu_i2p::{
     i2np::{I2npHeader, I2npMessageType},
     i2np_message::I2npMessage,
     private_keys::I2PPrivateKeys,
-    router_info::{FullRouterInfo, RouterInfo, RouterInfoCaps},
+    router_info::{FullRouterInfo, RouterInfo, RouterInfoBuilder, RouterInfoCaps},
     router_info_address::I2PAddress,
-    ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool},
+    ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool, check_session_confirmed_router_info},
 };
 
 fn init_tracing() {
@@ -353,6 +353,136 @@ async fn connect_to_explicit_address() {
     })
     .await;
     assert_eq!(established, Ssu2Event::Established { ident: bob_ident });
+
+    // Блок `Address` приходит и в `Retry`, и в `SessionCreated`: пул сообщает,
+    // каким видит нас собеседник (i2pd `HandleAddress` →
+    // `i2p::context.UpdateAddress`). Оба раза это наш сокет.
+    let external: Vec<SocketAddr> = alice_events
+        .iter()
+        .filter_map(|e| match e {
+            Ssu2Event::ExternalAddress { addr, from } => {
+                assert_eq!(*from, Some(bob_ident), "событие не от собеседника");
+                Some(*addr)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        external.len(),
+        2,
+        "ожидали адрес из `Retry` и из `SessionCreated`: {external:?}"
+    );
+    assert!(
+        external.iter().all(|addr| *addr == alice.addr),
+        "собеседник видит нас не по нашему сокету: {external:?}"
+    );
+}
+
+/// `RouterInfo` собеседника из `SessionConfirmed` — проверки ответчика
+/// (i2pd `SSU2Session::ProcessSessionConfirmed`, `SSU2Session.cpp:1353-1420`).
+///
+/// Проверяем функцию напрямую: подделывать эти случаи по сети долго
+/// (у каждой ошибки — свой таймаут рукопожатия).
+#[test]
+fn session_confirmed_router_info_checks() {
+    let remote: SocketAddr = "127.0.0.1:12345".parse().expect("addr");
+    let other: SocketAddr = "127.0.0.2:12345".parse().expect("addr");
+
+    // Подпись, свежесть и версия в порядке — RI принимается.
+    let (bytes, static_key) = peer_router_info(|body| body);
+    let (ident, intro_key, published) =
+        check_session_confirmed_router_info(&bytes, remote, Some(static_key)).expect("valid RI");
+    let ri = FullRouterInfo::from_buffer(&bytes).expect("parse RI");
+    let addr = ri.body().ssu2_address(false).expect("SSU2 address");
+    assert!(published, "тестовый RI публикует SSU2-адрес");
+    assert_eq!(&ident, ri.ident_hash(), "ident должен быть из RI");
+    assert_eq!(
+        &intro_key,
+        addr.i.as_bytes(),
+        "intro-ключ должен быть из RI"
+    );
+
+    // Подпись испорчена (последний байт — часть подписи).
+    let mut tampered = bytes;
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    assert!(
+        check_session_confirmed_router_info(&tampered, remote, Some(static_key)).is_err(),
+        "испорченная подпись должна отвергаться"
+    );
+
+    // Слишком старый: 91 минута.
+    let (bytes, static_key) = peer_router_info(|body| body.timestamp(now_ms() - 91 * 60 * 1000));
+    assert!(
+        check_session_confirmed_router_info(&bytes, remote, Some(static_key)).is_err(),
+        "RI старше 90 минут должен отвергаться"
+    );
+
+    // Из будущего: +3 минуты.
+    let (bytes, static_key) = peer_router_info(|body| body.timestamp(now_ms() + 3 * 60 * 1000));
+    assert!(
+        check_session_confirmed_router_info(&bytes, remote, Some(static_key)).is_err(),
+        "RI из будущего должен отвергаться"
+    );
+
+    // Старая версия (0.9.0) без `caps=O`.
+    let (bytes, static_key) = peer_router_info(|body| body.version(900));
+    assert!(
+        check_session_confirmed_router_info(&bytes, remote, Some(static_key)).is_err(),
+        "старая версия без high-bandwidth должна отвергаться"
+    );
+
+    // Та же версия, но `caps=O` — принимается (i2pd `:1372`).
+    let (bytes, static_key) =
+        peer_router_info(|body| body.version(900).caps(RouterInfoCaps::parse(b"O")));
+    assert!(
+        check_session_confirmed_router_info(&bytes, remote, Some(static_key)).is_ok(),
+        "старая версия с high-bandwidth принимается"
+    );
+
+    // Опубликованный адрес не совпал с адресом пакета.
+    let (bytes, static_key) = peer_router_info(|body| body);
+    assert!(
+        check_session_confirmed_router_info(&bytes, other, Some(static_key)).is_err(),
+        "чужой адрес пакета должен отвергаться"
+    );
+
+    // Другой статический ключ (не тот, что был в рукопожатии).
+    let mut wrong = static_key;
+    wrong[0] ^= 0x01;
+    assert!(
+        check_session_confirmed_router_info(&bytes, remote, Some(wrong)).is_err(),
+        "чужой статический ключ должен отвергаться"
+    );
+}
+
+/// `RouterInfo` собеседника для проверок: байты и статический ключ из его
+/// SSU2-адреса. `fix` позволяет подпортить body (timestamp, версию) — подпись
+/// пересчитывается, как в настоящем роутере.
+fn peer_router_info(
+    fix: impl FnOnce(RouterInfoBuilder) -> RouterInfoBuilder,
+) -> (Vec<u8>, [u8; 32]) {
+    let keys = I2PPrivateKeys::generate_default().expect("generate keys");
+    let static_keys = I2PX25519Keys::generate();
+    let mut intro = [0u8; 32];
+    rand::rng().fill_bytes(&mut intro);
+    let body = fix(RouterInfo::builder()
+        .timestamp(now_ms())
+        .add_address(I2PAddress::ssu2_published(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+            I2PTag::from_array(*static_keys.public_key()),
+            I2PTag::from_array(intro),
+        ))
+        .caps(RouterInfoCaps::parse(b"L"))
+        .version(DEFAULT_VERSION)
+        .net_id(i32::from(DEFAULT_NET_ID)))
+    .build();
+    let ri = FullRouterInfo::from_keys(&keys, body).expect("own RouterInfo");
+    (
+        ri.to_buffer().expect("serialize RouterInfo"),
+        *static_keys.public_key(),
+    )
 }
 
 /// Пока `SessionCreated` не принят, endpoint занят исходящей сессией

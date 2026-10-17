@@ -334,8 +334,18 @@ impl Ssu2DataSession {
     /// Создаёт сессию в состоянии [`Ssu2SessionState::Unknown`].
     ///
     /// `congestion` нужна [`SendState`] для начальных окна и RTO.
+    ///
+    /// `now` — время создания: от него считается «время последней активности»
+    /// ([`Self::last_activity`], i2pd `TransportSession` инициализирует
+    /// `m_LastActivityTimestamp` временем создания). Без этого свежая сессия,
+    /// ещё не принявшая ни одного data-пакета, выглядит простаивающей
+    /// `SSU2_TERMINATION_TIMEOUT` и её сразу завершает idle-таймер.
     #[must_use]
-    pub fn new<C: Ssu2CongestionPolicy>(params: DataSessionParams, congestion: &C) -> Self {
+    pub fn new<C: Ssu2CongestionPolicy>(
+        params: DataSessionParams,
+        congestion: &C,
+        now: Duration,
+    ) -> Self {
         let (send_key, recv_key) = match params.role {
             DataSessionRole::Initiator => (params.data_keys.ab, params.data_keys.ba),
             DataSessionRole::Responder => (params.data_keys.ba, params.data_keys.ab),
@@ -349,7 +359,7 @@ impl Ssu2DataSession {
             params,
             send_key,
             recv_key,
-            last_activity: Duration::ZERO,
+            last_activity: now,
             relay_tag: None,
             relay_tag_requested: false,
             external_address: None,
@@ -1168,7 +1178,11 @@ const fn event_kind(event: &BlockEvent) -> &'static str {
 }
 
 /// Фаза сессии для [`Ssu2Policy::datetime_action`] (i2pd `m_State`).
-const fn handshake_phase(state: Ssu2SessionState) -> HandshakePhase {
+///
+/// Нужна везде, где решается судьба блока `DateTime` — и в data phase, и в
+/// рукопожатии ([`crate::ssu2_conn`], payload `Retry`/`SessionCreated`).
+#[must_use]
+pub const fn handshake_phase(state: Ssu2SessionState) -> HandshakePhase {
     match state {
         Ssu2SessionState::SessionRequestReceived => HandshakePhase::SessionRequestReceived,
         Ssu2SessionState::TokenRequestReceived => HandshakePhase::TokenRequestReceived,

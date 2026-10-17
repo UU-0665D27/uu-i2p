@@ -169,6 +169,9 @@ async fn connect_to_live_i2pd_ssu2_and_receive_router_info() {
                 warn!("disconnected from {}", ident.to_base64());
                 break;
             }
+            Ssu2Event::ExternalAddress { addr, .. } => {
+                info!("i2pd sees us as {addr}");
+            }
         }
     }
     assert!(established, "session never reached Established");

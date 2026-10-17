@@ -58,6 +58,9 @@ use crate::config::{RouterConfig, Transport};
 use crate::crypto::I2PX25519Keys;
 use crate::error::{I2PError, Result};
 use crate::i2np_message::I2npMessage;
+use crate::netdb::{
+    NETDB_EXPIRATION_TIMEOUT_THRESHOLD, NETDB_MIN_ALLOWED_VERSION, NETDB_MIN_EXPIRATION_TIMEOUT,
+};
 use crate::router_info::FullRouterInfo;
 use crate::router_info_address::I2PAddress;
 use crate::ssu2_block::{
@@ -72,8 +75,9 @@ use crate::ssu2_handshake::{HandshakeConfig, InitiatorHandshake, ResponderHandsh
 use crate::ssu2_header::{ConnectionId, SSU2_MIN_PACKET_SIZE, SSU2_VERSION, Ssu2MessageType};
 use crate::ssu2_lifecycle::Ssu2SessionState;
 use crate::ssu2_policy::{
-    I2pdCongestionPolicy, I2pdPolicy, SSU2_MAX_PACKET_SIZE, SSU2_TERMINATION_TIMEOUT,
-    SSU2_TOKEN_EXPIRATION_THRESHOLD, SSU2_TOKEN_EXPIRATION_TIMEOUT, Ssu2Policy,
+    DateTimeAction, I2pdCongestionPolicy, I2pdPolicy, SSU2_MAX_PACKET_SIZE,
+    SSU2_TERMINATION_TIMEOUT, SSU2_TOKEN_EXPIRATION_THRESHOLD, SSU2_TOKEN_EXPIRATION_TIMEOUT,
+    Ssu2Policy,
 };
 use crate::ssu2_send::{RandomSource, append_address};
 use crate::ssu2_token::{Token, TokenSource, TokenStore};
@@ -294,6 +298,19 @@ pub enum Ssu2Event {
     Disconnected {
         /// С кем.
         ident: IdentHash,
+    },
+    /// Собеседник сообщил, каким видит наш внешний адрес (блок `Address` в
+    /// payload'е `Retry`/`SessionCreated`; i2pd `HandleAddress` →
+    /// `i2p::context.UpdateAddress`, `SSU2Session.cpp:2104`).
+    ///
+    /// Что с этим делать (публиковать ли адрес в своём `RouterInfo`) решает
+    /// роутер: пул только сообщает наблюдение.
+    ExternalAddress {
+        /// Наш адрес, каким его видит собеседник.
+        addr: SocketAddr,
+        /// Через какую сессию узнали (если `RouterInfo` собеседника уже
+        /// известен).
+        from: Option<IdentHash>,
     },
 }
 
@@ -1140,6 +1157,32 @@ impl PoolState {
             debug!(token, %remote, "apply_report: outgoing token stored");
         }
 
+        // Наш внешний адрес из payload'а `Retry`/`SessionCreated` (i2pd
+        // `HandleAddress` → `i2p::context.UpdateAddress`): пул только сообщает
+        // наблюдение, публиковать адрес — решение роутера.
+        if let Some(address) = report.external_address {
+            let from = self.sessions.get(&key).and_then(|s| s.ident);
+            debug!(
+                port = address.port,
+                ip = %address.ip,
+                %remote,
+                "apply_report: our external address as seen by the peer"
+            );
+            self.emit(Ssu2Event::ExternalAddress {
+                addr: SocketAddr::new(address.ip, address.port),
+                from,
+            });
+        }
+
+        // Решение по блоку `DateTime` (i2pd `HandleDateTime`): сам блок сессию
+        // не рвёт — в i2pd он лишь записывает причину завершения и правит
+        // смещение часов (см. `notes/i2pd-bugs.md`, п. 8).
+        if let Some(action) = report.datetime
+            && action != DateTimeAction::Ignore
+        {
+            debug!(?action, %remote, "apply_report: datetime decision");
+        }
+
         // `RouterInfo` инициатора из `SessionConfirmed` (ответчик).
         if let Some(ri_bytes) = report.remote_router_info {
             match self.accept_remote_router_info(key, &ri_bytes, report.remote_static_key) {
@@ -1179,47 +1222,25 @@ impl PoolState {
 
     /// Проверяет `RouterInfo` из `SessionConfirmed` и запоминает собеседника.
     ///
-    /// Зеркалит выбор адреса и проверки из
-    /// `SSU2Session::ProcessSessionConfirmed` (`SSU2Session.cpp:1394-1440`):
-    /// нужен SSU2-адрес семейства удалённого endpoint'а, его `s=` должен
-    /// совпасть с ключом из handshake, а опубликованный `host` — с адресом,
-    /// откуда пришёл пакет. Intro-ключ оттуда же идёт в исходящие заголовки.
+    /// Сами проверки — в [`check_session_confirmed_router_info`]; здесь
+    /// книговедение сессии: intro-ключ для исходящих заголовков и «на роутер
+    /// одна сессия».
     ///
     /// # Errors
     ///
-    /// [`I2PError::Malformed`], если `RouterInfo` не разбирается, в нём нет
-    /// подходящего SSU2-адреса либо ключ/host не совпали.
+    /// Пробрасывает ошибки [`check_session_confirmed_router_info`], а также
+    /// [`I2PError::Malformed`], если сессия успела исчезнуть.
     fn accept_remote_router_info(
         &mut self,
         key: ConnectionId,
         ri_bytes: &[u8],
         static_key: Option<[u8; 32]>,
     ) -> Result<IdentHash> {
-        let ri = FullRouterInfo::from_buffer(ri_bytes)?;
-        let Some(session) = self.sessions.get(&key) else {
+        let Some(remote) = self.sessions.get(&key).map(|s| s.remote) else {
             return Err(I2PError::Malformed("ssu2 pool: session vanished"));
         };
-        let remote = session.remote;
-        let ident = *ri.ident_hash();
-        let Some(addr) = ri.body().ssu2_address(remote.is_ipv6()) else {
-            return Err(I2PError::Malformed(
-                "ssu2 pool: no SSU2 address of that family in remote RouterInfo",
-            ));
-        };
-        if addr.published && addr.host != remote.ip() {
-            return Err(I2PError::Malformed(
-                "ssu2 pool: published host mismatch (address spoofing?)",
-            ));
-        }
-        if let Some(expected) = static_key
-            && *addr.s.as_bytes() != expected
-        {
-            return Err(I2PError::Malformed(
-                "ssu2 pool: static key mismatch in remote RouterInfo",
-            ));
-        }
-        let intro_key = *addr.i.as_bytes();
-        let published = addr.published;
+        let (ident, intro_key, published) =
+            check_session_confirmed_router_info(ri_bytes, remote, static_key)?;
         let Some(session) = self.sessions.get_mut(&key) else {
             return Err(I2PError::Malformed("ssu2 pool: session vanished"));
         };
@@ -1329,12 +1350,21 @@ impl PoolState {
                 PendingBlock::RouterInfo(body) => {
                     // i2pd `HandleRouterInfo` (`SSU2Session.cpp:2001`): тело
                     // блока = `flags` + `frag` + `RouterInfo` (возможно,
-                    // gzip-сжатый) — снимаем их перед разбором.
+                    // gzip-сжатый) — снимаем их перед разбором; подпись
+                    // проверяется, как при добавлении в netDb
+                    // (`netdb.AddRouterInfo`).
                     match RouterInfoBlock::parse(&body).and_then(|block| block.body()) {
-                        Ok(ri_bytes) => self.emit(Ssu2Event::RouterInfo {
-                            from: ident,
-                            ri_bytes: ri_bytes.into_owned(),
-                        }),
+                        Ok(ri_bytes) => match FullRouterInfo::from_buffer(&ri_bytes)
+                            .and_then(|ri| ri.verify(&ri_bytes))
+                        {
+                            Ok(()) => self.emit(Ssu2Event::RouterInfo {
+                                from: ident,
+                                ri_bytes: ri_bytes.into_owned(),
+                            }),
+                            Err(error) => {
+                                warn!(ident = %ident.to_base64(), %error, "apply_data_report: RouterInfo signature rejected");
+                            }
+                        },
                         Err(error) => {
                             warn!(ident = %ident.to_base64(), %error, "apply_data_report: malformed RouterInfo block");
                         }
@@ -1566,6 +1596,71 @@ impl PoolState {
 
 // --- задача и вспомогательное -------------------------------------------
 
+/// Проверяет `RouterInfo`, полученный в `SessionConfirmed` (ответчик).
+///
+/// Зеркалит `SSU2Session::ProcessSessionConfirmed`
+/// (`SSU2Session.cpp:1353-1420`): подпись, свежесть (`timestamp`), версия,
+/// SSU2-адрес семейства адреса пакета, совпадение опубликованного `host` с
+/// адресом, откуда пришёл пакет, и `s=` со статическим ключом рукопожатия.
+///
+/// Возвращает `ident`, intro-ключ собеседника и признак «адрес опубликован»
+/// (неопубликованный адрес — нормальный случай для NAT).
+///
+/// # Errors
+///
+/// [`I2PError::Malformed`] — RI не разбирается, подпись не сходится, RI
+/// слишком старый или из будущего, версия слишком старая (и нет `caps=O`),
+/// нет SSU2-адреса нужного семейства, не совпали `host` или `s=`.
+pub fn check_session_confirmed_router_info(
+    ri_bytes: &[u8],
+    remote: SocketAddr,
+    static_key: Option<[u8; 32]>,
+) -> Result<(IdentHash, [u8; 32], bool)> {
+    let ri = FullRouterInfo::from_buffer(ri_bytes)?;
+    // i2pd проверяет подпись ещё при разборе RI (`ExtractRouterInfo` →
+    // конструктор `RouterInfo`); непроверяемый RI не пускается дальше.
+    ri.verify(ri_bytes)?;
+    // Свежесть и версия (`:1355-1372`).
+    let now_ms = unix_now().0;
+    let ts = ri.body().timestamp;
+    if now_ms > ts.saturating_add(millis(NETDB_MIN_EXPIRATION_TIMEOUT)) {
+        return Err(I2PError::Malformed(
+            "ssu2 pool: RouterInfo in SessionConfirmed is too old",
+        ));
+    }
+    if ts > now_ms.saturating_add(millis(NETDB_EXPIRATION_TIMEOUT_THRESHOLD)) {
+        return Err(I2PError::Malformed(
+            "ssu2 pool: RouterInfo in SessionConfirmed is from the future",
+        ));
+    }
+    if ri.body().version.unwrap_or(0) < NETDB_MIN_ALLOWED_VERSION
+        && !ri.body().caps.is_high_bandwidth()
+    {
+        return Err(I2PError::Malformed(
+            "ssu2 pool: RouterInfo version is too old",
+        ));
+    }
+    let ident = *ri.ident_hash();
+    let Some(addr) = ri.body().ssu2_address(remote.is_ipv6()) else {
+        return Err(I2PError::Malformed(
+            "ssu2 pool: no SSU2 address of that family in remote RouterInfo",
+        ));
+    };
+    if addr.published && addr.host != remote.ip() {
+        return Err(I2PError::Malformed(
+            "ssu2 pool: published host mismatch (address spoofing?)",
+        ));
+    }
+    if let Some(expected) = static_key
+        && *addr.s.as_bytes() != expected
+    {
+        return Err(I2PError::Malformed(
+            "ssu2 pool: static key mismatch in remote RouterInfo",
+        ));
+    }
+    Ok((ident, *addr.i.as_bytes(), addr.published))
+}
+
 /// Задача пула: сокет, команды, тик.
 async fn run(
     socket: UdpSocket,
@@ -1661,6 +1756,11 @@ fn unix_now() -> (u64, u32) {
 /// Микросекунды (лаг очереди отправки).
 fn micros(now: Duration) -> u64 {
     u64::try_from(now.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Миллисекунды из `Duration` (сверка `timestamp` `RouterInfo` с `now`).
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Секунды из `Duration` (для токенов).

@@ -4,13 +4,14 @@
 //! пакетов передаются напрямую, как это делал бы UDP-транспорт. Проверяются
 //! состояния, содержимое пакетов, обмен токеном и переход в data phase.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use uu_i2p::{
     crypto::I2PX25519Keys,
     i2np::I2npMessageType,
     i2np_message::I2npMessage,
-    ssu2_block::{RouterInfoBlock, Ssu2Block, Ssu2TerminationReason},
+    ssu2_block::{AddressBlock, RouterInfoBlock, Ssu2Block, Ssu2TerminationReason},
     ssu2_conn::{
         ConnContext, ConnParams, ConnReport, HandshakeRole, ResponderEnv, Ssu2Connection,
         peek_dest_conn_id, peek_long_header_ids,
@@ -21,7 +22,7 @@ use uu_i2p::{
     },
     ssu2_header::ConnectionId,
     ssu2_lifecycle::Ssu2SessionState,
-    ssu2_policy::{I2pdCongestionPolicy, I2pdPolicy, Ssu2Policy},
+    ssu2_policy::{DateTimeAction, I2pdCongestionPolicy, I2pdPolicy, Ssu2Policy},
     ssu2_send::RandomSource,
 };
 
@@ -409,6 +410,50 @@ fn retry_with_zero_token_rejects_connection() {
 
     let report = w.alice_recv(base_time(), &mut retry, 0);
     assert!(report.rejected);
+    assert_eq!(report.packets.len(), 0);
+    assert_eq!(w.alice.state(), Ssu2SessionState::Failed);
+}
+
+/// Payload `Retry` разбирается (i2pd `ProcessRetry` → `HandlePayload`):
+/// `Address` — наш внешний адрес, `DateTime` — решение по часам,
+/// `Termination` — отказ ответчика.
+#[test]
+fn retry_payload_reports_address_datetime_and_termination() {
+    let mut w = World::new(vec![0xAB; RI_LEN]);
+    let address = AddressBlock {
+        port: 5555,
+        ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+    };
+    let params = RetryParams {
+        dest_conn_id: ALICE_ID,
+        source_conn_id: BOB_ID,
+        packet_num: 7,
+        token: 0,
+        now_secs: NOW_SECS,
+        valid_packets: 0,
+        address: Some(&address),
+        reason: Some(Ssu2TerminationReason::IncompatibleVersion),
+        pad_roll: 0xFF,
+    };
+    let mut retry = build_retry(
+        &I2pdPolicy,
+        &HandshakeConfig::default(),
+        &BOB_INTRO,
+        &params,
+    )
+    .expect("retry");
+
+    let report = w.alice_recv(base_time(), &mut retry, 0);
+    assert_eq!(
+        report.external_address,
+        Some(address),
+        "`Address` из `Retry` — наш внешний адрес"
+    );
+    // `DateTime` обрабатывается и для отказавшего `Retry` (i2pd: «to handle
+    // Datetime block and adjust clock in case of clock skew»). В тестовом
+    // режиме выключено, поэтому решение — ничего не делать.
+    assert_eq!(report.datetime, Some(DateTimeAction::Ignore));
+    assert!(report.rejected, "`Termination` — отказ ответчика");
     assert_eq!(report.packets.len(), 0);
     assert_eq!(w.alice.state(), Ssu2SessionState::Failed);
 }

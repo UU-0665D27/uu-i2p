@@ -150,6 +150,55 @@
   `pending_endpoint_blocks_duplicate_connect_until_session_dies`
   (`tests/ssu2_pool.rs`).
 
+## 8. SSU2: рассинхрон часов в рукопожатии — причина завершения вместо решения
+
+- Файлы: `SSU2Session.cpp` — `HandleDateTime` (`:1964`), `ProcessSessionRequest`
+  (`:944-955`), `SendRetry` (`:1562`), `ProcessRetry` (`:1602`),
+  `HandlePayload`/Termination (`:1843`), `SendTermination` (`:3286`).
+- Что не так: `HandleDateTime` в фазах `SessionRequestReceived`,
+  `TokenRequestReceived`, `Established` при `|offset| > SSU2_CLOCK_SKEW` (60 с)
+  просто пишет `m_TerminationReason = ClockSkew` и ничего больше. А эта
+  переменная в рукопожатии используется как **управляющий флаг**: сразу после
+  `HandlePayload` в `ProcessSessionRequest` стоит
+  `if (m_TerminationReason == NormalClose) SendSessionCreated(); else SendRetry();`.
+  То есть рассинхрон часов превращается в «ответить `Retry` вместо
+  `SessionCreated`».
+- Усугубляет `SendRetry`: токен он кладёт только при `NormalClose`
+  (`:1577`), а `Termination`-блок — наоборот, только когда причина **не**
+  `NormalClose` (`:1586`). Значит `Retry` про рассинхрон часов всегда приходит
+  с нулевым токеном.
+- На стороне Alice `ProcessRetry` разбирает payload (`HandlePayload` видит
+  `Termination` с причиной `ClockSkew` и делает `Done()`), после чего упирается
+  в `if (!token) return false` и пишет в лог `SSU2: Retry token is zero`
+  (комментарий рядом: «we should handle payload even for zero token to handle
+  Datetime block and adjust clock in case of clock skew»). В итоге в логе
+  причина — «нулевой токен», а не рассинхрон часов.
+- Там же мёртвый код: `if (m_TerminationReason == IncompatibleVersion) m_Version = 2;`
+  (`:1639`) стоит **до** проверки нулевого токена, а `Retry` с
+  `Termination(IncompatibleVersion)` всегда с нулевым токеном (см. выше).
+  Значит понижение версии (PQ → 2) в рамках одной попытки недостижимо: вместо
+  повторного `SessionRequest` на версии 2 Alice просто ждёт connect-таймаут.
+- В установленной сессии та же запись `m_TerminationReason = ClockSkew` не
+  читается никем: в data-пути этой переменной не пользуются (только
+  `SendRetry`/`SendSessionCreated`, обработка блока `Termination` и
+  `SendTermination`). Рассинхрон часов молча игнорируется, а если сессия
+  позже закроется по другой причине, `SendTermination` (`:3286`) отправит
+  `reason = ClockSkew` — неверную причину.
+- Триггер: разница часов между роутерами больше 60 с (или подмена
+  `DateTime`-блока в `SessionRequest`).
+- Последствие: установление соединения срывается, причём в логах Alice причина
+  выглядит как «Retry token is zero»; в установленной сессии рассинхрон часов
+  не приводит ни к чему, зато портит причину в `Termination`.
+- Статус: в локальном клоне (`79ae673d`) не исправлено.
+- У нас: поведение разобрано и повторено на уровне решений — фаза для
+  `DateTime` считается по состоянию сессии (`ssu2_engine::handshake_phase`),
+  решение отдаётся наружу (`ConnReport::datetime`, `RecvReport::datetime`), а
+  `Retry` с блоком `Termination` отвергает соединение сразу
+  (`ConnReport::rejected`, `recv_retry`) — без опоры на нулевой токен и с
+  понятной причиной в логе. (В i2pd `Termination` вместе с **ненулевым**
+  токеном привёл бы к попытке продолжить уже завершённую сессию; такого
+  сочетания i2pd не отправляет, у нас это тоже отказ.)
+
 ---
 
 ## Шаблон новой записи
