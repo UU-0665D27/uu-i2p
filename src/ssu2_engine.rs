@@ -61,7 +61,7 @@ use crate::ssu2_crypto::{DataPhaseKey, DataPhaseKeys};
 use crate::ssu2_data::{SSU2_DATA_OVERHEAD, decode_data_packet, encode_data_packet};
 use crate::ssu2_fragments::IncompleteMessages;
 use crate::ssu2_header::{
-    ConnectionId, SSU2_FLAG_IMMEDIATE_ACK_REQUESTED, ShortHeader, Ssu2MessageType,
+    ConnectionId, SSU2_FLAG_IMMEDIATE_ACK_REQUESTED, ShortHeader, Ssu2MessageType, header_mask,
 };
 use crate::ssu2_lifecycle::{SessionLifecycle, Ssu2SessionState};
 use crate::ssu2_policy::{
@@ -499,6 +499,25 @@ impl Ssu2DataSession {
     /// из `RouterInfo` инициатора, уже после обработки `SessionConfirmed`.
     pub const fn set_remote_intro_key(&mut self, intro_key: [u8; 32]) {
         self.params.remote_intro_key = intro_key;
+    }
+
+    /// Тип входящего пакета по второй половине cover-заголовка — тем же ключом,
+    /// каким i2pd разбирает его в `ProcessData` (`SSU2Session.cpp:1742`).
+    ///
+    /// У настоящего data-пакета это [`Ssu2MessageType::Data`]. Другое значение
+    /// (или `None` на коротком пакете) означает, что собеседник повторил
+    /// handshake-пакет — тогда отвечает [`crate::ssu2_conn`]
+    /// (`ResendHandshakePacket`/`SendQuickAck`), а не data-слой.
+    ///
+    /// Пакет не изменяется: ключ применяется к копии байтов заголовка.
+    #[must_use]
+    pub fn peek_message_type(&self, packet: &[u8]) -> Option<Ssu2MessageType> {
+        let end = packet.len();
+        let tail = packet.get(end.checked_sub(12)?..end)?;
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(tail);
+        let mask = header_mask(&self.recv_key.k_header_2, &iv);
+        Ssu2MessageType::from_u8(*packet.get(12)? ^ mask[4]).ok()
     }
 
     /// Принимает один data-пакет: деобфусцирует, расшифровывает, разбирает

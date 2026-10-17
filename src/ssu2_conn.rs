@@ -142,6 +142,10 @@ pub struct ConnReport {
     /// известен лишь из [`ConnReport::remote_router_info`], а без него
     /// заголовок `QuickAck` не замаскировать (i2pd берёт его из `m_Address`,
     /// заполненного в `ProcessSessionConfirmed`, `:1394`).
+    ///
+    /// Флаг поднимается и в установленной сессии, когда вместо data-пакета
+    /// пришёл повторный handshake-пакет (i2pd `ProcessData`,
+    /// `SSU2Session.cpp:1746`); тогда intro-ключ уже известен.
     pub quick_ack_pending: bool,
     /// Отчёт data-слоя, если входящий пакет оказался data-пакетом.
     pub data: Option<RecvReport>,
@@ -1058,7 +1062,17 @@ impl Ssu2Connection {
         packet: &mut [u8],
         ctx: &mut ConnContext<'_, R>,
     ) -> Result<ConnReport> {
-        let awaiting_ack = self.lifecycle.state() == Ssu2SessionState::SessionConfirmedSent;
+        let state = self.lifecycle.state();
+        let awaiting_ack = state == Ssu2SessionState::SessionConfirmedSent;
+        let is_data = {
+            let data = self.data.as_ref().ok_or(I2PError::Malformed(
+                "ssu2: data packet before handshake completion",
+            ))?;
+            data.peek_message_type(packet) == Some(Ssu2MessageType::Data)
+        };
+        if !is_data {
+            return Ok(self.non_data_report());
+        }
         let data = self.data.as_mut().ok_or(I2PError::Malformed(
             "ssu2: data packet before handshake completion",
         ))?;
@@ -1075,6 +1089,44 @@ impl Ssu2Connection {
             report.established = true;
         }
         Ok(report)
+    }
+
+    /// Ответ на пакет, который в data-состоянии оказался не data-пакетом
+    /// (i2pd `ProcessData`, `SSU2Session.cpp:1743-1751`).
+    ///
+    /// Так приходит повторный handshake-пакет — например, повторный
+    /// `SessionCreated`, если наш `SessionConfirmed` потерялся. i2pd в
+    /// `SessionConfirmedSent` повторяет `SessionConfirmed`
+    /// (`ResendHandshakePacket`), в `Established` шлёт `QuickAck` («in case it
+    /// was `SessionConfirmed`»), в `Closing` — `ResendHandshakePacket`, который к
+    /// тому моменту уже сброшен, то есть ничего.
+    fn non_data_report(&self) -> ConnReport {
+        match self.lifecycle.state() {
+            Ssu2SessionState::SessionConfirmedSent => {
+                debug!(
+                    packets = self.sent_handshake.len(),
+                    "recv_data: not a data packet; resending handshake"
+                );
+                ConnReport {
+                    packets: self.sent_handshake.clone(),
+                    ..ConnReport::default()
+                }
+            }
+            Ssu2SessionState::Established => {
+                debug!("recv_data: not a data packet; sending QuickAck");
+                ConnReport {
+                    quick_ack_pending: true,
+                    ..ConnReport::default()
+                }
+            }
+            state => {
+                debug!(
+                    state = state.name(),
+                    "recv_data: not a data packet; ignored"
+                );
+                ConnReport::default()
+            }
+        }
     }
 }
 

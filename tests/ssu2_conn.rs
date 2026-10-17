@@ -188,7 +188,16 @@ impl World {
 
     /// Полное рукопожатие до `Established` с обеих сторон.
     fn through_established(&mut self, now: Duration) -> ConnReport {
-        let mut created = self.through_session_created(now);
+        let (report, _created) = self.through_established_full(now);
+        report
+    }
+
+    /// Как [`Self::through_established`], но возвращает ещё и `SessionCreated`
+    /// ответчика: тестам он нужен, чтобы повторить handshake-пакет, когда
+    /// сессия уже в data-состоянии.
+    fn through_established_full(&mut self, now: Duration) -> (ConnReport, Vec<u8>) {
+        let created_original = self.through_session_created(now);
+        let mut created = created_original.clone();
         let confirmed = self.alice_recv(now + ms(40), &mut created, 0);
         assert_eq!(
             self.alice.state(),
@@ -225,7 +234,7 @@ impl World {
         assert!(report.established, "инициатор установил сессию по Ack");
         assert_eq!(self.alice.state(), Ssu2SessionState::Established);
         assert_eq!(self.bob.state(), Ssu2SessionState::Established);
-        report
+        (report, created_original)
     }
 }
 
@@ -448,6 +457,47 @@ fn connect_timer_expires() {
         !w.alice
             .connect_expired(now + I2pdPolicy.connect_timeout() * 4)
     );
+}
+
+#[test]
+fn repeated_session_created_resends_session_confirmed() {
+    let mut w = World::new(vec![0xAB; RI_LEN]);
+    let now = base_time();
+    let created = w.through_session_created(now);
+    let mut first = created.clone();
+    let confirmed = w.alice_recv(now + ms(40), &mut first, 0);
+    assert_eq!(w.alice.state(), Ssu2SessionState::SessionConfirmedSent);
+
+    // Наш `SessionConfirmed` потерялся, Bob повторяет `SessionCreated`
+    // (i2pd `ProcessData`: тип не `Data` → `ResendHandshakePacket`).
+    let mut repeat = created;
+    let report = w.alice_recv(now + ms(50), &mut repeat, 0);
+    assert_eq!(
+        report.packets, confirmed.packets,
+        "инициатор повторяет те же `SessionConfirmed`"
+    );
+    assert!(
+        report.data.is_none(),
+        "повтор не разбирается как data-пакет"
+    );
+    assert_eq!(w.alice.state(), Ssu2SessionState::SessionConfirmedSent);
+}
+
+#[test]
+fn non_data_packet_after_established_requests_quick_ack() {
+    let mut w = World::new(vec![0xAB; RI_LEN]);
+    let now = base_time();
+    let (report, created) = w.through_established_full(now);
+    assert!(report.established);
+
+    // Не-data пакет в `Established`: i2pd шлёт `QuickAck`
+    // («in case it was SessionConfirmed»).
+    let mut repeat = created;
+    let report = w.alice_recv(now + ms(70), &mut repeat, 0);
+    assert!(report.quick_ack_pending);
+    assert!(!report.established);
+    assert_eq!(report.packets, Vec::<Vec<u8>>::new());
+    assert_eq!(w.alice.state(), Ssu2SessionState::Established);
 }
 
 // ---- data phase ---------------------------------------------------------

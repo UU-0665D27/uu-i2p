@@ -5,7 +5,7 @@
 //! Внешний i2pd не нужен — оба конца наши.
 
 use rand::Rng;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout};
@@ -41,21 +41,31 @@ fn now_ms() -> u64 {
     .expect("milliseconds since epoch exceeds u64")
 }
 
-/// Узел: пул и его `RouterInfo` (для передачи собеседнику).
+/// Узел: пул, его `RouterInfo` (для передачи собеседнику) и адрес сокета.
 struct Node {
     pool: Ssu2Pool,
     ri: Vec<u8>,
+    addr: SocketAddr,
+}
+
+/// Поднимает узел, публикующий в `RouterInfo` настоящий порт сокета.
+async fn make_node() -> Node {
+    make_node_advertising(None).await
 }
 
 /// Поднимает узел: сокет на эфемерном порту 127.0.0.1 и **опубликованный**
-/// SSU2-адрес с этим портом (иначе инициатор не найдёт, куда подключаться).
+/// SSU2-адрес (иначе инициатор не найдёт, куда подключаться).
+///
+/// `advertised_port` позволяет опубликовать заведомо недостижимый порт —
+/// так проверяется [`Ssu2Pool::connect_to`].
 ///
 /// `RouterInfo` собирается вручную: `RouterConfig` запрещает публиковать
 /// loopback-адрес (в реальном роутере это бессмысленно), а тесту нужен именно
 /// локальный адрес с настоящим портом сокета.
-async fn make_node() -> Node {
+async fn make_node_advertising(advertised_port: Option<u16>) -> Node {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
-    let port = socket.local_addr().expect("local_addr").port();
+    let addr = socket.local_addr().expect("local_addr");
+    let port = advertised_port.unwrap_or_else(|| addr.port());
     let keys = I2PPrivateKeys::generate_default().expect("generate keys");
     let static_keys = I2PX25519Keys::generate();
     let mut intro = [0u8; 32];
@@ -78,13 +88,18 @@ async fn make_node() -> Node {
     let local = Ssu2Local::new(static_keys, intro, ri_bytes.clone(), DEFAULT_NET_ID, false)
         .expect("Ssu2Local");
     info!(
-        port,
+        %addr,
+        published_port = port,
         ri_len = ri_bytes.len(),
         ident = %ri.ident_hash().to_base64(),
         "node ready"
     );
     let pool = Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool");
-    Node { pool, ri: ri_bytes }
+    Node {
+        pool,
+        ri: ri_bytes,
+        addr,
+    }
 }
 
 /// Ждёт событие по предикату, сохраняя все прочие (их можно искать позже).
@@ -314,4 +329,28 @@ async fn reconnect_after_close() {
         }
     }
     assert_ne!(alice_ident, bob_ident);
+}
+
+#[tokio::test]
+async fn connect_to_explicit_address() {
+    init_tracing();
+    let alice = make_node().await;
+    // Bob публикует недостижимый порт: обычный `connect` по `RouterInfo` до
+    // него не дошёл бы, а `connect_to` использует настоящий адрес сокета.
+    let bob = make_node_advertising(Some(1)).await;
+    let bob_ident = *bob.pool.ident();
+    let mut alice_events: Vec<Ssu2Event> = Vec::new();
+
+    let ident = alice
+        .pool
+        .connect_to(&bob.ri, bob.addr)
+        .await
+        .expect("connect_to");
+    assert_eq!(ident, bob_ident);
+
+    let established = wait_event(&alice.pool, &mut alice_events, "alice Established", |e| {
+        matches!(e, Ssu2Event::Established { .. })
+    })
+    .await;
+    assert_eq!(established, Ssu2Event::Established { ident: bob_ident });
 }

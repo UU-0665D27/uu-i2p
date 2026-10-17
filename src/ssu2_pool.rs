@@ -303,6 +303,8 @@ enum Command {
     Connect {
         /// `RouterInfo` собеседника.
         ri_bytes: Vec<u8>,
+        /// Адрес вместо опубликованного в `RouterInfo` (для [`Ssu2Pool::connect_to`]).
+        addr: Option<SocketAddr>,
         /// Ответ: `IdentHash` (сразу после отправки первого пакета).
         reply: oneshot::Sender<Result<IdentHash>>,
     },
@@ -408,10 +410,35 @@ impl Ssu2Pool {
     ///   или соединение с этим endpoint'ом уже устанавливается;
     /// - [`I2PError::Io`] — пул остановлен.
     pub async fn connect(&self, remote_ri_bytes: &[u8]) -> Result<IdentHash> {
+        self.send_connect(remote_ri_bytes, None).await
+    }
+
+    /// Начинает соединение с роутером, но адрес берёт из `addr`, а не из
+    /// опубликованного SSU2-адреса в `RouterInfo`.
+    ///
+    /// Ключи (`s=`, `i=`) всё равно берутся из `RouterInfo` — подменяется
+    /// только транспортный адрес. Нужно, когда опубликованный адрес
+    /// недостижим с нашей стороны (NAT, тест на localhost); i2pd в
+    /// `SSU2Server::CreateSession` такого выбора не даёт и всегда идёт на
+    /// опубликованный адрес.
+    ///
+    /// # Errors
+    ///
+    /// Как у [`Self::connect`].
+    pub async fn connect_to(&self, remote_ri_bytes: &[u8], addr: SocketAddr) -> Result<IdentHash> {
+        self.send_connect(remote_ri_bytes, Some(addr)).await
+    }
+
+    async fn send_connect(
+        &self,
+        remote_ri_bytes: &[u8],
+        addr: Option<SocketAddr>,
+    ) -> Result<IdentHash> {
         let (reply, wait) = oneshot::channel();
         self.cmds
             .send(Command::Connect {
                 ri_bytes: remote_ri_bytes.to_vec(),
+                addr,
                 reply,
             })
             .await
@@ -597,8 +624,12 @@ impl PoolState {
     /// Команда от вызывающего.
     fn on_command(&mut self, command: Command, out: &mut OutQueue) {
         match command {
-            Command::Connect { ri_bytes, reply } => {
-                let result = self.start_connect(&ri_bytes, out);
+            Command::Connect {
+                ri_bytes,
+                addr,
+                reply,
+            } => {
+                let result = self.start_connect(&ri_bytes, addr, out);
                 let _ = reply.send(result);
             }
             Command::Send {
@@ -898,15 +929,34 @@ impl PoolState {
     }
 
     /// Начинает исходящее соединение (i2pd `SSU2Session::Connect`).
-    fn start_connect(&mut self, ri_bytes: &[u8], out: &mut OutQueue) -> Result<IdentHash> {
+    ///
+    /// `addr_override` — адрес вместо опубликованного в `RouterInfo` (см.
+    /// [`Ssu2Pool::connect_to`]); ключи всегда берутся из `RouterInfo`.
+    fn start_connect(
+        &mut self,
+        ri_bytes: &[u8],
+        addr_override: Option<SocketAddr>,
+        out: &mut OutQueue,
+    ) -> Result<IdentHash> {
         let remote_ri = FullRouterInfo::from_buffer(ri_bytes)?;
         let ident = *remote_ri.ident_hash();
         if let Some(key) = self.by_ident.get(&ident) {
             debug!(ident = %ident.to_base64(), conn_id = ?key, "start_connect: session already exists");
             return Ok(ident);
         }
-        let addr = find_ssu2_address(&remote_ri, self.local.ipv6())?;
-        let remote = SocketAddr::new(addr.host, addr.port);
+        let published = find_ssu2_address(&remote_ri, self.local.ipv6())?;
+        let remote = match addr_override {
+            Some(addr) => addr,
+            None if is_reachable_address(published) => {
+                SocketAddr::new(published.host, published.port)
+            }
+            None => {
+                return Err(I2PError::Malformed(
+                    "ssu2 pool: no published SSU2 address in remote RouterInfo",
+                ));
+            }
+        };
+        let addr = published;
         if self.by_endpoint.contains_key(&remote) {
             return Err(I2PError::Malformed(
                 "ssu2 pool: connect to that endpoint is already pending",
@@ -1536,26 +1586,32 @@ const fn address_block(from: SocketAddr) -> AddressBlock {
     }
 }
 
-/// Ищет опубликованный SSU2-адрес в `RouterInfo` (сначала семейства
-/// `prefer_v6`, затем другого).
+/// Ищет SSU2-адрес в `RouterInfo` (сначала семейства `prefer_v6`, затем
+/// другого).
+///
+/// Возвращает в том числе неопубликованный адрес — он всё равно несёт `s=`/`i=`
+/// (нужны для рукопожатия), — поэтому проверку «есть куда подключаться» делает
+/// вызывающий (см. [`is_reachable_address`]).
 ///
 /// # Errors
 ///
-/// [`I2PError::Malformed`], если опубликованного SSU2-адреса нет.
+/// [`I2PError::Malformed`], если SSU2-адреса нет вовсе.
 fn find_ssu2_address(ri: &FullRouterInfo, prefer_v6: bool) -> Result<&I2PAddress> {
-    let usable = |addr: &&I2PAddress| {
-        addr.is_ssu2() && addr.published && !addr.host.is_unspecified() && addr.port != 0
-    };
+    let usable = |addr: &&I2PAddress| addr.is_ssu2();
     ri.body()
         .ssu2_address(prefer_v6)
         .filter(usable)
         .or_else(|| ri.body().ssu2_address(!prefer_v6).filter(usable))
         .ok_or(I2PError::Malformed(
-            "ssu2 pool: no published SSU2 address in remote RouterInfo",
+            "ssu2 pool: no SSU2 address in remote RouterInfo",
         ))
 }
 
-/// Unix-время: `(миллисекунды, секунды)`.
+/// Можно ли подключаться по этому адресу: опубликован, с хостом и портом.
+const fn is_reachable_address(addr: &I2PAddress) -> bool {
+    addr.published && !addr.host.is_unspecified() && addr.port != 0
+}
+
 /// Текущее время — миллисекунды since epoch (как i2pd
 /// `GetMillisecondsSinceEpoch`).
 ///
@@ -1578,7 +1634,7 @@ fn unix_now() -> (u64, u32) {
     )
 }
 
-/// Монотонные микросекунды (лаг очереди отправки).
+/// Микросекунды (лаг очереди отправки).
 fn micros(now: Duration) -> u64 {
     u64::try_from(now.as_micros()).unwrap_or(u64::MAX)
 }
