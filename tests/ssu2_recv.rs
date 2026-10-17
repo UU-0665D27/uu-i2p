@@ -1,6 +1,7 @@
 use uu_i2p::{
     ssu2_block::Ssu2BlockType,
     ssu2_header::SSU2_FLAG_IMMEDIATE_ACK_REQUESTED,
+    ssu2_policy::{DateTimeAction, DateTimeSession, HandshakePhase, I2pdPolicy},
     ssu2_recv::{self, PayloadSink},
     ssu2_session::ReceiveState,
 };
@@ -323,4 +324,45 @@ fn process_data_packet_zero_is_always_processed() {
     ssu2_recv::process_data(0, 0, &block(ACK, &[0, 0, 0, 2, 0]), &mut state, &mut sink);
     assert_eq!(sink.0.len(), 2);
     assert_eq!(state.receive_packet_num(), 0, "номер 0 не учитывается");
+}
+
+#[test]
+fn handle_datetime_short_body_is_ignored() {
+    let session = DateTimeSession {
+        phase: HandshakePhase::Established,
+        testing: false,
+        sync_clock_from_peers: false,
+    };
+    assert_eq!(
+        ssu2_recv::handle_datetime(&I2pdPolicy, &[0, 0, 0], 1000, &session),
+        DateTimeAction::Ignore
+    );
+    assert_eq!(
+        ssu2_recv::handle_datetime(&I2pdPolicy, &[], 1000, &session),
+        DateTimeAction::Ignore
+    );
+}
+
+#[test]
+fn handle_datetime_computes_offset_from_now() {
+    let session = DateTimeSession {
+        phase: HandshakePhase::Established,
+        testing: false,
+        sync_clock_from_peers: false,
+    };
+    // now - remote = 100 -> вне допуска -> Terminate.
+    assert_eq!(
+        ssu2_recv::handle_datetime(&I2pdPolicy, &900u32.to_be_bytes(), 1000, &session),
+        DateTimeAction::Terminate
+    );
+    // now - remote = 60 = ровно допуск -> ничего.
+    assert_eq!(
+        ssu2_recv::handle_datetime(&I2pdPolicy, &940u32.to_be_bytes(), 1000, &session),
+        DateTimeAction::Ignore
+    );
+    // remote впереди: offset = -610 -> тоже Terminate.
+    assert_eq!(
+        ssu2_recv::handle_datetime(&I2pdPolicy, &1610u32.to_be_bytes(), 1000, &session),
+        DateTimeAction::Terminate
+    );
 }

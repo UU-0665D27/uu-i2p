@@ -164,6 +164,40 @@ impl Ssu2CloseReason {
     }
 }
 
+/// Состояние сессии и роутера, влияющее на решение по блоку `DateTime`.
+///
+/// Аналог аргументов `HandleDateTime` (`SSU2Session.cpp:1964`): фаза сессии
+/// (`m_State`), тестовый режим роутера для семейства удалённого конца и
+/// `m_Server.IsSyncClockFromPeers`. Семейство адреса разрешает вызывающий —
+/// в i2pd это `(is_v4 && GetTesting()) || (is_v6 && GetTestingV6())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateTimeSession {
+    /// Фаза сессии (i2pd `m_State`).
+    pub phase: HandshakePhase,
+    /// Роутер в тестовом режиме для семейства удалённого конца.
+    pub testing: bool,
+    /// `m_Server.IsSyncClockFromPeers()`.
+    pub sync_clock_from_peers: bool,
+}
+
+/// Что делать по блоку `DateTime` — результат [`Ssu2Policy::datetime_action`].
+///
+/// Соответствует ветвям `HandleDateTime` (в i2pd это запись в
+/// `m_TerminationReason`, вызов `AdjustTimeOffset` или `SetError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateTimeAction {
+    /// Ничего не делать.
+    Ignore,
+    /// Сессию нужно завершить с причиной `ClockSkew`.
+    Terminate,
+    /// Скорректировать смещение часов (i2pd `AdjustTimeOffset`) на это число
+    /// секунд; `0` — сбросить коррекцию.
+    AdjustTimeOffset(i64),
+    /// Выставить ошибку роутера `ClockSkew` (i2pd
+    /// `SetError (eRouterErrorClockSkew)`).
+    ClockSkewError,
+}
+
 // --- трейт ---------------------------------------------------------------
 
 /// Решения SSU2. Методы по умолчанию соответствуют i2pd.
@@ -261,6 +295,48 @@ pub trait Ssu2Policy: Send + Sync {
                 | HandshakePhase::TokenRequestReceived
                 | HandshakePhase::Established
         ) && offset_secs.unsigned_abs() > self.clock_skew_tolerance().as_secs()
+    }
+
+    /// Решение по блоку `DateTime` при расхождении `offset_secs`
+    /// (`now - remote`, секунды).
+    ///
+    /// Точный разбор `HandleDateTime`: в фазах запроса (`SessionRequestReceived`,
+    /// `TokenRequestReceived`) и установленной сессии расхождение больше допуска
+    /// завершает сессию; в фазах ответа (`SessionCreatedReceived`,
+    /// `TokenReceived`) и только в тестовом режиме (v4/v6) — либо синхронизирует
+    /// часы с пиром (порог [`Self::clock_adjust_threshold`]), либо, если
+    /// синхронизация от пиров выключена, выставляет ошибку роутера. Прочие фазы
+    /// ничего не делают.
+    fn datetime_action(&self, session: &DateTimeSession, offset_secs: i64) -> DateTimeAction {
+        match session.phase {
+            HandshakePhase::SessionRequestReceived
+            | HandshakePhase::TokenRequestReceived
+            | HandshakePhase::Established => {
+                if self.clock_skew_terminates(session.phase, offset_secs) {
+                    DateTimeAction::Terminate
+                } else {
+                    DateTimeAction::Ignore
+                }
+            }
+            HandshakePhase::SessionCreatedReceived | HandshakePhase::TokenReceived => {
+                if !session.testing {
+                    return DateTimeAction::Ignore;
+                }
+                let offset = offset_secs.unsigned_abs();
+                if session.sync_clock_from_peers {
+                    if offset > self.clock_adjust_threshold().as_secs() {
+                        DateTimeAction::AdjustTimeOffset(-offset_secs)
+                    } else {
+                        DateTimeAction::AdjustTimeOffset(0)
+                    }
+                } else if offset > self.clock_skew_tolerance().as_secs() {
+                    DateTimeAction::ClockSkewError
+                } else {
+                    DateTimeAction::Ignore
+                }
+            }
+            HandshakePhase::Other => DateTimeAction::Ignore,
+        }
     }
 
     // --- padding ---

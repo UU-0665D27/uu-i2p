@@ -3,13 +3,14 @@ use uu_i2p::{
     ssu2_ack::AckLimits,
     ssu2_block::Ssu2TerminationReason,
     ssu2_policy::{
-        HandshakePhase, I2pdCongestionPolicy, I2pdPolicy, SSU2_CLOCK_SKEW, SSU2_CLOCK_THRESHOLD,
-        SSU2_CONNECT_TIMEOUT, SSU2_HANDSHAKE_RESEND_INTERVAL, SSU2_INITIAL_RTO,
-        SSU2_IPV4_HEADER_SIZE, SSU2_MAX_NUM_FRAGMENTS, SSU2_MAX_NUM_RESENDS, SSU2_MAX_PACKET_SIZE,
-        SSU2_MAX_RTO, SSU2_MAX_WINDOW_SIZE, SSU2_MIN_PACKET_SIZE, SSU2_MIN_RTO,
-        SSU2_MIN_WINDOW_SIZE, SSU2_NEXT_TOKEN_EXPIRATION_TIMEOUT, SSU2_PACKET_OVERHEAD,
-        SSU2_PADDING_ROLL_MASK, SSU2_RESEND_ATTEMPT_MIN_INTERVAL, SSU2_RTO_KAPPA,
-        SSU2_RTT_EWMA_ALPHA, SSU2_SEND_DATETIME_NUM_PACKETS, SSU2_TOKEN_EXPIRATION_THRESHOLD,
+        DateTimeAction, DateTimeSession, HandshakePhase, I2pdCongestionPolicy, I2pdPolicy,
+        SSU2_CLOCK_SKEW, SSU2_CLOCK_THRESHOLD, SSU2_CONNECT_TIMEOUT,
+        SSU2_HANDSHAKE_RESEND_INTERVAL, SSU2_INITIAL_RTO, SSU2_IPV4_HEADER_SIZE,
+        SSU2_MAX_NUM_FRAGMENTS, SSU2_MAX_NUM_RESENDS, SSU2_MAX_PACKET_SIZE, SSU2_MAX_RTO,
+        SSU2_MAX_WINDOW_SIZE, SSU2_MIN_PACKET_SIZE, SSU2_MIN_RTO, SSU2_MIN_WINDOW_SIZE,
+        SSU2_NEXT_TOKEN_EXPIRATION_TIMEOUT, SSU2_PACKET_OVERHEAD, SSU2_PADDING_ROLL_MASK,
+        SSU2_RESEND_ATTEMPT_MIN_INTERVAL, SSU2_RTO_KAPPA, SSU2_RTT_EWMA_ALPHA,
+        SSU2_SEND_DATETIME_NUM_PACKETS, SSU2_TOKEN_EXPIRATION_THRESHOLD,
         SSU2_TOKEN_EXPIRATION_TIMEOUT, SSU2_UDP_HEADER_SIZE, Ssu2CloseReason, Ssu2CongestionPolicy,
         Ssu2Policy,
     },
@@ -98,6 +99,81 @@ fn clock_skew_terminates_by_phase() {
     assert!(!p.clock_skew_terminates(HandshakePhase::SessionCreatedReceived, 61));
     assert!(!p.clock_skew_terminates(HandshakePhase::TokenReceived, 61));
     assert!(!p.clock_skew_terminates(HandshakePhase::Other, 9999));
+}
+
+// ---- DateTime ------------------------------------------------------------
+
+/// Контекст `DateTime` (фаза, тестовый режим, синхронизация от пиров).
+fn dt(phase: HandshakePhase, testing: bool, sync_clock_from_peers: bool) -> DateTimeSession {
+    DateTimeSession {
+        phase,
+        testing,
+        sync_clock_from_peers,
+    }
+}
+
+#[test]
+fn datetime_terminates_in_request_phases() {
+    let p = I2pdPolicy;
+    for phase in [
+        HandshakePhase::SessionRequestReceived,
+        HandshakePhase::TokenRequestReceived,
+        HandshakePhase::Established,
+    ] {
+        let s = dt(phase, false, false);
+        assert_eq!(p.datetime_action(&s, 61), DateTimeAction::Terminate);
+        assert_eq!(p.datetime_action(&s, -61), DateTimeAction::Terminate);
+        // Ровно допуск — ещё не Terminate.
+        assert_eq!(p.datetime_action(&s, 60), DateTimeAction::Ignore);
+    }
+}
+
+#[test]
+fn datetime_response_phase_needs_testing() {
+    let p = I2pdPolicy;
+    // Не тестовый режим — молчим даже при огромном расхождении.
+    let s = dt(HandshakePhase::SessionCreatedReceived, false, true);
+    assert_eq!(p.datetime_action(&s, 9999), DateTimeAction::Ignore);
+}
+
+#[test]
+fn datetime_adjusts_when_syncing_from_peers() {
+    let p = I2pdPolicy;
+    let s = dt(HandshakePhase::SessionCreatedReceived, true, true);
+    // Сверх порога (15) — коррекция на -offset.
+    assert_eq!(
+        p.datetime_action(&s, 20),
+        DateTimeAction::AdjustTimeOffset(-20)
+    );
+    assert_eq!(
+        p.datetime_action(&s, -20),
+        DateTimeAction::AdjustTimeOffset(20)
+    );
+    // В пределах порога — сброс коррекции.
+    assert_eq!(
+        p.datetime_action(&s, 15),
+        DateTimeAction::AdjustTimeOffset(0)
+    );
+    assert_eq!(
+        p.datetime_action(&s, 0),
+        DateTimeAction::AdjustTimeOffset(0)
+    );
+}
+
+#[test]
+fn datetime_errors_without_sync_in_testing() {
+    let p = I2pdPolicy;
+    let s = dt(HandshakePhase::TokenReceived, true, false);
+    assert_eq!(p.datetime_action(&s, 61), DateTimeAction::ClockSkewError);
+    // Ровно допуск — ещё не ошибка.
+    assert_eq!(p.datetime_action(&s, 60), DateTimeAction::Ignore);
+}
+
+#[test]
+fn datetime_ignores_other_phases() {
+    let p = I2pdPolicy;
+    let s = dt(HandshakePhase::Other, true, true);
+    assert_eq!(p.datetime_action(&s, 9999), DateTimeAction::Ignore);
 }
 
 // ---- POC-подмена политики ------------------------------------------------

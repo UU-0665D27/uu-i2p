@@ -20,7 +20,8 @@
 //! `Termination` — `size >= 9`; `RelayTag` — `size >= 4`; `NewToken` —
 //! `size >= 12`; `PathResponse` — `size >= 8`. Остальные ограничения
 //! (`DateTime` — `len >= 4`, `RouterInfo` — `len >= 2`) применяет реализация
-//! [`PayloadSink`], как и обработчики в i2pd.
+//! [`PayloadSink`], как и обработчики в i2pd; для `DateTime` обвязка уже есть —
+//! [`handle_datetime`].
 //!
 //! ## Отличия от i2pd
 //!
@@ -34,6 +35,7 @@
 use crate::i2np::{I2NP_MAX_MESSAGE_SIZE, I2NP_MAX_SHORT_MESSAGE_SIZE, I2npMessageType};
 use crate::ssu2_block::Ssu2BlockType;
 use crate::ssu2_header::SSU2_FLAG_IMMEDIATE_ACK_REQUESTED;
+use crate::ssu2_policy::{DateTimeAction, DateTimeSession, Ssu2Policy};
 use crate::ssu2_session::ReceiveState;
 
 /// Итог [`handle_payload`]/[`process_data`] — флаги i2pd `m_IsDataReceived`
@@ -227,6 +229,26 @@ fn dispatch_block<S: PayloadSink>(
         }
         None => sink.on_unknown_block(raw_type, body),
     }
+}
+
+/// `HandleDateTime` (`SSU2Session.cpp:1964`): разбирает тело блока `DateTime`
+/// (4 байта, BE) и отдаёт решение [`Ssu2Policy::datetime_action`].
+///
+/// `now_secs` — текущее время (`i2p::util::GetSecondsSinceEpoch`), расхождение
+/// считается как `now_secs - time`, как `int64` в i2pd. Тело короче 4 байт —
+/// [`DateTimeAction::Ignore`] (i2pd: `if (len < 4) return;`).
+#[must_use]
+pub fn handle_datetime<P: Ssu2Policy>(
+    policy: &P,
+    body: &[u8],
+    now_secs: u64,
+    session: &DateTimeSession,
+) -> DateTimeAction {
+    let Some(head) = body.first_chunk::<4>() else {
+        return DateTimeAction::Ignore;
+    };
+    let remote = i64::from(u32::from_be_bytes(*head));
+    policy.datetime_action(session, now_secs.cast_signed().saturating_sub(remote))
 }
 
 /// Предел буфера I2NP-сообщения под блок `I2NP`: `NewI2NPTunnelMessage` для
