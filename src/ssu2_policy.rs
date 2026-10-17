@@ -18,18 +18,24 @@
 //! У трейта есть дефолтные тела (значения i2pd), так что своя политика
 //! переопределяет только то, что реально отличается.
 //!
+//! ## Состав
+//!
+//! Помимо сетевых решений, [`Ssu2Policy`] отображает событие закрытия
+//! ([`Ssu2CloseReason`]) в [`crate::ssu2_block::Ssu2TerminationReason`].
+//! Политика перегрузки data phase (окно, RTO) вынесена в отдельный трейт
+//! [`Ssu2CongestionPolicy`] с эталонной реализацией [`I2pdCongestionPolicy`].
+//!
 //! ## Что НЕ здесь
 //!
-//! - TODO(ssu2-policy-termination): выбор
-//!   [`crate::ssu2_block::Ssu2TerminationReason`] под конкретный сбой
-//!   handshake — появится вместе с логикой handshake (там известны точные
-//!   места сбоя);
-//! - TODO(ssu2-congestion): политика перегрузки/окна (RTO, окно) —
-//!   отдельный трейт при реализации data phase.
+//! - TODO(ssu2-congestion): привязка политики к механике отправки/ACK
+//!   (ретрансмиты, очередь отправки) — появится вместе с data phase.
 
 use std::time::Duration;
 
-use crate::{ssu2_ack::AckLimits, ssu2_block::SSU2_BLOCK_HEADER_SIZE};
+use crate::{
+    ssu2_ack::AckLimits,
+    ssu2_block::{SSU2_BLOCK_HEADER_SIZE, Ssu2TerminationReason},
+};
 
 // --- константы i2pd ------------------------------------------------------
 
@@ -73,6 +79,23 @@ pub const SSU2_MAX_NUM_FRAGMENTS: u8 = 64;
 /// Маска случайного байта для выбора размера padding'а (`0..=31`).
 pub const SSU2_PADDING_ROLL_MASK: u8 = 0x1F;
 
+// --- константы перегрузки (i2pd) ----------------------------------------
+
+/// Минимальный размер окна (в пакетах).
+pub const SSU2_MIN_WINDOW_SIZE: usize = 16;
+/// Максимальный размер окна (в пакетах).
+pub const SSU2_MAX_WINDOW_SIZE: usize = 256;
+/// Минимальный RTO.
+pub const SSU2_MIN_RTO: Duration = Duration::from_millis(100);
+/// Начальный RTO.
+pub const SSU2_INITIAL_RTO: Duration = Duration::from_millis(540);
+/// Максимальный RTO.
+pub const SSU2_MAX_RTO: Duration = Duration::from_millis(2500);
+/// Доля нового замера в сглаживании RTT (EWMA).
+pub const SSU2_RTT_EWMA_ALPHA: f64 = 0.125;
+/// Множитель RTO относительно сглаженного RTT (`kappa`).
+pub const SSU2_RTO_KAPPA: f64 = 1.8;
+
 // --- вспомогательные типы -----------------------------------------------
 
 /// Фаза handshake — нужна для решений, зависящих от состояния сессии.
@@ -93,6 +116,48 @@ pub enum HandshakePhase {
     Established,
     /// Любая другая фаза.
     Other,
+}
+
+/// Событие, из-за которого сессия завершается.
+///
+/// Перечислены только причины, которые i2pd реально выставляет в
+/// `m_TerminationReason` (остальные коды из
+/// [`crate::ssu2_block::Ssu2TerminationReason`] в его коде не используются).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ssu2CloseReason {
+    /// Обычное закрытие.
+    Normal,
+    /// Получен Termination от peer при установленной сессии.
+    TerminationReceived,
+    /// Idle timeout.
+    Idle,
+    /// Выключение роутера.
+    Shutdown,
+    /// Сессия заменена новой.
+    ReplacedByNewSession,
+    /// Расхождение часов сверх допуска.
+    ClockSkew,
+    /// Пакет не подтверждён после всех повторов.
+    UnackedData,
+    /// Несовместимая версия (ответ Retry).
+    IncompatibleVersion,
+}
+
+impl Ssu2CloseReason {
+    /// Человекочитаемое имя.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::TerminationReceived => "TerminationReceived",
+            Self::Idle => "Idle",
+            Self::Shutdown => "Shutdown",
+            Self::ReplacedByNewSession => "ReplacedByNewSession",
+            Self::ClockSkew => "ClockSkew",
+            Self::UnackedData => "UnackedData",
+            Self::IncompatibleVersion => "IncompatibleVersion",
+        }
+    }
 }
 
 // --- трейт ---------------------------------------------------------------
@@ -237,6 +302,27 @@ pub trait Ssu2Policy: Send + Sync {
     fn max_num_fragments(&self) -> u8 {
         SSU2_MAX_NUM_FRAGMENTS
     }
+
+    // --- завершение ---
+
+    /// Код причины завершения для конкретного события.
+    ///
+    /// Соответствует тому, какие значения `m_TerminationReason` выставляет
+    /// i2pd: `Timeout` — не дождались ACK; `ClockSkew` — `DateTime` вне
+    /// допуска; `IncompatibleVersion` — ответ Retry; остальные — из
+    /// shutdown/idle/замены сессии.
+    fn termination_reason(&self, reason: Ssu2CloseReason) -> Ssu2TerminationReason {
+        match reason {
+            Ssu2CloseReason::Normal => Ssu2TerminationReason::NormalClose,
+            Ssu2CloseReason::TerminationReceived => Ssu2TerminationReason::TerminationReceived,
+            Ssu2CloseReason::Idle => Ssu2TerminationReason::IdleTimeout,
+            Ssu2CloseReason::Shutdown => Ssu2TerminationReason::RouterShutdown,
+            Ssu2CloseReason::ReplacedByNewSession => Ssu2TerminationReason::ReplacedByNewSession,
+            Ssu2CloseReason::ClockSkew => Ssu2TerminationReason::ClockSkew,
+            Ssu2CloseReason::UnackedData => Ssu2TerminationReason::Timeout,
+            Ssu2CloseReason::IncompatibleVersion => Ssu2TerminationReason::IncompatibleVersion,
+        }
+    }
 }
 
 /// Эталонная политика SSU2 — ровно поведение i2pd (все значения по умолчанию).
@@ -247,3 +333,91 @@ pub trait Ssu2Policy: Send + Sync {
 pub struct I2pdPolicy;
 
 impl Ssu2Policy for I2pdPolicy {}
+
+// --- перегрузка (data phase) --------------------------------------------
+
+/// Политика перегрузки data phase: размер окна и RTO.
+///
+/// Отдельный трейт от [`Ssu2Policy`]: перегрузка меняется независимо от
+/// сетевых решений. Реализация чистая — состояние сессии (`rtt`, `window`)
+/// передаётся вызывающим. Значения по умолчанию — i2pd.
+pub trait Ssu2CongestionPolicy: Send + Sync {
+    /// Минимальный размер окна (в пакетах).
+    fn min_window_size(&self) -> usize {
+        SSU2_MIN_WINDOW_SIZE
+    }
+
+    /// Максимальный размер окна (в пакетах).
+    fn max_window_size(&self) -> usize {
+        SSU2_MAX_WINDOW_SIZE
+    }
+
+    /// Начальный размер окна (i2pd — минимальный).
+    fn initial_window_size(&self) -> usize {
+        self.min_window_size()
+    }
+
+    /// Начальный RTO.
+    fn initial_rto(&self) -> Duration {
+        SSU2_INITIAL_RTO
+    }
+
+    /// Минимальный RTO.
+    fn min_rto(&self) -> Duration {
+        SSU2_MIN_RTO
+    }
+
+    /// Максимальный RTO.
+    fn max_rto(&self) -> Duration {
+        SSU2_MAX_RTO
+    }
+
+    /// Доля нового замера в EWMA RTT.
+    fn rtt_ewma_alpha(&self) -> f64 {
+        SSU2_RTT_EWMA_ALPHA
+    }
+
+    /// Множитель RTO относительно сглаженного RTT.
+    fn rto_kappa(&self) -> f64 {
+        SSU2_RTO_KAPPA
+    }
+
+    /// Обновляет сглаженный RTT новым замером. `None` — замеров ещё не было.
+    ///
+    /// i2pd: `rtt = alpha*sample + (1-alpha)*rtt`, при этом новое значение
+    /// весит `alpha` (замеры сглаживаются медленно).
+    fn update_rtt(&self, current: Option<Duration>, sample: Duration) -> Duration {
+        current.map_or(sample, |prev| {
+            let alpha = self.rtt_ewma_alpha();
+            let ms = alpha.mul_add(sample.as_secs_f64(), (1.0 - alpha) * prev.as_secs_f64());
+            Duration::from_secs_f64(ms)
+        })
+    }
+
+    /// RTO из сглаженного RTT: `rtt * kappa`, зажатый в `[min, max]`.
+    fn rto_from_rtt(&self, rtt: Duration) -> Duration {
+        rtt.mul_f64(self.rto_kappa())
+            .clamp(self.min_rto(), self.max_rto())
+    }
+
+    /// Окно после подтверждения `acked` пакетов (i2pd: `+=`, не выше максимума).
+    fn window_on_ack(&self, window: usize, acked: usize) -> usize {
+        window.saturating_add(acked).min(self.max_window_size())
+    }
+
+    /// Окно после потери (i2pd: вдвое, не ниже минимума).
+    fn window_on_loss(&self, window: usize) -> usize {
+        (window / 2).max(self.min_window_size())
+    }
+
+    /// Можно ли отправить пакет при `in_flight` неподтверждённых (i2pd: `<=`).
+    fn can_send(&self, window: usize, in_flight: usize) -> bool {
+        in_flight <= window
+    }
+}
+
+/// Эталонная политика перегрузки — значения i2pd.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct I2pdCongestionPolicy;
+
+impl Ssu2CongestionPolicy for I2pdCongestionPolicy {}

@@ -1,13 +1,17 @@
 use std::time::Duration;
 use uu_i2p::{
     ssu2_ack::AckLimits,
+    ssu2_block::Ssu2TerminationReason,
     ssu2_policy::{
-        HandshakePhase, I2pdPolicy, Ssu2Policy, SSU2_CLOCK_SKEW, SSU2_CLOCK_THRESHOLD,
-        SSU2_CONNECT_TIMEOUT, SSU2_HANDSHAKE_RESEND_INTERVAL, SSU2_IPV4_HEADER_SIZE,
-        SSU2_MAX_NUM_FRAGMENTS, SSU2_MAX_NUM_RESENDS, SSU2_MAX_PACKET_SIZE, SSU2_MIN_PACKET_SIZE,
-        SSU2_NEXT_TOKEN_EXPIRATION_TIMEOUT, SSU2_PACKET_OVERHEAD, SSU2_PADDING_ROLL_MASK,
-        SSU2_RESEND_ATTEMPT_MIN_INTERVAL, SSU2_SEND_DATETIME_NUM_PACKETS,
-        SSU2_TOKEN_EXPIRATION_THRESHOLD, SSU2_TOKEN_EXPIRATION_TIMEOUT, SSU2_UDP_HEADER_SIZE,
+        HandshakePhase, I2pdCongestionPolicy, I2pdPolicy, SSU2_CLOCK_SKEW, SSU2_CLOCK_THRESHOLD,
+        SSU2_CONNECT_TIMEOUT, SSU2_HANDSHAKE_RESEND_INTERVAL, SSU2_INITIAL_RTO,
+        SSU2_IPV4_HEADER_SIZE, SSU2_MAX_NUM_FRAGMENTS, SSU2_MAX_NUM_RESENDS, SSU2_MAX_PACKET_SIZE,
+        SSU2_MAX_RTO, SSU2_MAX_WINDOW_SIZE, SSU2_MIN_PACKET_SIZE, SSU2_MIN_RTO,
+        SSU2_MIN_WINDOW_SIZE, SSU2_NEXT_TOKEN_EXPIRATION_TIMEOUT, SSU2_PACKET_OVERHEAD,
+        SSU2_PADDING_ROLL_MASK, SSU2_RESEND_ATTEMPT_MIN_INTERVAL, SSU2_RTO_KAPPA,
+        SSU2_RTT_EWMA_ALPHA, SSU2_SEND_DATETIME_NUM_PACKETS, SSU2_TOKEN_EXPIRATION_THRESHOLD,
+        SSU2_TOKEN_EXPIRATION_TIMEOUT, SSU2_UDP_HEADER_SIZE, Ssu2CloseReason, Ssu2CongestionPolicy,
+        Ssu2Policy,
     },
 };
 
@@ -137,4 +141,157 @@ fn policy_is_object_safe_and_swappable() {
     // Значения по умолчанию, которые не переопределяли, не изменились.
     assert_eq!(poc.max_packet_size(), SSU2_MAX_PACKET_SIZE);
     assert_eq!(poc.ack_limits(), AckLimits::default());
+}
+
+// ---- причины завершения --------------------------------------------------
+
+#[test]
+fn termination_reason_mapping_matches_i2pd() {
+    use Ssu2CloseReason::{
+        ClockSkew, Idle, IncompatibleVersion, Normal, ReplacedByNewSession, Shutdown,
+        TerminationReceived, UnackedData,
+    };
+    let p = I2pdPolicy;
+    assert_eq!(
+        p.termination_reason(Normal),
+        Ssu2TerminationReason::NormalClose
+    );
+    assert_eq!(
+        p.termination_reason(TerminationReceived),
+        Ssu2TerminationReason::TerminationReceived
+    );
+    assert_eq!(
+        p.termination_reason(Idle),
+        Ssu2TerminationReason::IdleTimeout
+    );
+    assert_eq!(
+        p.termination_reason(Shutdown),
+        Ssu2TerminationReason::RouterShutdown
+    );
+    assert_eq!(
+        p.termination_reason(ReplacedByNewSession),
+        Ssu2TerminationReason::ReplacedByNewSession
+    );
+    assert_eq!(
+        p.termination_reason(ClockSkew),
+        Ssu2TerminationReason::ClockSkew
+    );
+    assert_eq!(
+        p.termination_reason(UnackedData),
+        Ssu2TerminationReason::Timeout
+    );
+    assert_eq!(
+        p.termination_reason(IncompatibleVersion),
+        Ssu2TerminationReason::IncompatibleVersion
+    );
+
+    // Проводные коды (проверяем пару «неочевидных»).
+    assert_eq!(p.termination_reason(UnackedData).as_u8(), 14);
+    assert_eq!(p.termination_reason(ClockSkew).as_u8(), 7);
+    assert_eq!(p.termination_reason(Shutdown).as_u8(), 3);
+
+    // Имена непустые.
+    for r in [
+        Normal,
+        TerminationReceived,
+        Idle,
+        Shutdown,
+        ReplacedByNewSession,
+        ClockSkew,
+        UnackedData,
+        IncompatibleVersion,
+    ] {
+        assert_ne!(r.name(), "");
+    }
+}
+
+// ---- перегрузка ----------------------------------------------------------
+
+#[test]
+fn congestion_defaults_match_i2pd() {
+    let c = I2pdCongestionPolicy;
+    assert_eq!(c.min_window_size(), SSU2_MIN_WINDOW_SIZE);
+    assert_eq!(c.max_window_size(), SSU2_MAX_WINDOW_SIZE);
+    assert_eq!(c.initial_window_size(), SSU2_MIN_WINDOW_SIZE);
+    assert_eq!(c.initial_rto(), SSU2_INITIAL_RTO);
+    assert_eq!(c.min_rto(), SSU2_MIN_RTO);
+    assert_eq!(c.max_rto(), SSU2_MAX_RTO);
+    assert_eq!(c.rtt_ewma_alpha(), SSU2_RTT_EWMA_ALPHA);
+    assert_eq!(c.rto_kappa(), SSU2_RTO_KAPPA);
+}
+
+#[test]
+fn rtt_ewma_and_rto() {
+    let c = I2pdCongestionPolicy;
+    // Первый замер берётся как есть.
+    assert_eq!(
+        c.update_rtt(None, Duration::from_millis(200)),
+        Duration::from_millis(200)
+    );
+    // Второй: 0.125*100 + 0.875*200 = 187.5 мс.
+    let rtt = c.update_rtt(Some(Duration::from_millis(200)), Duration::from_millis(100));
+    assert!(
+        rtt.abs_diff(Duration::from_micros(187_500)) < Duration::from_micros(1),
+        "{rtt:?}"
+    );
+    // Новый замер тянет сглаженное значение вниз, но не до самого замера.
+    assert!(rtt > Duration::from_millis(100));
+    assert!(rtt < Duration::from_millis(200));
+
+    // RTO = rtt * kappa c зажимом в [100, 2500] мс.
+    assert_eq!(
+        c.rto_from_rtt(Duration::from_millis(200)),
+        Duration::from_millis(360)
+    );
+    assert_eq!(c.rto_from_rtt(Duration::from_millis(10)), SSU2_MIN_RTO); // 18 мс -> 100
+    assert_eq!(c.rto_from_rtt(Duration::from_secs(10)), SSU2_MAX_RTO);
+}
+
+#[test]
+fn window_growth_and_backoff() {
+    let c = I2pdCongestionPolicy;
+    // ACK расширяет окно, но не выше максимума.
+    assert_eq!(c.window_on_ack(16, 4), 20);
+    assert_eq!(c.window_on_ack(250, 100), SSU2_MAX_WINDOW_SIZE);
+    // Потеря делит окно вдвое, но не ниже минимума.
+    assert_eq!(c.window_on_loss(100), 50);
+    assert_eq!(c.window_on_loss(40), 20);
+    assert_eq!(c.window_on_loss(20), SSU2_MIN_WINDOW_SIZE); // 10 -> 16
+    assert_eq!(c.window_on_loss(16), SSU2_MIN_WINDOW_SIZE);
+    // can_send: на границе i2pd шлёт (<=).
+    assert!(c.can_send(16, 0));
+    assert!(c.can_send(16, 16));
+    assert!(!c.can_send(16, 17));
+}
+
+/// Пример «своей» политики перегрузки — не трогая эталонную.
+#[derive(Debug, Clone, Copy)]
+struct PocCongestion;
+
+impl Ssu2CongestionPolicy for PocCongestion {
+    fn max_window_size(&self) -> usize {
+        32
+    }
+
+    fn rto_kappa(&self) -> f64 {
+        1.0
+    }
+}
+
+#[test]
+fn congestion_policy_is_object_safe_and_swappable() {
+    let i2pd: Box<dyn Ssu2CongestionPolicy> = Box::new(I2pdCongestionPolicy);
+    assert_eq!(i2pd.window_on_ack(16, 100), 116);
+
+    let poc: Box<dyn Ssu2CongestionPolicy> = Box::new(PocCongestion);
+    // Переопределённый максимум окна.
+    assert_eq!(poc.window_on_ack(16, 100), 32);
+    // Переопределённый kappa: RTO = RTT.
+    assert_eq!(
+        poc.rto_from_rtt(Duration::from_millis(200)),
+        Duration::from_millis(200)
+    );
+    // Значения по умолчанию не изменились.
+    assert_eq!(poc.min_window_size(), SSU2_MIN_WINDOW_SIZE);
+    assert_eq!(poc.initial_rto(), SSU2_INITIAL_RTO);
 }
