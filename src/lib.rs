@@ -34,6 +34,7 @@ pub mod ntcp2_pool;
 pub mod private_keys;
 pub mod profiling;
 pub mod ratchet_tagset;
+pub mod router;
 pub mod router_context;
 pub mod router_info;
 pub mod router_info_address;
@@ -105,6 +106,11 @@ pub use netdb::NetDb;
 pub use ntcp2_pool::{Ntcp2Pool, PoolEvent};
 pub use private_keys::I2PPrivateKeys;
 pub use ratchet_tagset::{MAX_TAG_INDEX, RatchetTagSet};
+pub use router::{
+    BoxFuture, Clock, I2pdRouterPolicy, INITIAL_RI_PUBLISH_INTERVAL_SECS, Ntcp2Transport,
+    NoopObserver, RI_PUBLISH_INTERVAL_SECS, RI_PUBLISH_TARGETS, Router, RouterObserver,
+    RouterPolicy, SystemClock, TICK_INTERVAL_MS, TransportEvent, TransportPool,
+};
 pub use router_context::{RouterContext, StoreHandling};
 pub use router_info::{
     Congestion, MAX_RI_BUFFER_SIZE, RouterInfo, RouterInfoCaps, extract_param, extract_string,
