@@ -43,8 +43,11 @@
 use crate::{
     endian::{read_u16_be, read_u32_be, read_u64_be, write_u32_be, write_u64_be},
     error::{I2PError, Result},
+    gzip,
     i2np_message::I2npMessage,
+    router_info::{FullRouterInfo, MAX_RI_BUFFER_SIZE},
 };
+use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Размер заголовка блока: 1 байт типа + 2 байта длины.
@@ -456,7 +459,7 @@ pub struct RouterInfoBlock<'a> {
     pub router_info: &'a [u8],
 }
 
-impl RouterInfoBlock<'_> {
+impl<'a> RouterInfoBlock<'a> {
     /// Запрошен ли flood (бит 0 `flags`).
     #[must_use]
     pub const fn flood_requested(&self) -> bool {
@@ -479,6 +482,57 @@ impl RouterInfoBlock<'_> {
     #[must_use]
     pub const fn num_fragments(&self) -> u8 {
         self.frag & 0x0F
+    }
+
+    /// Тело `RouterInfo` как на wire.
+    ///
+    /// Без флага gzip — заимствованный срез; с флагом — распакованные байты.
+    /// И распакованное, и сырое тело ограничено [`MAX_RI_BUFFER_SIZE`] (как в
+    /// `ExtractRouterInfo` у i2pd), чтобы gzip-бомба не раздула память.
+    ///
+    /// # Errors
+    ///
+    /// - [`I2PError::Malformed`], если gzip не разбирается;
+    /// - [`I2PError::InvalidLength`], если тело (распакованное или сырое)
+    ///   больше [`MAX_RI_BUFFER_SIZE`].
+    pub fn body(&self) -> Result<Cow<'a, [u8]>> {
+        if !self.gzip_compressed() {
+            if self.router_info.len() > MAX_RI_BUFFER_SIZE {
+                return Err(I2PError::InvalidLength {
+                    expected: MAX_RI_BUFFER_SIZE,
+                    got: self.router_info.len(),
+                });
+            }
+            return Ok(Cow::Borrowed(self.router_info));
+        }
+        let bytes = gzip::decompress(self.router_info)?;
+        if bytes.len() > MAX_RI_BUFFER_SIZE {
+            return Err(I2PError::InvalidLength {
+                expected: MAX_RI_BUFFER_SIZE,
+                got: bytes.len(),
+            });
+        }
+        Ok(Cow::Owned(bytes))
+    }
+
+    /// Разбирает `RouterInfo` из блока и проверяет подпись.
+    ///
+    /// Соответствует `ExtractRouterInfo` (снятие gzip) плюс проверке подписи
+    /// при добавлении в netdb (`AddRouterInfo`) в i2pd. Прочие проверки
+    /// (`timestamp`, версия, совпадение адреса/статического ключа с рукопожатием)
+    /// остаются уровню сессии.
+    ///
+    /// # Errors
+    ///
+    /// - как [`Self::body`];
+    /// - как [`FullRouterInfo::from_buffer`] (разбор);
+    /// - [`I2PError::Malformed`], если подпись не сходится.
+    #[must_use = "результат разбора нужно обработать"]
+    pub fn verified_router_info(&self) -> Result<FullRouterInfo> {
+        let body = self.body()?;
+        let ri = FullRouterInfo::from_buffer(&body)?;
+        ri.verify(&body)?;
+        Ok(ri)
     }
 }
 

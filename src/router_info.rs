@@ -911,6 +911,21 @@ impl RouterInfo {
     pub fn ssu2_v6_address(&self) -> Option<&I2PAddress> {
         self.addresses.iter().find(|a| a.is_ssu2() && a.is_v6())
     }
+
+    /// SSU2-адрес для семейства: `ipv6 == true` — v6, иначе v4.
+    ///
+    /// Соответствует выбору `GetSSU2V6Address` / `GetSSU2V4Address` в i2pd
+    /// по семейству удалённого endpoint'а. Статический ключ такого адреса —
+    /// `address.s`.
+    #[must_use]
+    pub fn ssu2_address(&self, ipv6: bool) -> Option<&I2PAddress> {
+        if ipv6 {
+            self.ssu2_v6_address()
+        } else {
+            self.ssu2_v4_address()
+        }
+    }
+
     /// Сериализует body в wire-формат.
     ///
     /// Обратная к [`Self::parse_body`]. Не включает identity и

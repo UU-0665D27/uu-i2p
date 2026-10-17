@@ -14,6 +14,10 @@ mod tests {
             write_block, write_raw_block,
         },
     };
+    use uu_i2p::{
+        router_info::FullRouterInfo, I2PAddress, I2PPrivateKeys, I2PTag, RouterInfo,
+        MAX_RI_BUFFER_SIZE,
+    };
 
     // ---- hex helper -----------------------------------------------------
 
@@ -289,6 +293,109 @@ mod tests {
                 expected: 2,
                 got: 1
             })
+        ));
+    }
+
+    /// Собирает подписанный `RouterInfo` с одним SSU2-адресом.
+    fn signed_ssu2_router_info(keys: &I2PPrivateKeys, ipv6: bool, static_key: [u8; 32]) -> Vec<u8> {
+        let host = if ipv6 {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))
+        };
+        let addr = I2PAddress::ssu2_published(
+            host,
+            12345,
+            I2PTag::from_array(static_key),
+            I2PTag::from_array([0x22; 32]),
+        );
+        let body = RouterInfo::builder().add_address(addr).build();
+        FullRouterInfo::from_keys(keys, body)
+            .unwrap()
+            .to_buffer()
+            .unwrap()
+    }
+
+    #[test]
+    fn router_info_body_uncompressed_borrows() {
+        let raw = [0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF];
+        let b: RouterInfoBlock<'_> = RouterInfoBlock::parse(&raw).unwrap();
+        assert!(!b.gzip_compressed());
+        let decoded = b.body().unwrap();
+        assert!(matches!(decoded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&decoded[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn router_info_body_gzip_decompresses() {
+        let payload = b"\x00signed-router-info-bytes";
+        let compressed = uu_i2p::gzip::compress(payload).unwrap();
+        let mut raw = vec![SSU2_ROUTER_INFO_FLAG_GZIP, 0x01];
+        raw.extend_from_slice(&compressed);
+        let b: RouterInfoBlock<'_> = RouterInfoBlock::parse(&raw).unwrap();
+        assert!(b.gzip_compressed());
+        let decoded = b.body().unwrap();
+        assert!(matches!(decoded, std::borrow::Cow::Owned(_)));
+        assert_eq!(&decoded[..], &payload[..]);
+    }
+
+    #[test]
+    fn router_info_body_bad_gzip() {
+        let b: RouterInfoBlock<'_> =
+            RouterInfoBlock::parse(&[SSU2_ROUTER_INFO_FLAG_GZIP, 0x01, 0x00, 0x01, 0x02]).unwrap();
+        assert!(matches!(b.body(), Err(I2PError::Malformed(_))));
+    }
+
+    #[test]
+    fn router_info_body_too_long() {
+        let raw = vec![0u8; MAX_RI_BUFFER_SIZE + 3]; // flags + frag + > MAX
+        let b: RouterInfoBlock<'_> = RouterInfoBlock::parse(&raw).unwrap();
+        assert!(matches!(b.body(), Err(I2PError::InvalidLength { .. })));
+    }
+
+    #[test]
+    fn router_info_verified_and_ssu2_address() {
+        let keys = I2PPrivateKeys::generate_default().unwrap();
+        let static_key = [0x11u8; 32];
+        let ri_bytes = signed_ssu2_router_info(&keys, false, static_key);
+        let mut raw = vec![SSU2_ROUTER_INFO_FLAG_FLOOD, 0x01];
+        raw.extend_from_slice(&ri_bytes);
+        let b: RouterInfoBlock<'_> = RouterInfoBlock::parse(&raw).unwrap();
+
+        let ri = b.verified_router_info().unwrap();
+        let addr = ri.body().ssu2_address(false).expect("v4 ssu2 address");
+        assert_eq!(addr.s.0, static_key);
+        assert!(ri.body().ssu2_address(true).is_none());
+    }
+
+    #[test]
+    fn router_info_verified_gzip() {
+        let keys = I2PPrivateKeys::generate_default().unwrap();
+        let static_key = [0x33u8; 32];
+        let ri_bytes = signed_ssu2_router_info(&keys, true, static_key);
+        let compressed = uu_i2p::gzip::compress(&ri_bytes).unwrap();
+        let mut raw = vec![SSU2_ROUTER_INFO_FLAG_GZIP, 0x01];
+        raw.extend_from_slice(&compressed);
+        let b: RouterInfoBlock<'_> = RouterInfoBlock::parse(&raw).unwrap();
+
+        let ri = b.verified_router_info().unwrap();
+        let addr = ri.body().ssu2_address(true).expect("v6 ssu2 address");
+        assert_eq!(addr.s.0, static_key);
+        assert!(ri.body().ssu2_address(false).is_none());
+    }
+
+    #[test]
+    fn router_info_bad_signature() {
+        let keys = I2PPrivateKeys::generate_default().unwrap();
+        let mut ri_bytes = signed_ssu2_router_info(&keys, false, [0x44; 32]);
+        let last = ri_bytes.len() - 1;
+        ri_bytes[last] ^= 0xFF; // портим подпись
+        let mut raw = vec![0x00, 0x01];
+        raw.extend_from_slice(&ri_bytes);
+        let b: RouterInfoBlock<'_> = RouterInfoBlock::parse(&raw).unwrap();
+        assert!(matches!(
+            b.verified_router_info(),
+            Err(I2PError::Malformed(_))
         ));
     }
 

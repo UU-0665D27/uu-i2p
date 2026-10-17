@@ -38,8 +38,12 @@
 //!
 //! - TODO(ssu2-scf-multifrag): > 2 фрагментов `SessionConfirmed` (i2pd тоже
 //!   ограничен двумя);
-//! - TODO(ssu2-blocks): разбор `RouterInfo` (подпись, адрес, статический
-//!   ключ); `Congestion` (21) и `NextNonce` (11) — формат в i2pd не определён.
+//! - [`RouterInfoBlock::verified_router_info`](crate::ssu2_block::RouterInfoBlock::verified_router_info)
+//!   разбирает `RouterInfo` (в т.ч. gzip) и проверяет подпись; остальные
+//!   проверки (timestamp, версия, совпадение адреса/статического ключа с
+//!   рукопожатием) — уровень сессии;
+//! - TODO(ssu2-blocks): `Congestion` (21) и `NextNonce` (11) — формат в i2pd
+//!   не определён.
 //!
 //! ## Замечание по длине
 //!
