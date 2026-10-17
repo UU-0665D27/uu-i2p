@@ -703,7 +703,8 @@ impl PoolState {
             return;
         };
         let remote = session.remote;
-        for packet in session.conn.poll_resend(&policy, now, jitter) {
+        let plan = session.conn.poll_resend(&policy, now, jitter);
+        for packet in plan.handshake_packets {
             out.push((remote, packet));
         }
 
@@ -727,6 +728,19 @@ impl PoolState {
                 now_micros,
                 rng: &mut rng,
             };
+            // Плановая переотправка своего `RouterInfo` (i2pd `Resend`:
+            // `ts > m_NextRouterInfoResendTime` → `SendLocalRouterInfo`).
+            if plan.resend_router_info {
+                match data.send_router_info(&policy, &mut ctx, &self.local.ri_bytes) {
+                    Ok(packet) => {
+                        debug!(conn_id = ?key, "tick_session: RouterInfo resent");
+                        out.push((remote, packet));
+                    }
+                    Err(error) => {
+                        warn!(%error, conn_id = ?key, "tick_session: RouterInfo resend failed");
+                    }
+                }
+            }
             match data.resend(&policy, &congestion, &mut ctx) {
                 Ok(report) => {
                     terminate = report.terminate;

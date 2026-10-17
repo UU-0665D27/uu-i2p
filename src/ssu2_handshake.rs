@@ -36,8 +36,9 @@
 //!
 //! ## Что дальше
 //!
-//! - TODO(ssu2-scf-multifrag): > 2 фрагментов `SessionConfirmed` (i2pd тоже
-//!   ограничен двумя);
+//! - `SessionConfirmed` — не больше двух фрагментов: как и в i2pd, `RouterInfo`,
+//!   не влезающий в два пакета, не разбивается (в i2pd там даже нет проверки —
+//!   отправился бы пустой payload);
 //! - [`RouterInfoBlock::verified_router_info`](crate::ssu2_block::RouterInfoBlock::verified_router_info)
 //!   разбирает `RouterInfo` (в т.ч. gzip) и проверяет подпись; остальные
 //!   проверки (timestamp, версия, совпадение адреса/статического ключа с
@@ -549,8 +550,8 @@ impl InitiatorHandshake {
             (max_single + max_payload, CONFIRMED_FLAG_FIRST)
         };
         if block.len() >= max_used {
-            // TODO(ssu2-scf-multifrag): i2pd тоже не умеет > 2 фрагментов
-            // (там даже нет проверки — отправился бы пустой payload).
+            // Как и в i2pd, больше двух фрагментов не поддерживается (там даже
+            // нет проверки — отправился бы пустой payload).
             return Err(I2PError::Malformed(
                 "ssu2: RouterInfo does not fit in two SessionConfirmed fragments",
             ));

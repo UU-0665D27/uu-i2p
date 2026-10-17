@@ -468,17 +468,53 @@ fn handshake_resend_repeats_last_packet() {
 
     // Сразу после отправки повтор не нужен.
     assert_eq!(
-        w.alice.poll_resend(&I2pdPolicy, now, 0).len(),
+        w.alice
+            .poll_resend(&I2pdPolicy, now, 0)
+            .handshake_packets
+            .len(),
         0,
         "сразу после отправки повтор не нужен"
     );
 
     let due = now + I2pdPolicy.handshake_resend_interval() + ms(1);
     let resent = w.alice.poll_resend(&I2pdPolicy, due, 0);
-    assert_eq!(resent.len(), 1);
+    assert_eq!(resent.handshake_packets.len(), 1);
     assert_eq!(
-        resent[0], packets[0],
+        resent.handshake_packets[0], packets[0],
         "шлём те же байты (i2pd держит пакет)"
+    );
+    assert!(
+        !resent.resend_router_info,
+        "`RouterInfo` пересылается по своему таймеру"
+    );
+}
+
+/// Плановая переотправка своего `RouterInfo` (i2pd `Resend` →
+/// `SendLocalRouterInfo`): таймер ставится в `Established` (`:343`), а решение
+/// выносится в [`uu_i2p::ssu2_conn::ResendPlan::resend_router_info`].
+#[test]
+fn router_info_resend_is_scheduled_after_establish() {
+    let mut w = World::new(vec![0xAB; RI_LEN]);
+    let now = base_time();
+    let report = w.through_established(now);
+    assert!(report.established);
+
+    assert!(
+        !w.alice.poll_resend(&I2pdPolicy, now, 0).resend_router_info,
+        "сразу после установления пересылать нечего"
+    );
+
+    // Таймер поставлен в `Established` (`SSU2Session.cpp:343`), считать от него.
+    let scheduled = w
+        .alice
+        .timers()
+        .next_router_info_resend()
+        .expect("таймер переотправки RouterInfo поставлен");
+    assert!(
+        w.alice
+            .poll_resend(&I2pdPolicy, scheduled + ms(1), 0)
+            .resend_router_info,
+        "после срока пора переслать свой RouterInfo"
     );
 }
 

@@ -38,11 +38,13 @@
 //! `send_termination`, `send_path_challenge`, `send_path_response`);
 //! [`Ssu2DataSession::resend`] повторяет data-пакеты по RTO (i2pd `Resend`).
 //!
-//! TODO(ssu2-engine-timers): таймеры — подключить [`crate::ssu2_timers`]
-//! (resend-tick, connect-таймер, RouterInfo-перепланирование; i2pd
-//! `HandleResendTimer`, `SSU2.cpp:1228`).
 //! Драйвер рукопожатия (состояния `SessionRequestSent`/`SessionConfirmedSent`
 //! и переход в `Established` по `Ack`) — в [`crate::ssu2_conn`].
+//!
+//! Таймеры ([`crate::ssu2_timers`]) живут там же: connect-таймер и
+//! переотправка handshake-пакетов — в [`crate::ssu2_conn::Ssu2Connection`],
+//! а тик `HandleResendTimer` (`SSU2.cpp:1228`) — в [`crate::ssu2_pool`]
+//! (триггер повторов, плановая переотправка своего `RouterInfo`, idle-таймаут).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -385,7 +387,11 @@ impl Ssu2DataSession {
         self.lifecycle.is_established()
     }
 
-    /// Переход в `Established` (i2pd `Established`; таймеры и очередь — TODO).
+    /// Переход в `Established` (i2pd `Established`, `SSU2Session.cpp:331`).
+    ///
+    /// Таймеры и очередь отправки `Established` трогает не здесь: connect-таймер
+    /// и расписание `RouterInfo` — в [`crate::ssu2_conn`], `SendQueue` —
+    /// [`Self::flush`].
     pub const fn establish(&mut self) -> bool {
         self.lifecycle.establish()
     }
@@ -476,7 +482,7 @@ impl Ssu2DataSession {
         self.path_validated
     }
 
-    /// Ключ отправки data-пакетов (TODO(ssu2-engine-send): `SendData`).
+    /// Ключ отправки data-пакетов (`SendData` шифрует им payload).
     #[must_use]
     pub const fn send_key(&self) -> &DataPhaseKey {
         &self.send_key

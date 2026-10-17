@@ -276,6 +276,20 @@ fn peek_message_type(packet: &[u8], intro_key: &[u8; 32]) -> Option<Ssu2MessageT
     peek_message_type_with(packet, intro_key)
 }
 
+/// Итог [`Ssu2Connection::poll_resend`] — что отправить в этом тике
+/// (i2pd `SSU2Session::Resend`, `SSU2Session.cpp:614`).
+///
+/// Оба пункта могут быть сразу: i2pd после переотправки своего `RouterInfo`
+/// не выходит из `Resend`, а доходит до повторa data-пакетов.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResendPlan {
+    /// Неподтверждённые handshake-пакеты (i2pd `ResendHandshakePacket`).
+    pub handshake_packets: Vec<Vec<u8>>,
+    /// Пора переслать свой `RouterInfo` (i2pd `SendLocalRouterInfo` по
+    /// `SSU2_ROUTERINFO_RESEND_INTERVAL`).
+    pub resend_router_info: bool,
+}
+
 /// Одно SSU2-соединение: рукопожатие и (после него) data phase.
 pub struct Ssu2Connection {
     params: ConnParams,
@@ -514,14 +528,15 @@ impl Ssu2Connection {
     /// Один тик переотправки на этапе рукопожатия (i2pd `Resend`,
     /// `ResendHandshakePacket`): возвращает неподтверждённые handshake-пакеты,
     /// если таймер сработал.
+    #[must_use]
     pub fn poll_resend<P: Ssu2Policy>(
         &mut self,
         policy: &P,
         now: Duration,
         jitter: u64,
-    ) -> Vec<Vec<u8>> {
+    ) -> ResendPlan {
         let plan = self.timers.resend_step(policy, now, jitter);
-        if plan.resend_handshake {
+        let handshake_packets = if plan.resend_handshake {
             debug!(
                 state = self.lifecycle.state().name(),
                 packets = self.sent_handshake.len(),
@@ -530,6 +545,10 @@ impl Ssu2Connection {
             self.sent_handshake.clone()
         } else {
             Vec::new()
+        };
+        ResendPlan {
+            handshake_packets,
+            resend_router_info: plan.resend_router_info,
         }
     }
 
