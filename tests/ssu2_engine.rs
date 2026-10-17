@@ -17,7 +17,8 @@ use uu_i2p::{
     ssu2_crypto::DataPhaseKeys,
     ssu2_data::{SSU2_DATA_OVERHEAD, encode_data_packet},
     ssu2_engine::{
-        DataSessionParams, DataSessionRole, PendingBlock, Ssu2DataSession, TerminationAction,
+        DataSessionParams, DataSessionRole, PendingBlock, SendContext, Ssu2DataSession,
+        TerminationAction,
     },
     ssu2_header::{ConnectionId, ShortHeader, Ssu2MessageType},
     ssu2_lifecycle::Ssu2SessionState,
@@ -424,4 +425,323 @@ fn recv_updates_last_activity() {
     let now = Duration::from_secs(1234);
     let _ = recv(&mut session, 1, &i2np_payload(MSG_ID, &body(4)), now);
     assert_eq!(session.last_activity(), now);
+}
+
+// ---- Отправка -----------------------------------------------------------
+
+/// Постоянный «бросок» для паддинга (i2pd `GetRng` в тестах).
+struct Rolls(u32);
+
+impl uu_i2p::ssu2_send::RandomSource for Rolls {
+    fn roll(&mut self) -> u32 {
+        self.0
+    }
+}
+
+const INTRO_A: [u8; 32] = [0x11; 32];
+const INTRO_B: [u8; 32] = [0x22; 32];
+const CONN_A: ConnectionId = ConnectionId([1; 8]);
+const CONN_B: ConnectionId = ConnectionId([2; 8]);
+
+fn side(role: DataSessionRole, source: ConnectionId, dest: ConnectionId) -> Ssu2DataSession {
+    let (local, remote) = match role {
+        DataSessionRole::Initiator => (INTRO_A, INTRO_B),
+        DataSessionRole::Responder => (INTRO_B, INTRO_A),
+    };
+    Ssu2DataSession::new(
+        DataSessionParams {
+            role,
+            source_conn_id: source,
+            dest_conn_id: dest,
+            data_keys: keys(),
+            local_intro_key: local,
+            remote_intro_key: remote,
+            max_payload: MAX_PAYLOAD,
+            testing: false,
+            sync_clock_from_peers: false,
+        },
+        &I2pdCongestionPolicy,
+    )
+}
+
+/// Пара сессий: Alice (инициатор) и Bob (ответчик) с общими ключами.
+fn pair() -> (Ssu2DataSession, Ssu2DataSession) {
+    (
+        side(DataSessionRole::Initiator, CONN_A, CONN_B),
+        side(DataSessionRole::Responder, CONN_B, CONN_A),
+    )
+}
+
+fn message(msg_id: u32, body_len: usize) -> uu_i2p::i2np_message::I2npMessage {
+    uu_i2p::i2np_message::I2npMessage::from_ntcp2_bytes(&ntcp2(
+        TYPE_DATABASE_STORE,
+        msg_id,
+        0,
+        &body(body_len),
+    ))
+    .expect("message")
+}
+
+fn recv_all(session: &mut Ssu2DataSession, packets: &[Vec<u8>], now: Duration) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    for packet in packets {
+        let mut wire = packet.clone();
+        let report = session
+            .recv(&mut wire, &I2pdPolicy, &I2pdCongestionPolicy, now, NOW_SECS)
+            .expect("recv");
+        for msg in report.i2np {
+            got.push(msg.payload().to_vec());
+        }
+    }
+    got
+}
+
+#[test]
+fn flush_delivers_i2np_end_to_end() {
+    let (mut alice, mut bob) = pair();
+    alice.establish();
+    alice.enqueue_i2np(message(MSG_ID, 4), 1);
+    let mut rng = Rolls(0);
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let report = alice.flush(&I2pdPolicy, &mut ctx).expect("flush");
+    assert_ne!(report.packets.len(), 0);
+    assert_eq!(alice.send().in_flight(), report.packets.len());
+    assert_eq!(alice.queue_len(), 0);
+
+    let got = recv_all(&mut bob, &report.packets, Duration::from_secs(1));
+    assert_eq!(got, vec![body(4)]);
+}
+
+#[test]
+fn flush_without_queue_sends_nothing() {
+    let (mut alice, _bob) = pair();
+    alice.establish();
+    let mut rng = Rolls(0);
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let report = alice.flush(&I2pdPolicy, &mut ctx).expect("flush");
+    assert_eq!(report.packets.len(), 0);
+    assert!(!report.ack_block_sent);
+}
+
+#[test]
+fn flush_requires_established() {
+    let (mut alice, _bob) = pair();
+    alice.enqueue_i2np(message(MSG_ID, 4), 1);
+    let mut rng = Rolls(0);
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let report = alice.flush(&I2pdPolicy, &mut ctx).expect("flush");
+    assert_eq!(report.packets.len(), 0);
+    assert_eq!(alice.queue_len(), 1, "сообщение остаётся в очереди");
+}
+
+#[test]
+fn flush_drops_stale_message() {
+    let (mut alice, _bob) = pair();
+    alice.establish();
+    alice.enqueue_i2np(message(MSG_ID, 4), 1);
+    let mut rng = Rolls(0);
+    // Лаг очереди заведомо больше I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_TRANSIT.
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: u64::MAX / 2,
+        rng: &mut rng,
+    };
+    let report = alice.flush(&I2pdPolicy, &mut ctx).expect("flush");
+    assert_eq!(report.packets.len(), 0);
+    assert_eq!(report.dropped.len(), 1);
+    assert_eq!(report.dropped[0].msg_id(), MSG_ID);
+}
+
+#[test]
+fn keep_alive_is_received_as_data() {
+    let (mut alice, mut bob) = pair();
+    alice.establish();
+    let mut rng = Rolls(0);
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let packet = alice
+        .send_keep_alive(&I2pdPolicy, &mut ctx)
+        .expect("keep alive");
+    assert!(packet.len() >= uu_i2p::ssu2_header::SSU2_MIN_PACKET_SIZE);
+    let mut wire = packet;
+    let report = bob
+        .recv(
+            &mut wire,
+            &I2pdPolicy,
+            &I2pdCongestionPolicy,
+            Duration::from_secs(1),
+            NOW_SECS,
+        )
+        .expect("recv");
+    assert!(report.data_received, "IMMEDIATE_ACK_REQUESTED выставлен");
+    assert_eq!(report.i2np.len(), 0);
+}
+
+#[test]
+fn termination_packet_closes_peer() {
+    let (mut alice, mut bob) = pair();
+    alice.establish();
+    let plan = alice.request_termination(Ssu2TerminationReason::NormalClose);
+    assert!(plan.send_termination);
+    let mut rng = Rolls(0);
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let packet = alice
+        .send_termination(&I2pdPolicy, &mut ctx)
+        .expect("termination");
+    let mut wire = packet;
+    let report = bob
+        .recv(
+            &mut wire,
+            &I2pdPolicy,
+            &I2pdCongestionPolicy,
+            Duration::from_secs(1),
+            NOW_SECS,
+        )
+        .expect("recv");
+    assert_eq!(report.termination, Some(TerminationAction::CloseNow));
+}
+
+#[test]
+fn path_challenge_and_response_roundtrip() {
+    let (mut alice, mut bob) = pair();
+    let address = AddressBlock {
+        port: 12345,
+        ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+    };
+    let challenge = 0x0102_0304_0506_0708u64;
+    let mut rng = Rolls(0);
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let packet = alice
+        .send_path_challenge(&I2pdPolicy, &mut ctx, &address, challenge)
+        .expect("challenge");
+    let mut wire = packet;
+    let report = bob
+        .recv(
+            &mut wire,
+            &I2pdPolicy,
+            &I2pdCongestionPolicy,
+            Duration::from_secs(1),
+            NOW_SECS,
+        )
+        .expect("recv");
+    let data = report.path_challenge.expect("challenge reported");
+    assert_eq!(data, challenge.to_be_bytes());
+
+    let response = bob
+        .send_path_response(&I2pdPolicy, &mut ctx, &address, &data)
+        .expect("response");
+    let mut wire = response;
+    let report = alice
+        .recv(
+            &mut wire,
+            &I2pdPolicy,
+            &I2pdCongestionPolicy,
+            Duration::from_secs(1),
+            NOW_SECS,
+        )
+        .expect("recv");
+    assert!(report.path_response_accepted);
+    assert!(alice.path_validated());
+}
+
+#[test]
+fn resend_after_rto_reissues_packet() {
+    let (mut alice, mut bob) = pair();
+    alice.establish();
+    alice.enqueue_i2np(message(MSG_ID, 4), 1);
+    let mut rng = Rolls(0);
+    let t0 = Duration::from_secs(1);
+    let mut ctx = SendContext {
+        now: t0,
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let report = alice.flush(&I2pdPolicy, &mut ctx).expect("flush");
+    assert_eq!(report.packets.len(), 1);
+    let first_num = alice.send_packet_num() - 1;
+
+    // Раньше RTO повтор не выдается.
+    ctx.now = t0 + alice.send().rto() / 2;
+    let report = alice
+        .resend(&I2pdPolicy, &I2pdCongestionPolicy, &mut ctx)
+        .expect("resend");
+    assert_eq!(report.packets.len(), 0);
+
+    // После RTO — повтор с новым номером.
+    ctx.now = t0 + alice.send().rto() * 2;
+    let report = alice
+        .resend(&I2pdPolicy, &I2pdCongestionPolicy, &mut ctx)
+        .expect("resend");
+    assert_eq!(report.resent, vec![first_num]);
+    assert_eq!(report.packets.len(), 1);
+    assert_eq!(alice.send().in_flight(), 1);
+    let sent = alice.send().sent_packets();
+    let (num, packet) = sent.iter().next().expect("resent packet tracked");
+    assert_eq!(*num, first_num + 1);
+    assert_eq!(packet.num_resends, 1);
+
+    let got = recv_all(&mut bob, &report.packets, ctx.now);
+    assert_eq!(got, vec![body(4)], "повтор доходит до собеседника");
+}
+
+#[test]
+fn resend_beyond_limit_terminates_session() {
+    let (mut alice, _bob) = pair();
+    alice.establish();
+    alice.enqueue_i2np(message(MSG_ID, 4), 1);
+    let mut rng = Rolls(0);
+    let mut ctx = SendContext {
+        now: Duration::from_secs(1),
+        now_ms: 1000,
+        now_micros: 1,
+        rng: &mut rng,
+    };
+    let _ = alice.flush(&I2pdPolicy, &mut ctx).expect("flush");
+
+    let mut terminated = false;
+    for _ in 0..10 {
+        ctx.now += alice.send().rto() * 4;
+        let report = alice
+            .resend(&I2pdPolicy, &I2pdCongestionPolicy, &mut ctx)
+            .expect("resend");
+        if report.terminate {
+            terminated = true;
+            break;
+        }
+    }
+    assert!(terminated, "предел повторов должен завершить сессию");
+    assert_eq!(alice.send().in_flight(), 0);
+    assert_eq!(alice.queue_len(), 0);
+    assert_eq!(alice.termination_reason(), Ssu2TerminationReason::Timeout);
 }

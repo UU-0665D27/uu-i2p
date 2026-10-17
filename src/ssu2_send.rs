@@ -488,7 +488,11 @@ pub fn fragmented_message<P: Ssu2Policy>(
 }
 
 /// Один «бросок» для padding'а: `GetRng()() & padding_roll_mask`.
-fn padding_roll<P: Ssu2Policy>(rng: &mut impl RandomSource, policy: &P) -> u8 {
+///
+/// Публична, чтобы вызывающий мог повторить ту же маску для контрольных
+/// пакетов (`SendQuickAck`/`SendKeepAlive`/`SendTermination`), которые i2pd
+/// собирает вне [`send_queue`].
+pub fn padding_roll<P: Ssu2Policy>(rng: &mut impl RandomSource, policy: &P) -> u8 {
     u8::try_from(rng.roll() & u32::from(policy.padding_roll_mask())).unwrap_or_default()
 }
 

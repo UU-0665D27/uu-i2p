@@ -28,11 +28,23 @@
 //! - [`RecvReport::termination`] — что делать с `Termination` (ответить своим
 //!   `Termination` или завершать сразу).
 //!
-//! TODO(ssu2-engine-send): отправка (SendData/SendQueue/SendQuickAck/
-//! SendTermination/SendPathResponse) и таймеры ([`crate::ssu2_timers`]).
+//! ## Отправка
+//!
+//! [`Ssu2DataSession::enqueue_i2np`] ставит I2NP-сообщения в очередь, а
+//! [`Ssu2DataSession::flush`] упаковывает её в data-пакеты (i2pd `SendQueue`).
+//! Готовые пакеты — байты для отправки транспортом; сессия сама ведёт номера
+//! пакетов, окно (`SendState`) и копии payload'ов для повторов. Контрольные
+//! пакеты — отдельные методы (`send_quick_ack`, `send_keep_alive`,
+//! `send_termination`, `send_path_challenge`, `send_path_response`);
+//! [`Ssu2DataSession::resend`] повторяет data-пакеты по RTO (i2pd `Resend`).
+//!
+//! TODO(ssu2-engine-timers): таймеры — подключить [`crate::ssu2_timers`]
+//! (resend-tick, connect-таймер, RouterInfo-перепланирование; i2pd
+//! `HandleResendTimer`, `SSU2.cpp:1228`).
 //! TODO(ssu2-engine-handshake): handshake — `Ack` в состоянии
 //! `SessionConfirmedSent` переводит сессию в `Established` (`SSU2Session.cpp:2037`).
 
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use tracing::{debug, trace, warn};
@@ -44,14 +56,17 @@ use crate::ssu2_block::{
     PathResponseBlock, RelayTagBlock, Ssu2Block, Ssu2TerminationReason, TerminationBlock,
 };
 use crate::ssu2_crypto::{DataPhaseKey, DataPhaseKeys};
-use crate::ssu2_data::decode_data_packet;
+use crate::ssu2_data::{SSU2_DATA_OVERHEAD, decode_data_packet, encode_data_packet};
 use crate::ssu2_fragments::IncompleteMessages;
-use crate::ssu2_header::ConnectionId;
+use crate::ssu2_header::{
+    ConnectionId, SSU2_FLAG_IMMEDIATE_ACK_REQUESTED, ShortHeader, Ssu2MessageType,
+};
 use crate::ssu2_lifecycle::{SessionLifecycle, Ssu2SessionState};
 use crate::ssu2_policy::{
     DateTimeAction, DateTimeSession, HandshakePhase, Ssu2CongestionPolicy, Ssu2Policy,
 };
 use crate::ssu2_recv::{self, PayloadSink, ReceivedI2np, ReceivedMsgIds};
+use crate::ssu2_send::{self, QueuedMessage, RandomSource, SendQueueConfig, padding_roll};
 use crate::ssu2_session::{ReceiveState, SendState};
 
 /// Роль стороны в data phase (определяет направление ключей).
@@ -136,6 +151,46 @@ pub struct RecvReport {
     pub external_address: Option<AddressBlock>,
     /// Блоки, которые должен обработать вызывающий (см. [`PendingBlock`]).
     pub pending: Vec<PendingBlock>,
+}
+
+/// Итог [`Ssu2DataSession::flush`] (i2pd `SendQueue`).
+#[derive(Debug, Default)]
+pub struct SendReport {
+    /// Пакеты для отправки (в порядке отправки).
+    pub packets: Vec<Vec<u8>>,
+    /// Отправлен ли где-нибудь ACK-блок (i2pd `ackBlockSent`).
+    pub ack_block_sent: bool,
+    /// Снятые с очереди истёкшие/просроченные сообщения (i2pd `Drop`).
+    pub dropped: Vec<I2npMessage>,
+}
+
+/// Итог [`Ssu2DataSession::resend`] (i2pd `Resend`, часть с data-пакетами).
+#[derive(Debug, Default)]
+pub struct ResendReport {
+    /// Повторно отправленные пакеты.
+    pub packets: Vec<Vec<u8>>,
+    /// Каким номерам соответствуют повторно отправленные пакеты (в том же
+    /// порядке, что [`Self::packets`]).
+    pub resent: Vec<u32>,
+    /// Превышен предел повторов — сессия завершается (`Timeout`).
+    pub terminate: bool,
+}
+
+/// Окружение отправки: время и генератор.
+///
+/// - `now` — монотонное время (`m_SentPackets.sendTime`, RTT/RTO);
+/// - `now_ms` — Unix-время в миллисекундах (`DateTime`, истечение I2NP);
+/// - `now_micros` — монотонные микросекунды (лаг очереди, `m_SendQueue`);
+/// - `rng` — `m_Server.GetRng()`.
+pub struct SendContext<'a, R: RandomSource> {
+    /// Монотонное время.
+    pub now: Duration,
+    /// Unix-время в миллисекундах.
+    pub now_ms: u64,
+    /// Монотонное время в микросекундах.
+    pub now_micros: u64,
+    /// Генератор.
+    pub rng: &'a mut R,
 }
 
 /// Событие одного блока payload'а, собранное [`Collector`].
@@ -263,6 +318,10 @@ pub struct Ssu2DataSession {
     remote_termination: Option<Ssu2TerminationReason>,
     path_challenge_sent: Option<u64>,
     path_validated: bool,
+    send_packet_num: u32,
+    last_datetime_packet_num: u32,
+    out_queue: VecDeque<QueuedMessage>,
+    sent_payloads: BTreeMap<u32, Vec<u8>>,
 }
 
 impl Ssu2DataSession {
@@ -291,6 +350,10 @@ impl Ssu2DataSession {
             remote_termination: None,
             path_challenge_sent: None,
             path_validated: false,
+            send_packet_num: 0,
+            last_datetime_packet_num: 0,
+            out_queue: VecDeque::new(),
+            sent_payloads: BTreeMap::new(),
         }
     }
 
@@ -341,6 +404,18 @@ impl Ssu2DataSession {
     #[must_use]
     pub const fn last_activity(&self) -> Duration {
         self.last_activity
+    }
+
+    /// Номер следующего отправляемого пакета (`m_SendPacketNum`).
+    #[must_use]
+    pub const fn send_packet_num(&self) -> u32 {
+        self.send_packet_num
+    }
+
+    /// Длина очереди отправки (`m_SendQueue.size ()`).
+    #[must_use]
+    pub fn queue_len(&self) -> usize {
+        self.out_queue.len()
     }
 
     /// Приёмное состояние (номера пакетов, ACK).
@@ -663,6 +738,314 @@ impl Ssu2DataSession {
             report.termination = Some(TerminationAction::RecordReason(reason));
         }
     }
+}
+
+/// Отправная половина сессии (i2pd `SendQueue` / `SendData` / `SendQuickAck`
+/// / `SendKeepAlive` / `SendTermination` / `SendPath*` / `Resend`).
+impl Ssu2DataSession {
+    /// Ставит I2NP-сообщение в очередь отправки (i2pd `SendI2NPMessages`).
+    ///
+    /// `now_micros` — монотонные микросекунды (`GetMonotonicMicroseconds`);
+    /// по ним [`flush`](Self::flush) отсеивает «просроченные» в очереди
+    /// сообщения.
+    ///
+    /// Отправка — отдельно: [`flush`](Self::flush) (i2pd `PostI2NPMessages`
+    /// зовёт `SendQueue`, а при заполненном окне ещё и `Resend`).
+    pub fn enqueue_i2np(&mut self, message: I2npMessage, now_micros: u64) {
+        trace!(
+            msg_id = message.msg_id(),
+            queue = self.out_queue.len() + 1,
+            "enqueue_i2np: queued"
+        );
+        self.out_queue.push_back(QueuedMessage {
+            message,
+            enqueue_time: now_micros,
+        });
+    }
+
+    /// Упаковывает очередь в data-пакеты (i2pd `SendQueue`).
+    ///
+    /// Отправленные пакеты регистрируются в окне и запоминаются для повторов
+    /// ([`resend`](Self::resend)). Возвращает байты пакетов — их отправляет
+    /// вызывающий.
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки сборки блоков/шифрования.
+    pub fn flush<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+    ) -> crate::Result<SendReport> {
+        if !self.lifecycle.is_established() {
+            return Ok(SendReport::default());
+        }
+        let ack = self.receive.to_ack_block(policy.ack_limits());
+        let cfg = SendQueueConfig {
+            ack: &ack,
+            max_payload: self.params.max_payload,
+            window_size: self.send.window(),
+            sent_packets: self.send.in_flight(),
+            established: true,
+            now_ms: ctx.now_ms,
+            now_micros: ctx.now_micros,
+        };
+        let plan = ssu2_send::send_queue(&mut self.out_queue, &cfg, ctx.rng, policy)?;
+        for msg in &plan.dropped {
+            debug!(msg_id = msg.msg_id(), "flush: dropped message from queue");
+        }
+        let mut packets = Vec::with_capacity(plan.packets.len());
+        for payload in plan.packets {
+            packets.push(self.send_data(&payload.payload, payload.flags, ctx.now, true)?);
+        }
+        debug!(
+            packets = packets.len(),
+            ack_block_sent = plan.ack_block_sent,
+            queue = self.out_queue.len(),
+            in_flight = self.send.in_flight(),
+            "flush: SendQueue"
+        );
+        Ok(SendReport {
+            packets,
+            ack_block_sent: plan.ack_block_sent,
+            dropped: plan.dropped,
+        })
+    }
+
+    /// `SendQuickAck`: `[DateTime]` + Ack + Padding.
+    ///
+    /// i2pd зовёт его из `ProcessData` при `IsEstablished()`; проверки
+    /// состояния здесь нет — решение за вызывающим.
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки сборки/шифрования.
+    pub fn send_quick_ack<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+    ) -> crate::Result<Vec<u8>> {
+        let ack = self.receive.to_ack_block(policy.ack_limits());
+        let roll = padding_roll(ctx.rng, policy);
+        let payload = ssu2_send::quick_ack(
+            self.send_packet_num,
+            &mut self.last_datetime_packet_num,
+            &ack,
+            roll,
+            secs_rounded(ctx.now_ms),
+            self.params.max_payload,
+            policy,
+        )?;
+        self.send_data(&payload.payload, payload.flags, ctx.now, false)
+    }
+
+    /// `SendKeepAlive`: Padding (не меньше 8) + флаг `IMMEDIATE_ACK_REQUESTED`.
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки сборки/шифрования.
+    pub fn send_keep_alive<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+    ) -> crate::Result<Vec<u8>> {
+        let roll = padding_roll(ctx.rng, policy);
+        let payload = ssu2_send::keep_alive(roll, policy)?;
+        self.send_data(&payload.payload, payload.flags, ctx.now, false)
+    }
+
+    /// `SendTermination`: Termination + Padding; причина — текущая причина
+    /// завершения сессии (`m_TerminationReason`).
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки сборки/шифрования.
+    pub fn send_termination<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+    ) -> crate::Result<Vec<u8>> {
+        let roll = padding_roll(ctx.rng, policy);
+        let payload = ssu2_send::termination(
+            u64::from(self.receive.receive_packet_num()),
+            self.lifecycle.termination_reason().as_u8(),
+            roll,
+            policy,
+        )?;
+        self.send_data(&payload.payload, payload.flags, ctx.now, false)
+    }
+
+    /// `SendPathChallenge`: запоминает челлендж и шлёт `DateTime` + Address +
+    /// `Path Challenge` + Ack + Padding.
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки сборки/шифрования.
+    pub fn send_path_challenge<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+        address: &AddressBlock,
+        challenge: u64,
+    ) -> crate::Result<Vec<u8>> {
+        let ack = self.receive.to_ack_block(policy.ack_limits());
+        let roll = padding_roll(ctx.rng, policy);
+        let payload = ssu2_send::path_challenge(
+            address,
+            challenge,
+            &ack,
+            roll,
+            secs_rounded(ctx.now_ms),
+            self.params.max_payload,
+            policy,
+        )?;
+        self.path_challenge_sent = Some(challenge);
+        debug!(address = ?address, "send_path_challenge: challenge sent");
+        self.send_data(&payload.payload, payload.flags, ctx.now, false)
+    }
+
+    /// `SendPathResponse`: `DateTime` + Address + `Path Response` + Ack +
+    /// Padding. `data` — данные из принятого `Path Challenge`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::I2PError::InvalidLength`], если данные не помещаются
+    /// (i2pd в этом случае только пишет предупреждение и ничего не отправляет).
+    pub fn send_path_response<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+        address: &AddressBlock,
+        data: &[u8],
+    ) -> crate::Result<Vec<u8>> {
+        let ack = self.receive.to_ack_block(policy.ack_limits());
+        let roll = padding_roll(ctx.rng, policy);
+        let payload = ssu2_send::path_response(
+            address,
+            data,
+            &ack,
+            roll,
+            secs_rounded(ctx.now_ms),
+            self.params.max_payload,
+            policy,
+        )?;
+        self.send_data(&payload.payload, payload.flags, ctx.now, false)
+    }
+
+    /// Повторяет data-пакеты по RTO (i2pd `Resend`, часть с `m_SentPackets`).
+    ///
+    /// Каждому повтору выдаётся новый номер пакета; при `num_resends > 1`
+    /// ставится флаг `IMMEDIATE_ACK_REQUESTED`. Предел попыток —
+    /// [`Ssu2Policy::max_num_resends`]: тогда очередь и неподтверждённые
+    /// пакеты очищаются, а сессия завершается по `Timeout` (i2pd
+    /// `RequestTermination(eSSU2TerminationReasonTimeout)`).
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки шифрования.
+    pub fn resend<P: Ssu2Policy, C: Ssu2CongestionPolicy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        congestion: &C,
+        ctx: &mut SendContext<'_, R>,
+    ) -> crate::Result<ResendReport> {
+        let plan = self.send.plan_resend(ctx.now, policy.max_num_resends());
+        let mut packets = Vec::new();
+        let mut mapping: Vec<(u32, u32)> = Vec::new();
+        for old in plan.resend {
+            let Some(payload) = self.sent_payloads.get(&old).cloned() else {
+                continue;
+            };
+            let num_resends = self
+                .send
+                .sent_packets()
+                .get(&old)
+                .map_or(0, |p| p.num_resends);
+            let flags = if num_resends > 1 {
+                SSU2_FLAG_IMMEDIATE_ACK_REQUESTED
+            } else {
+                0
+            };
+            let new_num = self.send_packet_num;
+            packets.push(self.send_data(&payload, flags, ctx.now, false)?);
+            self.sent_payloads.remove(&old);
+            self.sent_payloads.insert(new_num, payload);
+            mapping.push((old, new_num));
+        }
+        if !mapping.is_empty() {
+            self.send.apply_resends(&mapping, ctx.now, congestion);
+            debug!(
+                resent = mapping.len(),
+                window = self.send.window(),
+                "resend: data packets resent"
+            );
+        }
+        if plan.terminate {
+            warn!(
+                resent = mapping.len(),
+                "resend: too many attempts; terminating session by timeout"
+            );
+            self.send.clear();
+            self.sent_payloads.clear();
+            self.out_queue.clear();
+            let _ = self
+                .lifecycle
+                .request_termination(Ssu2TerminationReason::Timeout);
+        }
+        Ok(ResendReport {
+            packets,
+            resent: mapping.iter().map(|&(old, _)| old).collect(),
+            terminate: plan.terminate,
+        })
+    }
+
+    /// Шифрует payload в data-пакет и выдаёт номер (`SendData`).
+    ///
+    /// `register` — класть ли пакет в `m_SentPackets` (i2pd делает это только
+    /// для `SendQueue`/`SendFragmentedMessage`/`Resend`, но не для
+    /// контрольных пакетов).
+    fn send_data(
+        &mut self,
+        payload: &[u8],
+        flags: u8,
+        now: Duration,
+        register: bool,
+    ) -> crate::Result<Vec<u8>> {
+        let packet_num = self.send_packet_num;
+        let header = ShortHeader {
+            dest_conn_id: self.params.dest_conn_id,
+            packet_num,
+            msg_type: Ssu2MessageType::Data,
+            flags: [flags, 0, 0],
+        };
+        let mut out = vec![0u8; payload.len() + SSU2_DATA_OVERHEAD];
+        let len = encode_data_packet(
+            &header,
+            &self.params.remote_intro_key,
+            &self.send_key,
+            payload,
+            &mut out,
+        )?;
+        out.truncate(len);
+        self.send_packet_num = self.send_packet_num.wrapping_add(1);
+        if register {
+            self.send.register_sent(packet_num, now);
+            self.sent_payloads.insert(packet_num, payload.to_vec());
+        }
+        trace!(
+            packet_num,
+            payload_len = payload.len(),
+            flags,
+            register,
+            "send_data: data packet"
+        );
+        Ok(out)
+    }
+}
+
+/// `(GetMillisecondsSinceEpoch () + 500) / 1000` — секунды с округлением.
+fn secs_rounded(now_ms: u64) -> u32 {
+    u32::try_from(now_ms.saturating_add(500) / 1000).unwrap_or(u32::MAX)
 }
 
 /// Имя варианта [`BlockEvent`] для `tracing`.
