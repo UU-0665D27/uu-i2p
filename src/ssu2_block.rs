@@ -28,17 +28,18 @@
 //! [`RelayTagBlock`], [`NewTokenBlock`], [`PathChallengeBlock`],
 //! [`PathResponseBlock`], [`FirstPacketNumberBlock`], [`PaddingBlock`].
 //!
-//! ## Что не внутри (следующие итерации)
+//! ## Без типизированных обёрток
 //!
 //! - `Ack` (12) — реализован в [`crate::ssu2_ack`];
-//! - TODO(ssu2-blocks): `Congestion` (21) и `NextNonce` (11) — i2pd их
-//!   не разбирает (тип 11 просто игнорируется, тип 21 отсутствует в его
-//!   enum), формат не определён, поэтому читаются/пишутся через
-//!   [`RawBlock`] / [`write_block`].
+//! - `NextNonce` (11), `IntroKey` (14), `FirstPacketNumber` (20) — в
+//!   [`Ssu2BlockType`] присутствуют (как в i2pd), но при обработке i2pd тело
+//!   этих блоков игнорирует, поэтому типизированной обёртки нет: они
+//!   читаются/пишутся через [`RawBlock`] / [`write_block`].
+//!   [`FirstPacketNumberBlock`] — необязательный «мягкий» парсер того же
+//!   блока.
 //!
-//! Типы уже присутствуют в [`Ssu2BlockType`], но без типизированных
-//! обёрток — до реализации они читаются/пишутся через [`RawBlock`] /
-//! [`write_block`].
+//! Типа `21` в этом списке нет: в i2pd он не зарегистрирован, поэтому
+//! [`Blocks`] отдаёт его как [`RawBlock`].
 
 use crate::{
     endian::{read_u16_be, read_u32_be, read_u64_be, write_u32_be, write_u64_be},
@@ -69,10 +70,12 @@ pub const SSU2_ROUTER_INFO_FLAG_GZIP: u8 = 0x02;
 
 /// Тип блока payload'а SSU2.
 ///
-/// Совпадает с `enum SSU2BlockType` в i2pd. Неизвестные/зарезервированные
-/// значения [`Self::from_u8`] возвращает как `None`: по спеке их нужно
-/// пропускать (forward compatibility), поэтому [`Blocks`] отдаёт сырой
-/// [`RawBlock`] с числовым типом.
+/// Совпадает с `enum SSU2BlockType` в i2pd (сверено с i2pd 2.61.0): `0..=20`
+/// и `254`. Тип `21` в i2pd не зарегистрирован, поэтому и здесь отсутствует.
+///
+/// Неизвестные/зарезервированные значения [`Self::from_u8`] возвращает как
+/// `None`: их нужно пропускать (forward compatibility), поэтому [`Blocks`]
+/// отдаёт сырой [`RawBlock`] с числовым типом.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Ssu2BlockType {
@@ -104,6 +107,8 @@ pub enum Ssu2BlockType {
     Ack = 12,
     /// Address (13).
     Address = 13,
+    /// Intro Key (14).
+    IntroKey = 14,
     /// Relay Tag Request (15).
     RelayTagRequest = 15,
     /// Relay Tag (16).
@@ -116,8 +121,6 @@ pub enum Ssu2BlockType {
     PathResponse = 19,
     /// First Packet Number (20).
     FirstPacketNumber = 20,
-    /// Congestion (21).
-    Congestion = 21,
     /// Padding (254).
     Padding = 254,
 }
@@ -141,13 +144,13 @@ impl Ssu2BlockType {
             11 => Self::NextNonce,
             12 => Self::Ack,
             13 => Self::Address,
+            14 => Self::IntroKey,
             15 => Self::RelayTagRequest,
             16 => Self::RelayTag,
             17 => Self::NewToken,
             18 => Self::PathChallenge,
             19 => Self::PathResponse,
             20 => Self::FirstPacketNumber,
-            21 => Self::Congestion,
             254 => Self::Padding,
             _ => return None,
         })
@@ -177,13 +180,13 @@ impl Ssu2BlockType {
             Self::NextNonce => "NextNonce",
             Self::Ack => "Ack",
             Self::Address => "Address",
+            Self::IntroKey => "IntroKey",
             Self::RelayTagRequest => "RelayTagRequest",
             Self::RelayTag => "RelayTag",
             Self::NewToken => "NewToken",
             Self::PathChallenge => "PathChallenge",
             Self::PathResponse => "PathResponse",
             Self::FirstPacketNumber => "FirstPacketNumber",
-            Self::Congestion => "Congestion",
             Self::Padding => "Padding",
         }
     }

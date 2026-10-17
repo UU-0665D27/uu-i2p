@@ -55,15 +55,17 @@ mod tests {
         assert_eq!(Ssu2BlockType::Termination.as_u8(), 6);
         assert_eq!(Ssu2BlockType::Ack.as_u8(), 12);
         assert_eq!(Ssu2BlockType::Address.as_u8(), 13);
+        assert_eq!(Ssu2BlockType::IntroKey.as_u8(), 14);
         assert_eq!(Ssu2BlockType::RelayTagRequest.as_u8(), 15);
-        assert_eq!(Ssu2BlockType::Congestion.as_u8(), 21);
         assert_eq!(Ssu2BlockType::Padding.as_u8(), 254);
+        // Тип 21 отсутствует в enum i2pd — у нас тоже не зарегистрирован.
+        assert_eq!(Ssu2BlockType::from_u8(21), None);
     }
 
     #[test]
     fn block_type_roundtrip_registered() {
         let registered = [
-            0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 254,
+            0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 254,
         ];
         for v in registered {
             let t = Ssu2BlockType::from_u8(v).expect("registered type");
@@ -73,7 +75,7 @@ mod tests {
 
     #[test]
     fn block_type_unknown_is_none() {
-        for v in [14u8, 22, 100, 223, 253, 255] {
+        for v in [21u8, 22, 100, 223, 253, 255] {
             assert!(Ssu2BlockType::from_u8(v).is_none(), "type {v}");
         }
     }
@@ -81,7 +83,7 @@ mod tests {
     #[test]
     fn block_type_names_unique() {
         let registered = [
-            0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 254,
+            0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 254,
         ];
         let mut seen = std::collections::HashSet::new();
         for v in registered {
@@ -89,6 +91,18 @@ mod tests {
             assert!(seen.insert(t.name()), "duplicate name {}", t.name());
             assert_eq!(format!("{t}"), t.name());
         }
+    }
+
+    #[test]
+    fn type_21_unregistered_is_raw_block() {
+        // Тип 21 не входит в enum i2pd — блок должен пройти как сырой
+        // (forward compatibility), с сохранением числового типа.
+        let mut payload = Vec::new();
+        write_raw_block(&mut payload, 21, &[0xDE, 0xAD]).unwrap();
+        let blk = Blocks::new(&payload).next().unwrap().unwrap();
+        assert_eq!(blk.kind(), None);
+        assert_eq!(blk.block_type, 21);
+        assert_eq!(blk.body, &[0xDE, 0xAD]);
     }
 
     // ---- фрейминг -------------------------------------------------------
