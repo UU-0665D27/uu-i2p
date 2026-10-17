@@ -66,7 +66,7 @@ pub mod tunnel_reassembly;
 pub mod variable_tunnel_build;
 
 pub use config::{
-    DEFAULT_NET_ID, DEFAULT_VERSION, ListenEndpoint, RouterConfig, RouterConfigBuilder,
+    DEFAULT_NET_ID, DEFAULT_VERSION, ListenEndpoint, RouterConfig, RouterConfigBuilder, Transport,
 };
 pub use crypto::{AeadChaCha20Poly1305, Aes256Ecb, I2PX25519Keys, NoiseSymmetricState};
 pub use data_message::DataBody;

@@ -3,7 +3,7 @@ mod tests {
     use std::net::IpAddr;
     use uu_i2p::{
         DEFAULT_NET_ID, DEFAULT_VERSION, I2PPrivateKeys, I2PX25519Keys, ListenEndpoint,
-        RouterConfig, error::I2PError,
+        RouterConfig, Transport, error::I2PError,
     };
 
     fn keys() -> I2PPrivateKeys {
@@ -156,11 +156,65 @@ mod tests {
             .keys(keys())
             .ntcp2_keys(static_key, iv)
             .listen_unpublished("0.0.0.0:2827".parse().unwrap())
-            .listen_published("0.0.0.0:2827".parse().unwrap(), "1.2.3.4".parse().unwrap())
-            .listen_unpublished("[::]:2827".parse().unwrap())
+            .listen_published("0.0.0.0:2828".parse().unwrap(), "1.2.3.4".parse().unwrap())
+            .listen_unpublished("[::]:2829".parse().unwrap())
             .build()
             .unwrap();
         assert_eq!(cfg.listen().len(), 3);
+    }
+
+    #[test]
+    fn same_address_two_transports_is_allowed() {
+        let (static_key, iv) = ntcp2();
+        let cfg = RouterConfig::builder()
+            .keys(keys())
+            .ntcp2_keys(static_key, iv)
+            .ssu2_intro_key([0x11; 32])
+            .listen_unpublished("0.0.0.0:2827".parse().unwrap())
+            .listen_ssu2_unpublished("0.0.0.0:2827".parse().unwrap())
+            .build()
+            .unwrap();
+        assert_eq!(cfg.listen().len(), 2);
+        assert_eq!(cfg.listen()[0].transport, Transport::Ntcp2);
+        assert_eq!(cfg.listen()[1].transport, Transport::Ssu2);
+    }
+
+    #[test]
+    fn duplicate_bind_same_transport_fails() {
+        let (static_key, iv) = ntcp2();
+        let r = RouterConfig::builder()
+            .keys(keys())
+            .ntcp2_keys(static_key, iv)
+            .listen_unpublished("0.0.0.0:2827".parse().unwrap())
+            .listen_unpublished("0.0.0.0:2827".parse().unwrap())
+            .build();
+        assert!(matches!(r, Err(I2PError::Malformed(_))));
+    }
+
+    #[test]
+    fn ssu2_endpoint_requires_intro_key() {
+        let (static_key, iv) = ntcp2();
+        let r = RouterConfig::builder()
+            .keys(keys())
+            .ntcp2_keys(static_key, iv)
+            .listen_ssu2_unpublished("0.0.0.0:2827".parse().unwrap())
+            .build();
+        assert!(matches!(r, Err(I2PError::Malformed(_))));
+    }
+
+    #[test]
+    fn ssu2_auto_unspecified_is_unpublished() {
+        let ep = ListenEndpoint::ssu2_auto("0.0.0.0:2827".parse().unwrap());
+        assert_eq!(ep.transport, Transport::Ssu2);
+        assert!(ep.advertise.is_none());
+    }
+
+    #[test]
+    fn with_transport_switches_transport() {
+        let ep = ListenEndpoint::unpublished("1.2.3.4:2827".parse().unwrap())
+            .with_transport(Transport::Ssu2);
+        assert_eq!(ep.transport, Transport::Ssu2);
+        assert_eq!(Transport::Ssu2.name(), "SSU2");
     }
 
     // ---- build_router_info ---------------------------------------------
@@ -234,6 +288,65 @@ mod tests {
             .unwrap();
         let ri = cfg.build_router_info(1_700_000_000_000).unwrap();
         assert_eq!(ri.body().addresses.len(), 2);
+    }
+
+    #[test]
+    fn build_router_info_publishes_ssu2() {
+        let (static_key, iv) = ntcp2();
+        let expected_s = *static_key.public_key();
+        let intro = [0x11u8; 32];
+        let cfg = RouterConfig::builder()
+            .keys(keys())
+            .ntcp2_keys(static_key, iv)
+            .ssu2_intro_key(intro)
+            .listen_ssu2_published("0.0.0.0:2827".parse().unwrap(), "1.2.3.4".parse().unwrap())
+            .build()
+            .unwrap();
+        let ri = cfg.build_router_info(1_700_000_000_000).unwrap();
+        assert_eq!(ri.body().addresses.len(), 1);
+        let a = &ri.body().addresses[0];
+        assert!(a.is_ssu2());
+        assert!(a.published);
+        assert_eq!(a.port, 2827);
+        // Static-ключ общий с NTCP2, intro-ключ — из конфига.
+        assert_eq!(a.s.0, expected_s);
+        assert_eq!(a.i.0, intro);
+    }
+
+    #[test]
+    fn build_router_info_ntcp2_and_ssu2_share_port() {
+        let (static_key, iv) = ntcp2();
+        let cfg = RouterConfig::builder()
+            .keys(keys())
+            .ntcp2_keys(static_key, iv)
+            .ssu2_intro_key([0x11; 32])
+            .listen_published("0.0.0.0:2827".parse().unwrap(), "1.2.3.4".parse().unwrap())
+            .listen_ssu2_published("0.0.0.0:2827".parse().unwrap(), "1.2.3.4".parse().unwrap())
+            .build()
+            .unwrap();
+        let ri = cfg.build_router_info(1_700_000_000_000).unwrap();
+        assert_eq!(ri.body().addresses.len(), 2);
+        assert!(ri.body().addresses[0].is_ntcp2());
+        assert!(ri.body().addresses[1].is_ssu2());
+        assert_eq!(ri.body().addresses[0].port, ri.body().addresses[1].port);
+    }
+
+    #[test]
+    fn build_router_info_ssu2_unpublished_has_no_host() {
+        let (static_key, iv) = ntcp2();
+        let cfg = RouterConfig::builder()
+            .keys(keys())
+            .ntcp2_keys(static_key, iv)
+            .ssu2_intro_key([0x11; 32])
+            .listen_ssu2_unpublished("[::]:2827".parse().unwrap())
+            .build()
+            .unwrap();
+        let ri = cfg.build_router_info(1_700_000_000_000).unwrap();
+        assert_eq!(ri.body().addresses.len(), 1);
+        let a = &ri.body().addresses[0];
+        assert!(a.is_ssu2());
+        assert!(!a.published);
+        assert!(a.host.is_unspecified());
     }
 
     // ---- Debug ---------------------------------------------------------

@@ -7,10 +7,14 @@
 //!
 //! ## Множественные listen-endpoints
 //!
-//! Роутер может слушать на любом количестве `bind`-адресов. Каждый
-//! [`ListenEndpoint`] независим:
+//! Роутер слушает на любом количестве `bind`-адресов — в том числе на
+//! нескольких интерфейсах и на разных транспортах сразу. Ограничения «один
+//! endpoint на роутер» здесь нет. Каждый [`ListenEndpoint`] независим:
 //!
-//! - **bind** — куда открывать `tokio::net::TcpListener`;
+//! - **bind** — куда открывать listener;
+//! - **transport** — [`Transport::Ntcp2`] (TCP) или [`Transport::Ssu2`]
+//!   (UDP). NTCP2 и SSU2 могут слушать один и тот же `IP:порт`: это разные
+//!   сокеты (TCP и UDP), и так делает i2pd;
 //! - **advertise** — какой IP публиковать в своём `RouterInfo`.
 //!   `None` — не публикуем (полезно для `127.0.0.1`, для NAT'нутых
 //!   роутеров, для тестового окружения).
@@ -19,8 +23,6 @@
 //!
 //! - загрузка из файла (i2pd-style `i2pd.conf`) — caller сам заполняет
 //!   builder;
-//! - SSU2 (UDP) — только NTCP2 (TCP); когда появится SSU2, добавим
-//!   `Transport` в [`ListenEndpoint`];
 //! - bandwidth limits, congestion, auto-caps — пока всё вручную через
 //!   [`RouterInfoCaps`].
 
@@ -41,6 +43,36 @@ pub const DEFAULT_VERSION: u32 = 970;
 /// `netId` по умолчанию — основной I2P.
 pub const DEFAULT_NET_ID: u8 = 2;
 
+/// Транспорт listen-endpoint'а.
+///
+/// Отличается сокет: [`Transport::Ntcp2`] — TCP (`tokio::net::TcpListener`),
+/// [`Transport::Ssu2`] — UDP (`tokio::net::UdpSocket`). Один и тот же
+/// `IP:порт` может быть занят сразу обоими транспортами — это разные сокеты.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Transport {
+    /// TCP — NTCP2.
+    Ntcp2,
+    /// UDP — SSU2.
+    Ssu2,
+}
+
+impl Transport {
+    /// Имя транспорта (для логов и ошибок).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ntcp2 => "NTCP2",
+            Self::Ssu2 => "SSU2",
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Один listen-endpoint.
 ///
 /// ## Пример
@@ -56,6 +88,9 @@ pub const DEFAULT_NET_ID: u8 = 2;
 ///     "0.0.0.0:2827".parse().unwrap(),
 ///     "1.2.3.4".parse().unwrap(),
 /// );
+///
+/// // SSU2 (UDP) на том же порту, что TCP выше — это разные сокеты.
+/// let ep = ListenEndpoint::ssu2_auto("0.0.0.0:2827".parse().unwrap());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenEndpoint {
@@ -65,43 +100,85 @@ pub struct ListenEndpoint {
     ///
     /// Порт для advertise-адреса берётся из `bind.port()`.
     pub advertise: Option<IpAddr>,
+    /// Транспорт (TCP — NTCP2, UDP — SSU2).
+    pub transport: Transport,
 }
 
 impl ListenEndpoint {
-    /// Непубликуемый endpoint. Полезен для loopback'а, NAT-роутеров,
-    /// тестового окружения.
+    /// Непубликуемый endpoint транспорта `transport`.
     #[must_use]
-    pub const fn unpublished(bind: SocketAddr) -> Self {
+    pub const fn unpublished_on(transport: Transport, bind: SocketAddr) -> Self {
         Self {
             bind,
             advertise: None,
+            transport,
         }
     }
 
-    /// Публикуемый endpoint: `bind` для listener'а, `advertise` в RI.
+    /// Публикуемый endpoint транспорта `transport`.
     #[must_use]
-    pub const fn published(bind: SocketAddr, advertise: IpAddr) -> Self {
+    pub const fn published_on(transport: Transport, bind: SocketAddr, advertise: IpAddr) -> Self {
         Self {
             bind,
             advertise: Some(advertise),
+            transport,
         }
     }
 
-    /// Автоопределение: если `bind` — на конкретном IP (не unspecified),
-    /// то публикуем именно его; если на `0.0.0.0`/`::` — не публикуем.
-    ///
-    /// Разумный дефолт, чтобы не заставлять caller явно указывать
-    /// advertise для тривиальных случаев.
+    /// Автоопределение advertise для транспорта `transport`: если `bind` —
+    /// на конкретном IP (не unspecified), публикуем именно его; если на
+    /// `0.0.0.0`/`::` — не публикуем.
+    #[must_use]
+    pub const fn auto_on(transport: Transport, bind: SocketAddr) -> Self {
+        if bind.ip().is_unspecified() {
+            Self::unpublished_on(transport, bind)
+        } else {
+            Self::published_on(transport, bind, bind.ip())
+        }
+    }
+
+    /// NTCP2 (TCP), непубликуемый. Полезен для loopback'а, NAT-роутеров,
+    /// тестового окружения.
+    #[must_use]
+    pub const fn unpublished(bind: SocketAddr) -> Self {
+        Self::unpublished_on(Transport::Ntcp2, bind)
+    }
+
+    /// NTCP2 (TCP), публикуемый: `bind` для listener'а, `advertise` в RI.
+    #[must_use]
+    pub const fn published(bind: SocketAddr, advertise: IpAddr) -> Self {
+        Self::published_on(Transport::Ntcp2, bind, advertise)
+    }
+
+    /// NTCP2 (TCP), автоопределение advertise.
     #[must_use]
     pub const fn auto(bind: SocketAddr) -> Self {
-        if bind.ip().is_unspecified() {
-            Self::unpublished(bind)
-        } else {
-            Self {
-                bind,
-                advertise: Some(bind.ip()),
-            }
-        }
+        Self::auto_on(Transport::Ntcp2, bind)
+    }
+
+    /// SSU2 (UDP), непубликуемый.
+    #[must_use]
+    pub const fn ssu2_unpublished(bind: SocketAddr) -> Self {
+        Self::unpublished_on(Transport::Ssu2, bind)
+    }
+
+    /// SSU2 (UDP), публикуемый.
+    #[must_use]
+    pub const fn ssu2_published(bind: SocketAddr, advertise: IpAddr) -> Self {
+        Self::published_on(Transport::Ssu2, bind, advertise)
+    }
+
+    /// SSU2 (UDP), автоопределение advertise.
+    #[must_use]
+    pub const fn ssu2_auto(bind: SocketAddr) -> Self {
+        Self::auto_on(Transport::Ssu2, bind)
+    }
+
+    /// Сменить транспорт endpoint'а.
+    #[must_use]
+    pub const fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 }
 
@@ -126,6 +203,7 @@ pub struct RouterConfig {
     keys: I2PPrivateKeys,
     ntcp2_static: I2PX25519Keys,
     ntcp2_iv: [u8; 16],
+    ssu2_intro_key: Option<[u8; 32]>,
     listen: Vec<ListenEndpoint>,
     caps: RouterInfoCaps,
     is_floodfill: bool,
@@ -166,6 +244,16 @@ impl RouterConfig {
     #[must_use]
     pub const fn ntcp2_iv(&self) -> &[u8; 16] {
         &self.ntcp2_iv
+    }
+
+    /// Intro-ключ SSU2 (`i=` в адресе SSU2). `None`, пока нет SSU2-endpoint'ов.
+    ///
+    /// Один ключ на все SSU2-интерфейсы — так же, как i2pd хранит его в
+    /// `RouterContext::m_SSU2Keys->intro`. Static-ключ (`s=`) у NTCP2 и SSU2
+    /// общий ([`Self::ntcp2_static`]).
+    #[must_use]
+    pub const fn ssu2_intro_key(&self) -> Option<&[u8; 32]> {
+        self.ssu2_intro_key.as_ref()
     }
 
     /// Listen-endpoints.
@@ -210,6 +298,9 @@ impl RouterConfig {
 
         let mut builder = RouterInfo::builder().timestamp(timestamp_ms);
 
+        // Инвариант `build()`: если есть SSU2-endpoint'ы, intro-ключ задан.
+        let intro = I2PTag::from_array(self.ssu2_intro_key.unwrap_or_default());
+
         for ep in &self.listen {
             // Готовим общие параметры заранее, чтобы замыкания
             // в `map_or_else` были короткие.
@@ -218,10 +309,16 @@ impl RouterConfig {
             let is_v4 = ep.bind.is_ipv4();
             let is_v6 = ep.bind.is_ipv6();
 
-            let address = ep.advertise.map_or_else(
-                || I2PAddress::ntcp2_unpublished(port, s, iv, is_v4, is_v6),
-                |ip| I2PAddress::ntcp2_published(ip, port, s, iv),
-            );
+            let address = match ep.transport {
+                Transport::Ntcp2 => ep.advertise.map_or_else(
+                    || I2PAddress::ntcp2_unpublished(port, s, iv, is_v4, is_v6),
+                    |ip| I2PAddress::ntcp2_published(ip, port, s, iv),
+                ),
+                Transport::Ssu2 => ep.advertise.map_or_else(
+                    || I2PAddress::ssu2_unpublished(port, s, intro, is_v4, is_v6),
+                    |ip| I2PAddress::ssu2_published(ip, port, s, intro),
+                ),
+            };
             builder = builder.add_address(address);
         }
 
@@ -247,6 +344,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("version", &self.version)
             .field("ident_hash", self.keys.public().ident_hash())
             .field("ntcp2_public", self.ntcp2_static.public_key())
+            .field("ssu2_intro_key_set", &self.ssu2_intro_key.is_some())
             .field("listen", &self.listen)
             .field("caps", &self.caps)
             .field("is_floodfill", &self.is_floodfill)
@@ -264,7 +362,9 @@ impl std::fmt::Debug for RouterConfig {
 /// - `is_floodfill` = `false`;
 /// - `listen` = пусто — **обязательно** заполнить через
 ///   [`Self::listen_auto`] / [`Self::listen_unpublished`] /
-///   [`Self::listen_published`].
+///   [`Self::listen_published`] (NTCP2) либо их SSU2-аналоги
+///   [`Self::listen_ssu2_auto`] / [`Self::listen_ssu2_unpublished`] /
+///   [`Self::listen_ssu2_published`].
 #[derive(Default)]
 pub struct RouterConfigBuilder {
     net_id: Option<u8>,
@@ -272,6 +372,7 @@ pub struct RouterConfigBuilder {
     keys: Option<I2PPrivateKeys>,
     ntcp2_static: Option<I2PX25519Keys>,
     ntcp2_iv: Option<[u8; 16]>,
+    ssu2_intro_key: Option<[u8; 32]>,
     listen: Vec<ListenEndpoint>,
     caps: Option<RouterInfoCaps>,
     is_floodfill: bool,
@@ -295,6 +396,7 @@ impl std::fmt::Debug for RouterConfigBuilder {
             )
             .field("ntcp2_static_set", &self.ntcp2_static.is_some())
             .field("ntcp2_iv", &self.ntcp2_iv)
+            .field("ssu2_intro_key_set", &self.ssu2_intro_key.is_some())
             .field("listen", &self.listen)
             .field("caps", &self.caps)
             .field("is_floodfill", &self.is_floodfill)
@@ -331,6 +433,17 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Intro-ключ SSU2. Обязателен, если среди listen-endpoint'ов есть SSU2.
+    ///
+    /// Static-ключ (`s=`) отдельно задавать не нужно: он общий с NTCP2
+    /// ([`Self::ntcp2_keys`]) — как в i2pd, где NTCP2 и SSU2 используют одну
+    /// пару статических ключей.
+    #[must_use]
+    pub const fn ssu2_intro_key(mut self, intro_key: [u8; 32]) -> Self {
+        self.ssu2_intro_key = Some(intro_key);
+        self
+    }
+
     /// Добавляет listen-endpoint.
     #[must_use]
     pub fn listen(mut self, ep: ListenEndpoint) -> Self {
@@ -359,6 +472,28 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Шорткат SSU2: `listen(ListenEndpoint::ssu2_auto(bind))`.
+    #[must_use]
+    pub fn listen_ssu2_auto(mut self, bind: SocketAddr) -> Self {
+        self.listen.push(ListenEndpoint::ssu2_auto(bind));
+        self
+    }
+
+    /// Шорткат SSU2: `listen(ListenEndpoint::ssu2_unpublished(bind))`.
+    #[must_use]
+    pub fn listen_ssu2_unpublished(mut self, bind: SocketAddr) -> Self {
+        self.listen.push(ListenEndpoint::ssu2_unpublished(bind));
+        self
+    }
+
+    /// Шорткат SSU2: `listen(ListenEndpoint::ssu2_published(bind, advertise))`.
+    #[must_use]
+    pub fn listen_ssu2_published(mut self, bind: SocketAddr, advertise: IpAddr) -> Self {
+        self.listen
+            .push(ListenEndpoint::ssu2_published(bind, advertise));
+        self
+    }
+
     /// RI-level caps.
     #[must_use]
     pub const fn caps(mut self, caps: RouterInfoCaps) -> Self {
@@ -381,7 +516,12 @@ impl RouterConfigBuilder {
     ///   (`keys`, `ntcp2_keys`), `listen` пуст;
     /// - [`Error::Unsupported`] — ключи не `EdDSA` + ECIES-X25519;
     /// - [`Error::Malformed`] — публикуемый `advertise`-адрес
-    ///   unspecified, multicast или loopback; порт 0.
+    ///   unspecified, multicast или loopback; порт 0;
+    /// - [`Error::Malformed`] — есть SSU2-endpoint, но не задан
+    ///   `ssu2_intro_key`;
+    /// - [`Error::Malformed`] — два endpoint'а одного транспорта на одном
+    ///   `bind` (такой сокет не открыть дважды; NTCP2 и SSU2 на одном
+    ///   `IP:порт` — можно, это разные сокеты).
     pub fn build(self) -> Result<RouterConfig> {
         let keys = self
             .keys
@@ -430,12 +570,32 @@ impl RouterConfigBuilder {
             }
         }
 
+        let mut seen: Vec<(Transport, SocketAddr)> = Vec::with_capacity(self.listen.len());
+        for ep in &self.listen {
+            let key = (ep.transport, ep.bind);
+            if seen.contains(&key) {
+                return Err(I2PError::Malformed(
+                    "config: duplicate listen endpoint for the same transport",
+                ));
+            }
+            seen.push(key);
+        }
+
+        let ssu2_intro_key = self.ssu2_intro_key;
+        if self.listen.iter().any(|ep| ep.transport == Transport::Ssu2) && ssu2_intro_key.is_none()
+        {
+            return Err(I2PError::Malformed(
+                "config: ssu2 intro key not set, but SSU2 endpoint present",
+            ));
+        }
+
         Ok(RouterConfig {
             net_id: self.net_id.unwrap_or(DEFAULT_NET_ID),
             version: self.version.unwrap_or(DEFAULT_VERSION),
             keys,
             ntcp2_static,
             ntcp2_iv,
+            ssu2_intro_key,
             listen: self.listen,
             caps: self.caps.unwrap_or_else(|| RouterInfoCaps::parse(b"L")),
             is_floodfill: self.is_floodfill,
