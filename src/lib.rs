@@ -44,6 +44,7 @@ pub mod ssu2_ack;
 pub mod ssu2_block;
 pub mod ssu2_crypto;
 pub mod ssu2_header;
+pub mod ssu2_policy;
 pub mod tag;
 pub mod timestamp;
 pub mod tunnel_build_crypto;
