@@ -43,6 +43,7 @@ pub mod siphash;
 pub mod tag;
 pub mod timestamp;
 pub mod tunnel_build_crypto;
+pub mod tunnel_build_message;
 pub mod tunnel_build_record;
 pub mod tunnel_config;
 pub mod tunnel_messages;
@@ -91,6 +92,10 @@ pub use short_tunnel_build::{SHORT_TUNNEL_BUILD_HEADER_SIZE, ShortTunnelBuildBod
 pub use signature::{CryptoKeyType, SigningKeyType};
 pub use tag::{I2PAesKey, I2PTag, IdentHash, SessionTag};
 pub use tunnel_build_crypto::{GarlicReplyKeys, HopCrypto, RecordKeys};
+pub use tunnel_build_message::{
+    BuildReplyResult, STANDARD_NUM_RECORDS, ShortBuildRequest, build_short_tunnel_request,
+    process_short_build_reply,
+};
 pub use tunnel_build_record::{
     BuildOptions, BuildRetCode, EncryptedShortRecord, NUM_TUNNEL_BUILD_RECORDS,
     SHORT_REQUEST_RECORD_CLEAR_TEXT_SIZE, SHORT_RESPONSE_PLAINTEXT_SIZE,
