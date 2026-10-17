@@ -1394,6 +1394,12 @@ pub struct Ntcp2SendHalf {
 }
 
 impl Ntcp2SendHalf {
+    /// Номер следующего исходящего фрейма (`seqn` в `Termination`).
+    #[must_use]
+    pub const fn sequence_number(&self) -> u64 {
+        self.seq
+    }
+
     /// См. [`Ntcp2DataPhase::obfuscate_send_length`].
     pub fn obfuscate_send_length(&mut self, frame_len: u16) -> [u8; 2] {
         self.iv = siphash24(&self.iv, &self.sip_key).to_le_bytes();
@@ -2374,6 +2380,116 @@ pub struct Ntcp2LocalConfig<'a> {
     pub net_id: u8,
 }
 
+/// Владеющая версия [`Ntcp2LocalConfig`].
+///
+/// Нужна там, где локальные данные живут дольше одного вызова: пул/транспорт
+/// роутера держит их между соединениями, а [`Ntcp2LocalConfig`] только
+/// заимствует ключи и байты RI. Ключи и IV берутся из [`RouterConfig`],
+/// `ri_bytes` — из собственного `RouterInfo` (его надо обновлять
+/// [`Self::set_router_info`] после [`crate::RouterContext::rebuild_own_ri`]).
+///
+/// i2pd держит то же самое в `RouterContext` (`m_NTCP2Keys`,
+/// `m_RouterInfo`) и отдаёт в `NTCP2Session` при каждом соединении.
+pub struct Ntcp2Local {
+    static_keys: I2PX25519Keys,
+    ident_hash: [u8; 32],
+    iv: [u8; 16],
+    ri_bytes: Vec<u8>,
+    net_id: u8,
+}
+
+impl Ntcp2Local {
+    /// Собирает локальные данные из любых источников.
+    #[must_use]
+    pub const fn new(
+        static_keys: I2PX25519Keys,
+        ident_hash: [u8; 32],
+        iv: [u8; 16],
+        ri_bytes: Vec<u8>,
+        net_id: u8,
+    ) -> Self {
+        Self {
+            static_keys,
+            ident_hash,
+            iv,
+            ri_bytes,
+            net_id,
+        }
+    }
+
+    /// Берёт ключи, IV и `netId` из конфигурации, RI — снаружи.
+    ///
+    /// `ri_bytes` должен быть собран **той же** конфигурацией: i2pd сверяет
+    /// `s` из NTCP2-адреса в `SessionConfirmed` со статическим ключом,
+    /// которым шёл handshake (`NTCPSession.cpp`, `EstablishSessionAfter...`).
+    ///
+    /// # Errors
+    ///
+    /// [`I2PError::InvalidLength`], если identity-ключ не даёт `IdentHash`
+    /// ожидаемой длины.
+    pub fn from_config(config: &crate::config::RouterConfig, ri_bytes: Vec<u8>) -> Result<Self> {
+        let ident_hash: [u8; 32] = (*config.keys().public().ident_hash()).into();
+        let private_key = config.ntcp2_static().private_key();
+        Ok(Self {
+            static_keys: I2PX25519Keys::from_private(
+                &private_key,
+                Some(config.ntcp2_static().public_key()),
+            ),
+            ident_hash,
+            iv: *config.ntcp2_iv(),
+            ri_bytes,
+            net_id: config.net_id(),
+        })
+    }
+
+    /// Заимствованная конфигурация для handshake.
+    #[must_use]
+    pub fn config(&self) -> Ntcp2LocalConfig<'_> {
+        Ntcp2LocalConfig {
+            static_keys: &self.static_keys,
+            ident_hash: self.ident_hash,
+            iv: self.iv,
+            ri_bytes: &self.ri_bytes,
+            net_id: self.net_id,
+        }
+    }
+
+    /// `IdentHash` своего роутера.
+    #[must_use]
+    pub const fn ident_hash(&self) -> &[u8; 32] {
+        &self.ident_hash
+    }
+
+    /// NTCP2 IV (тот, что опубликован в RI).
+    #[must_use]
+    pub const fn iv(&self) -> &[u8; 16] {
+        &self.iv
+    }
+
+    /// Сырые байты своего `RouterInfo`.
+    #[must_use]
+    pub fn router_info(&self) -> &[u8] {
+        &self.ri_bytes
+    }
+
+    /// Обновляет свой `RouterInfo` (новый timestamp, адреса).
+    pub fn set_router_info(&mut self, ri_bytes: Vec<u8>) {
+        self.ri_bytes = ri_bytes;
+    }
+}
+
+impl std::fmt::Debug for Ntcp2Local {
+    /// Печатает, что есть, но не сами секреты.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ntcp2Local")
+            .field("ident_hash", &crate::IdentHash::from_array(self.ident_hash))
+            .field("iv", &self.iv)
+            .field("ri_len", &self.ri_bytes.len())
+            .field("net_id", &self.net_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Установленная NTCP2-сессия.
 ///
 /// Создаётся через [`Self::connect`] (Alice) или [`Self::accept`] (Bob).
@@ -2870,6 +2986,29 @@ impl Ntcp2SessionWrite {
             Ntcp2Block::I2npMessage(payload),
         ];
         self.send_blocks(&blocks).await
+    }
+
+    /// Отправляет `Termination` и закрывает свою сторону TCP
+    /// (i2pd `NTCP2Session::SendTermination`).
+    ///
+    /// `seqn` — номер последнего отправленного/следующего фрейма, как в
+    /// i2pd (`m_SendSequenceNumber`). После него write-половина
+    /// бесполезна: TCP уходит в FIN, читать ответ можно до EOF.
+    ///
+    /// # Errors
+    ///
+    /// См. [`Self::send_blocks`].
+    pub async fn send_termination(&mut self, reason: Ntcp2TerminationReason) -> Result<()> {
+        let blocks = [Ntcp2Block::Termination {
+            seqn: self.send.sequence_number(),
+            reason,
+        }];
+        debug!(?reason, "Ntcp2SessionWrite::send_termination");
+        self.send_blocks(&blocks).await?;
+        self.stream
+            .shutdown()
+            .await
+            .map_err(|e| I2PError::Io(e.to_string()))
     }
 }
 

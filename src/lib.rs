@@ -103,12 +103,13 @@ pub use lease_set2::{
     NETDB_STORE_TYPE_META_LEASESET2, NETDB_STORE_TYPE_STANDARD_LEASESET2, Properties, Property,
 };
 pub use netdb::NetDb;
+pub use ntcp2::Ntcp2Local;
 pub use ntcp2_pool::{Ntcp2Pool, PoolEvent};
 pub use private_keys::I2PPrivateKeys;
 pub use ratchet_tagset::{MAX_TAG_INDEX, RatchetTagSet};
 pub use router::{
-    BoxFuture, Clock, I2pdRouterPolicy, INITIAL_RI_PUBLISH_INTERVAL_SECS, Ntcp2Transport,
-    NoopObserver, RI_PUBLISH_INTERVAL_SECS, RI_PUBLISH_TARGETS, Router, RouterObserver,
+    BoxFuture, Clock, I2pdRouterPolicy, INITIAL_RI_PUBLISH_INTERVAL_SECS, NoopObserver,
+    Ntcp2Transport, RI_PUBLISH_INTERVAL_SECS, RI_PUBLISH_TARGETS, Router, RouterObserver,
     RouterPolicy, SystemClock, TICK_INTERVAL_MS, TransportEvent, TransportPool,
 };
 pub use router_context::{RouterContext, StoreHandling};

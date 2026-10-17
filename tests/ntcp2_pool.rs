@@ -1,13 +1,15 @@
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::time::Duration;
+
     use tokio::net::TcpListener;
     use uu_i2p::{
         I2PError, I2PTag, IdentHash, Ntcp2Pool, PoolEvent,
         crypto::I2PX25519Keys,
         i2np::I2npMessageType,
         i2np_message::I2npMessage,
-        ntcp2::{Ntcp2LocalConfig, Ntcp2Session},
+        ntcp2::{Ntcp2Block, Ntcp2LocalConfig, Ntcp2Session, Ntcp2TerminationReason},
         private_keys::I2PPrivateKeys,
         router_info::{FullRouterInfo, RouterInfo},
         router_info_address::I2PAddress,
@@ -24,14 +26,20 @@ mod tests {
         /// `socket_addr` — реальный адрес listener'а; используется
         /// в `Address::ntcp2_published`, чтобы remote мог подключиться.
         fn new(iv_byte: u8, socket_addr: SocketAddr) -> Self {
+            Self::with_published(iv_byte, socket_addr)
+        }
+
+        /// То же, но опубликованный в RI адрес задан отдельно: так
+        /// проверяется `connect_to` (адрес из RI намеренно недоступен).
+        fn with_published(iv_byte: u8, published: SocketAddr) -> Self {
             let keys = I2PPrivateKeys::generate_default().unwrap();
             let ntcp2_static = I2PX25519Keys::generate();
             let ntcp2_iv = [iv_byte; 16];
             let mut static_bytes = [0u8; 32];
             static_bytes.copy_from_slice(ntcp2_static.public_key());
             let addr = I2PAddress::ntcp2_published(
-                socket_addr.ip(),
-                socket_addr.port(),
+                published.ip(),
+                published.port(),
                 I2PTag::from_array(static_bytes),
                 ntcp2_iv,
             );
@@ -67,13 +75,9 @@ mod tests {
     }
 
     /// Ждёт первое `PoolEvent::Message` от указанного пира, пропуская
-    /// `PoolEvent::RouterInfo` (их шлёт responder сразу после handshake —
-    /// поведение i2pd: `Transports::PeerConnected` → `SendLocalRouterInfo`).
-    ///
-    /// В проде эти события поглощает `RouterContext`, кладя RI в netdb.
-    /// Пул сам в netdb не ходит, поэтому транслирует их наружу.
+    /// `Established`, `RouterInfo` и `Disconnected`.
     async fn recv_message_from(pool: &Ntcp2Pool, expected_from: IdentHash) -> I2npMessage {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -98,6 +102,32 @@ mod tests {
                         FullRouterInfo::from_buffer(&ri_bytes).expect("peer RI failed to parse");
                     assert_eq!(ri.ident_hash(), &expected_from, "RI ident mismatch");
                 }
+                PoolEvent::Established { .. } | PoolEvent::Disconnected { .. } => {}
+            }
+        }
+    }
+
+    /// Ждёт `Disconnected` от указанного пира.
+    async fn recv_disconnected(pool: &Ntcp2Pool, expected_from: IdentHash) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for PoolEvent::Disconnected"
+            );
+            let event = tokio::time::timeout(remaining, pool.next_event())
+                .await
+                .expect("timeout waiting for PoolEvent")
+                .expect("pool.next_event");
+            match event {
+                PoolEvent::Disconnected { ident } => {
+                    assert_eq!(ident, expected_from, "Disconnected from unexpected peer");
+                    return;
+                }
+                PoolEvent::Established { .. }
+                | PoolEvent::Message { .. }
+                | PoolEvent::RouterInfo { .. } => {}
             }
         }
     }
@@ -138,6 +168,12 @@ mod tests {
         assert!(alice_pool.has_session(&bob_ident).await);
         assert_eq!(alice_pool.len().await, 1);
 
+        // Первое событие — `Established` (пул сообщает о готовности).
+        match alice_pool.next_event().await.unwrap() {
+            PoolEvent::Established { ident } => assert_eq!(ident, bob_ident),
+            other => panic!("expected PoolEvent::Established, got {other:?}"),
+        }
+
         // Ждём завершения handshake на стороне Bob'а.
         let mut bob_session = bob_task.await.unwrap().expect("bob handshake");
 
@@ -145,8 +181,7 @@ mod tests {
         // отдельным фреймом — как i2pd `SendLocalRouterInfo`.
         // Забираем его из очереди сейчас, чтобы дальше получать
         // только I2NP-сообщения.
-        let ri_event = alice_pool.next_event().await.unwrap();
-        match ri_event {
+        match alice_pool.next_event().await.unwrap() {
             PoolEvent::RouterInfo { from, ri_bytes } => {
                 assert_eq!(from, bob_ident);
                 let ri = FullRouterInfo::from_buffer(&ri_bytes).expect("peer RI parse");
@@ -155,6 +190,7 @@ mod tests {
             message @ PoolEvent::Message { .. } => {
                 panic!("expected PoolEvent::RouterInfo first, got {message:?}");
             }
+            other => panic!("unexpected event {other:?}"),
         }
 
         // Alice → Bob через pool.
@@ -172,6 +208,124 @@ mod tests {
         let message = recv_message_from(&alice_pool, bob_ident).await;
         assert_eq!(message.message_type(), I2npMessageType::DeliveryStatus);
         assert_eq!(message.payload(), &[9]);
+    }
+
+    /// `connect_to` игнорирует адрес из RI (он недоступен) и идёт по
+    /// заданному — так же, как `Ssu2Pool::connect_to` в live-тестах.
+    #[tokio::test]
+    async fn pool_connect_to_uses_explicit_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let alice = Side::new(0x55, server_addr);
+        // Опубликован заведомо недоступный порт (1).
+        let bob = Side::with_published(0x66, "127.0.0.1:1".parse().expect("bogus addr"));
+        let bob_ident = bob.ident_hash();
+        let bob_ri_bytes = bob.ri_bytes.clone();
+
+        let bob_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let cfg = bob.config();
+            Ntcp2Session::accept(stream, &cfg).await
+        });
+
+        let alice_pool = Ntcp2Pool::new();
+        let alice_cfg = alice.config();
+        let ident = alice_pool
+            .connect_to(&alice_cfg, &bob_ri_bytes, server_addr)
+            .await
+            .expect("pool.connect_to");
+
+        assert_eq!(ident, bob_ident);
+        assert!(alice_pool.has_session(&bob_ident).await);
+        assert!(bob_task.await.unwrap().is_ok());
+    }
+
+    /// Закрытие: `Termination(NormalClose)` уходит peer'у, событие
+    /// `Disconnected` — ровно одно, сессия исчезает из карты.
+    #[tokio::test]
+    async fn pool_close_sends_termination_and_emits_disconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let alice = Side::new(0x77, server_addr);
+        let bob = Side::new(0x88, server_addr);
+        let bob_ident = bob.ident_hash();
+        let bob_ri_bytes = bob.ri_bytes.clone();
+
+        let bob_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let cfg = bob.config();
+            Ntcp2Session::accept(stream, &cfg).await
+        });
+
+        let alice_pool = Ntcp2Pool::new();
+        let alice_cfg = alice.config();
+        alice_pool.connect(&alice_cfg, &bob_ri_bytes).await.unwrap();
+        let bob_session = bob_task.await.unwrap().expect("bob handshake");
+        let (mut bob_read, _bob_write) = bob_session.split();
+
+        assert!(alice_pool.remove_session(&bob_ident).await);
+        assert!(!alice_pool.has_session(&bob_ident).await);
+        assert!(
+            !alice_pool.remove_session(&bob_ident).await,
+            "повторное закрытие — false"
+        );
+        // Повторное закрытие не должно прислать второе событие.
+
+        recv_disconnected(&alice_pool, bob_ident).await;
+
+        // Bob читает `Termination` из фрейма: сначала свой RI он уже
+        // отправил, теперь ждём блок в data phase.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "no Termination from Alice");
+            let blocks = tokio::time::timeout(remaining, bob_read.read_frame())
+                .await
+                .expect("timeout waiting for frame")
+                .expect("bob read_frame");
+            if let Some(reason) = blocks.iter().find_map(|block| match block {
+                Ntcp2Block::Termination { reason, .. } => Some(*reason),
+                _ => None,
+            }) {
+                assert_eq!(reason, Ntcp2TerminationReason::NormalClose);
+                break;
+            }
+        }
+    }
+
+    /// `Termination` от peer'а — тоже `Disconnected`, без ответа.
+    #[tokio::test]
+    async fn pool_peer_termination_emits_disconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let alice = Side::new(0x99, server_addr);
+        let bob = Side::new(0xAA, server_addr);
+        let bob_ident = bob.ident_hash();
+        let bob_ri_bytes = bob.ri_bytes.clone();
+
+        let bob_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let cfg = bob.config();
+            Ntcp2Session::accept(stream, &cfg).await
+        });
+
+        let alice_pool = Ntcp2Pool::new();
+        let alice_cfg = alice.config();
+        alice_pool.connect(&alice_cfg, &bob_ri_bytes).await.unwrap();
+        let bob_session = bob_task.await.unwrap().expect("bob handshake");
+        let (_read, mut write) = bob_session.split();
+
+        write
+            .send_termination(Ntcp2TerminationReason::NormalClose)
+            .await
+            .unwrap();
+
+        recv_disconnected(&alice_pool, bob_ident).await;
+        // Сессия убрана из карты задачей, а не нами.
+        assert!(!alice_pool.has_session(&bob_ident).await);
     }
 
     #[tokio::test]

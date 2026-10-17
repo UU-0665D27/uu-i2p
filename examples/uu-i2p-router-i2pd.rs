@@ -36,19 +36,35 @@
 //! значит сессию начал он, а не мы; следом на эту сессию приходят его
 //! сообщения (`ShortTunnelBuild`, `PeerTest`), хотя мы ничего не слали.
 //!
+//! ## `--ntcp2`: исходящая сессия по NTCP2
+//!
+//! Тот же роутер, но соединение идёт по TCP: `Ntcp2Transport` собирается
+//! с [`Ntcp2Local`] из `RouterContext` и звонит i2pd на его NTCP2-порт
+//! (`127.0.0.1:12346`). В RI при этом публикуется NTCP2-адрес: i2pd
+//! сверяет `s` из нашего RI в `SessionConfirmed` со статическим ключом
+//! handshake и рвёт сессию, если адреса нет
+//! (`NTCP2.cpp`, `EstablishSessionAfterSessionConfirmed`: «Address not
+//! found in `SessionConfirmed`»). Listener мы не обслуживаем — входящий
+//! NTCP2 появится вместе с accept-loop (шаг 3a-5).
+//!
+//! Признак успеха: `demo: соединение установлено` с
+//! `transport=NTCP2`, в логе i2pd — `SessionConfirmed from 127.0.0.1:<порт>`
+//! и `NTCP2: Session ... created`; дальнейшие I2NP (наш RI, `DatabaseLookup`
+//! и его ответ) идут по этому соединению.
+//!
 //! ## Запуск
 //!
 //! Нужен запущенный тестовый i2pd (`~/.local/opt/i2pd-uu/run-ssu2.sh`:
-//! SSU2 на `127.0.0.1:12345`, `reservedrange = false`, httpproxy на
-//! `127.0.0.1:4445`, `netDb` очищен).
+//! SSU2 на `127.0.0.1:12345`, NTCP2 на `127.0.0.1:12346`,
+//! `reservedrange = false`, httpproxy на `127.0.0.1:4445`, `netDb` очищен).
 //!
 //! ```text
 //! RUST_LOG=uu_i2p=debug cargo run --example uu-i2p-router-i2pd -- \
-//!     ~/.local/opt/i2pd-uu/datadir/router.info 127.0.0.1:12345
+//!     ~/.local/opt/i2pd-uu/datadir/router.info 127.0.0.1:12345 --ntcp2
 //! ```
 //!
-//! (или `UU_I2P_LIVE_RI` / `UU_I2P_LIVE_SSU2` / `UU_I2P_SECS` /
-//! `UU_I2P_LIVE_PROXY`).
+//! (или `UU_I2P_LIVE_RI` / `UU_I2P_LIVE_SSU2` / `UU_I2P_LIVE_NTCP2` /
+//! `UU_I2P_SECS` / `UU_I2P_LIVE_PROXY`).
 //!
 //! ## Что смотреть
 //!
@@ -65,9 +81,8 @@
 //!
 //! ## Ограничения
 //!
-//! - NTCP2-плечо в трейте [`uu_i2p::TransportPool`] пока не умеет
-//!   `connect` (`// TODO(step-3a-4)` в `src/router.rs`), поэтому
-//!   соединение идёт только по SSU2;
+//! - входящий NTCP2 не принимаем (нет accept-loop): NTCP2-адрес в RI
+//!   опубликован, но listener только держит порт;
 //! - туннелей нет (шаг 3b): `TunnelData`/`TunnelGateway` только
 //!   логируются, доставка I2NP — напрямую по сессии;
 //! - loopback в RI и caps `f` — обманка для локального теста: настоящим
@@ -82,15 +97,15 @@ use std::sync::{
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use uu_i2p::{
     DatabaseLookup, I2PTag, I2PX25519Keys, I2npBody, I2npMessage, I2npMessageType, IdentHash,
-    Router, RouterConfig, RouterContext, RouterObserver, Ssu2Local, Ssu2Pool, TransportEvent,
-    TransportPool,
+    Ntcp2Local, Ntcp2Transport, Router, RouterConfig, RouterContext, RouterObserver, Ssu2Local,
+    Ssu2Pool, TransportEvent, TransportPool,
     config::{DEFAULT_NET_ID, Transport},
     private_keys::I2PPrivateKeys,
     router_info::FullRouterInfo,
@@ -225,8 +240,12 @@ impl RouterObserver for DemoObserver {
 struct Args {
     ri_path: String,
     addr: SocketAddr,
+    /// Адрес NTCP2 тестового i2pd (для `--ntcp2`).
+    ntcp2_addr: SocketAddr,
     proxy: SocketAddr,
     secs: u64,
+    /// Идти по NTCP2 (иначе — SSU2).
+    ntcp2: bool,
     /// После размена закрыть свою сессию и ждать, чтобы i2pd позвонил сам
     /// (проверка входящего пути — мы в роли ответчика).
     accept: bool,
@@ -236,12 +255,16 @@ fn parse_args() -> Args {
     let mut positional = Vec::new();
     let mut secs = None;
     let mut proxy = None;
+    let mut ntcp2_addr = None;
     let mut accept = None;
+    let mut ntcp2 = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--secs" => secs = args.next().and_then(|s| s.parse().ok()),
             "--proxy" => proxy = args.next().and_then(|s| s.parse().ok()),
+            "--ntcp2-addr" => ntcp2_addr = args.next().and_then(|s| s.parse().ok()),
+            "--ntcp2" => ntcp2 = Some(true),
             "--accept" => accept = Some(true),
             _ => positional.push(arg),
         }
@@ -253,9 +276,11 @@ fn parse_args() -> Args {
         .or_else(|| std::env::var("UU_I2P_LIVE_RI").ok());
     let Some(ri_path) = ri_path else {
         eprintln!(
-            "usage: uu-i2p-router-i2pd <router.info> [host:port] [--secs N] [--proxy host:port] [--accept]\n\
+            "usage: uu-i2p-router-i2pd <router.info> [host:port] [--secs N] [--proxy host:port] \
+             [--ntcp2] [--ntcp2-addr host:port] [--accept]\n\
              \n\
-             env: UU_I2P_LIVE_RI, UU_I2P_LIVE_SSU2, UU_I2P_LIVE_PROXY, UU_I2P_SECS, UU_I2P_ACCEPT"
+             env: UU_I2P_LIVE_RI, UU_I2P_LIVE_SSU2, UU_I2P_LIVE_NTCP2, UU_I2P_LIVE_PROXY, \
+             UU_I2P_SECS, UU_I2P_NTCP2, UU_I2P_ACCEPT"
         );
         std::process::exit(1);
     };
@@ -266,6 +291,13 @@ fn parse_args() -> Args {
         .unwrap_or_else(|| "127.0.0.1:12345".to_owned())
         .parse()
         .expect("host:port");
+    let ntcp2_addr = ntcp2_addr
+        .or_else(|| {
+            std::env::var("UU_I2P_LIVE_NTCP2")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or_else(|| "127.0.0.1:12346".parse().expect("default NTCP2 addr"));
     let proxy = proxy
         .or_else(|| std::env::var("UU_I2P_LIVE_PROXY").ok())
         .unwrap_or_else(|| DEFAULT_PROXY.to_owned())
@@ -282,8 +314,12 @@ fn parse_args() -> Args {
     Args {
         ri_path,
         addr,
+        ntcp2_addr,
         proxy,
         secs,
+        ntcp2: ntcp2
+            .or_else(|| std::env::var("UU_I2P_NTCP2").ok().map(|v| v != "0"))
+            .unwrap_or(false),
         accept: accept
             .or_else(|| std::env::var("UU_I2P_ACCEPT").ok().map(|v| v != "0"))
             .unwrap_or(false),
@@ -337,21 +373,32 @@ fn spawn_pokes(proxy: SocketAddr, attempts: usize, period: Duration) {
 /// Локальный роутер во всём, что нужно `main` до и после прогона.
 struct LocalRouter {
     router: Router,
-    pool: Arc<dyn TransportPool>,
+    /// Пулы, которые надо подключить (`Ssu2Pool` всегда, NTCP2 — по
+    /// `--ntcp2`).
+    pools: Vec<Arc<dyn TransportPool>>,
     counters: Arc<Counters>,
     /// Приходит `Established` из цикла роутера.
     established: oneshot::Receiver<IdentHash>,
     own: IdentHash,
+    /// Наш SSU2-адрес.
     addr: SocketAddr,
+    /// Наш опубликованный NTCP2-адрес (если `--ntcp2`).
+    ntcp2_addr: Option<SocketAddr>,
+    /// Listener'ы, которые просто держат занятыми опубликованные порты.
+    /// NTCP2 accept-loop пока нет (шаг 3a-5), поэтому входящие NTCP2
+    /// соединения никто не обслуживает.
+    listeners: Vec<TcpListener>,
 }
 
 impl LocalRouter {
-    /// Собирает сокет, конфиг, контекст, пул и роутер.
+    /// Собирает сокеты, конфиг, контекст, пулы и роутер.
     ///
     /// RI публикует loopback, потому что i2pd проверяет `Host mismatch`
     /// в `SessionConfirmed` (`SSU2Session.cpp:1400`); caps `f` — чтобы
     /// i2pd выбрал нас ближайшим флудфиллом и спросил `LeaseSet`.
-    async fn build() -> Self {
+    /// В `--ntcp2` добавляется NTCP2-адрес: i2pd сверяет его `s` со
+    /// статическим ключом handshake (`NTCP2.cpp`).
+    async fn build(ntcp2: bool) -> Self {
         // Свой UDP-сокет: порт нужен до сборки RI (его публикуем).
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
         let addr = socket.local_addr().expect("local_addr");
@@ -364,23 +411,43 @@ impl LocalRouter {
             I2PX25519Keys::from_private(&static_keys.private_key(), Some(static_keys.public_key()));
         let intro: [u8; 32] = rand::random();
 
-        let config = RouterConfig::builder()
+        let ntcp2_listener = if ntcp2 {
+            Some(TcpListener::bind("127.0.0.1:0").await.expect("bind tcp"))
+        } else {
+            None
+        };
+        let ntcp2_listen_addr = ntcp2_listener
+            .as_ref()
+            .map(|listener| listener.local_addr().expect("ntcp2 local_addr"));
+        let mut listeners = Vec::new();
+        if let Some(listener) = ntcp2_listener {
+            listeners.push(listener);
+        }
+
+        let mut builder = RouterConfig::builder()
             .keys(router_keys)
             .ntcp2_keys(ntcp2_static, [0x42; 16])
             .listen_ssu2_published(addr, IpAddr::V4(Ipv4Addr::LOCALHOST))
             .ssu2_intro_key(intro)
             .floodfill(true)
-            .allow_reserved_advertise(true)
-            .build()
-            .expect("RouterConfig");
+            .allow_reserved_advertise(true);
+        if let Some(ntcp2_addr) = ntcp2_listen_addr {
+            builder = builder.listen_published(ntcp2_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        }
+        let config = builder.build().expect("RouterConfig");
 
         let ctx = RouterContext::new(config).expect("RouterContext");
         let own = *ctx.own_ident_hash();
         let own_ri = ctx.own_ri().to_buffer().expect("own RouterInfo");
-        let local =
-            Ssu2Local::new(static_keys, intro, own_ri, DEFAULT_NET_ID, false).expect("Ssu2Local");
-        let pool: Arc<dyn TransportPool> =
-            Arc::new(Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool"));
+        let local = Ssu2Local::new(static_keys, intro, own_ri.clone(), DEFAULT_NET_ID, false)
+            .expect("Ssu2Local");
+        let mut pools: Vec<Arc<dyn TransportPool>> = vec![Arc::new(
+            Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool"),
+        )];
+        if ntcp2_listen_addr.is_some() {
+            let ntcp2_local = Ntcp2Local::from_config(ctx.config(), own_ri).expect("Ntcp2Local");
+            pools.push(Arc::new(Ntcp2Transport::with_local(ntcp2_local)));
+        }
 
         let counters = Arc::new(Counters::default());
         let (established_tx, established) = oneshot::channel();
@@ -391,11 +458,13 @@ impl LocalRouter {
 
         Self {
             router: Router::new(ctx).with_observer(Box::new(observer)),
-            pool,
+            pools,
             counters,
             established,
             own,
             addr,
+            ntcp2_addr: ntcp2_listen_addr,
+            listeners,
         }
     }
 }
@@ -406,38 +475,51 @@ struct RunOptions {
     addr: SocketAddr,
     proxy: SocketAddr,
     secs: u64,
+    /// Каким транспортом звонить i2pd.
+    kind: Transport,
     accept: bool,
 }
 
 impl RunOptions {
     const fn from_args(args: &Args) -> Self {
         Self {
-            addr: args.addr,
+            addr: if args.ntcp2 {
+                args.ntcp2_addr
+            } else {
+                args.addr
+            },
             proxy: args.proxy,
             secs: args.secs,
+            kind: if args.ntcp2 {
+                Transport::Ntcp2
+            } else {
+                Transport::Ssu2
+            },
             accept: args.accept,
         }
     }
 }
 
-/// Тело задачи с роутером: подключить пул, позвонить i2pd, отправить
+/// Тело задачи с роутером: подключить пулы, позвонить i2pd, отправить
 /// пару I2NP и крутить цикл.
 ///
 /// Возвращает роутер обратно — `main` печатает по нему итог, а `run_until`
 /// владеет им монопольно.
 async fn run_router(
     mut router: Router,
-    pool: Arc<dyn TransportPool>,
+    pools: Vec<Arc<dyn TransportPool>>,
     ri_bytes: &[u8],
     own: IdentHash,
     options: RunOptions,
     script: impl Future<Output = ()> + Send,
 ) -> uu_i2p::Result<Router> {
-    router.attach(pool)?;
+    for pool in pools {
+        router.attach(pool)?;
+    }
     let i2pd = router
-        .dial(ri_bytes, Some(options.addr), Some(Transport::Ssu2))
+        .dial(ri_bytes, Some(options.addr), Some(options.kind))
         .await?;
-    info!(peer = %i2pd.to_base64(), "demo: dial");
+    info!(peer = %i2pd.to_base64(), transport = %options.kind, "demo: dial");
 
     // Публикуем себя — путь `Router::send` (сессия уже в карте).
     let store = router.context().build_own_database_store()?;
@@ -505,9 +587,19 @@ async fn run_script(counters: Arc<Counters>, options: RunOptions) {
 }
 
 /// Итог прогона: что осталось в состоянии роутера.
-fn print_summary(router: &Router, i2pd: &IdentHash, counters: &Counters, local_addr: SocketAddr) {
+fn print_summary(
+    router: &Router,
+    i2pd: &IdentHash,
+    counters: &Counters,
+    local_addr: SocketAddr,
+    local_ntcp2: Option<SocketAddr>,
+) {
     println!("=== Итог ===");
     println!("Наш SSU2:           {local_addr}");
+    println!(
+        "Наш NTCP2:          {}",
+        local_ntcp2.map_or_else(|| "не публикуем".to_owned(), |a| a.to_string())
+    );
     println!("Пир в карте сессий: {:?}", router.session_transport(i2pd));
     println!("Записей в netDb:    {}", router.context().netdb().len());
     counters.print();
@@ -530,9 +622,13 @@ async fn main() {
     init_tracing();
     let args = parse_args();
 
-    println!("=== Демонстрация: объединённый Router против i2pd (SSU2) ===");
+    println!(
+        "=== Демонстрация: объединённый Router против i2pd ({}) ===",
+        if args.ntcp2 { "NTCP2" } else { "SSU2" }
+    );
     println!("RouterInfo i2pd: {}", args.ri_path);
     println!("i2pd SSU2:       {}", args.addr);
+    println!("i2pd NTCP2:      {}", args.ntcp2_addr);
     println!("i2pd httpproxy:  {}", args.proxy);
     println!();
 
@@ -540,36 +636,51 @@ async fn main() {
     let remote_ri = FullRouterInfo::from_buffer(&ri_bytes).expect("parse i2pd RouterInfo");
     let i2pd = *remote_ri.ident_hash();
 
-    let local = LocalRouter::build().await;
+    let local = LocalRouter::build(args.ntcp2).await;
     println!("Наш роутер:      {}", local.own.to_base64());
     println!("Наш SSU2:        {}", local.addr);
+    if let Some(ntcp2_addr) = local.ntcp2_addr {
+        println!("Наш NTCP2:       {ntcp2_addr} (listener без accept-loop)");
+    }
     println!();
 
     let LocalRouter {
         router,
-        pool,
+        pools,
         counters,
         established,
         own,
         addr: local_addr,
+        ntcp2_addr: local_ntcp2,
+        listeners,
     } = local;
     let options = RunOptions::from_args(&args);
     let script = run_script(Arc::clone(&counters), options);
     let loop_task =
         tokio::spawn(
-            async move { run_router(router, pool, &ri_bytes, own, options, script).await },
+            async move { run_router(router, pools, &ri_bytes, own, options, script).await },
         );
 
     // Ждём `Established`: его приносит наблюдатель из цикла роутера.
     match tokio::time::timeout(Duration::from_secs(ESTABLISH_TIMEOUT_SECS), established).await {
-        Ok(Ok(ident)) => println!("SSU2: сессия с i2pd установлена ({})", ident.to_base64()),
-        _ => eprintln!("SSU2: сессия не установилась за {ESTABLISH_TIMEOUT_SECS} с — смотрим логи"),
+        Ok(Ok(ident)) => println!(
+            "{}: сессия с i2pd установлена ({})",
+            options.kind,
+            ident.to_base64()
+        ),
+        _ => eprintln!(
+            "{}: сессия не установилась за {ESTABLISH_TIMEOUT_SECS} с — смотрим логи",
+            options.kind
+        ),
     }
     println!();
 
     match loop_task.await {
-        Ok(Ok(router)) => print_summary(&router, &i2pd, &counters, local_addr),
+        Ok(Ok(router)) => print_summary(&router, &i2pd, &counters, local_addr, local_ntcp2),
         Ok(Err(error)) => eprintln!("Цикл роутера завершился с ошибкой: {error}"),
         Err(join) => eprintln!("Задача роутера упала: {join}"),
     }
+
+    // Держим опубликованные порты до конца прогона.
+    drop(listeners);
 }
