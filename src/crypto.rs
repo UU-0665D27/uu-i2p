@@ -24,7 +24,9 @@
 
 use crate::error::{I2PError, Result};
 use aes::Aes256;
-use aes::cipher::{BlockModeDecrypt as _, BlockModeEncrypt as _};
+use aes::cipher::{
+    BlockCipherDecrypt as _, BlockCipherEncrypt as _, BlockModeDecrypt as _, BlockModeEncrypt as _,
+};
 use cbc::cipher::block_padding::NoPadding;
 // `KeyIvInit` нужен для `Encryptor::new` / `Decryptor::new` и
 // для `ChaCha20Raw::new`. В этой версии `cipher`-трейтов он один
@@ -268,6 +270,43 @@ impl Aes256Cbc {
         Ok(())
     }
 }
+// --- AES-256-ECB (один блок) -----------------------------------------------
+
+/// AES-256 в режиме ECB для **одного блока** (16 байт).
+///
+/// Нужен для шифрования IV в слоях туннеля
+/// (`ECBEncryption` / `ECBDecryption` в i2pd). ECB небезопасен для
+/// данных произвольной длины, поэтому API принимает ровно один блок.
+pub struct Aes256Ecb {
+    cipher: Aes256,
+}
+
+impl Aes256Ecb {
+    /// Создаёт шифр с ключом `key`.
+    #[must_use]
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self {
+            cipher: Aes256::new(key.into()),
+        }
+    }
+
+    /// Шифрует один блок.
+    #[must_use]
+    pub fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        let mut b = aes::Block::from(*block);
+        self.cipher.encrypt_block(&mut b);
+        b.into()
+    }
+
+    /// Расшифровывает один блок.
+    #[must_use]
+    pub fn decrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        let mut b = aes::Block::from(*block);
+        self.cipher.decrypt_block(&mut b);
+        b.into()
+    }
+}
+
 // --- HKDF -----------------------------------------------------------------
 
 /// HKDF-SHA256: `extract` + `expand`.

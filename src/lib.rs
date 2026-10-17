@@ -46,13 +46,14 @@ pub mod tunnel_build_crypto;
 pub mod tunnel_build_message;
 pub mod tunnel_build_record;
 pub mod tunnel_config;
+pub mod tunnel_layer;
 pub mod tunnel_messages;
 pub mod variable_tunnel_build;
 
 pub use config::{
     DEFAULT_NET_ID, DEFAULT_VERSION, ListenEndpoint, RouterConfig, RouterConfigBuilder,
 };
-pub use crypto::{AeadChaCha20Poly1305, I2PX25519Keys, NoiseSymmetricState};
+pub use crypto::{AeadChaCha20Poly1305, Aes256Ecb, I2PX25519Keys, NoiseSymmetricState};
 pub use data_message::DataBody;
 pub use database_lookup::{
     DatabaseLookup, ECIES_TAG_LEN, ELGAMAL_TAG_LEN, EncryptedReply, LOOKUP_FLAG_DELIVERY,
@@ -102,6 +103,7 @@ pub use tunnel_build_record::{
     SHORT_TUNNEL_BUILD_RECORD_SIZE, ShortBuildRequestRecord, ShortBuildResponseRecord,
 };
 pub use tunnel_config::{TunnelConfig, TunnelHopConfig};
+pub use tunnel_layer::{TUNNEL_LAYER_SIZE, TunnelDecryption, TunnelEncryption, TunnelLayerChain};
 pub use tunnel_messages::{TunnelDataBody, TunnelGatewayBody, TunnelTestBody};
 pub use variable_tunnel_build::{EncryptedLongRecord, VariableTunnelBuildBody};
 
