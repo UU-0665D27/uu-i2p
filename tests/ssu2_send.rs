@@ -1,11 +1,17 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 use uu_i2p::{
     error::I2PError,
+    i2np::{I2npHeader, I2npMessageType},
+    i2np_message::I2npMessage,
     ssu2_ack::Ssu2AckBlock,
-    ssu2_block::{AddressBlock, Blocks, Ssu2Block, Ssu2BlockType},
+    ssu2_block::{
+        AddressBlock, Blocks, FirstFragmentBlock, FollowOnFragmentBlock, Ssu2Block, Ssu2BlockType,
+    },
+    ssu2_fragments::IncompleteMessages,
     ssu2_header::SSU2_FLAG_IMMEDIATE_ACK_REQUESTED,
-    ssu2_policy::I2pdPolicy,
+    ssu2_policy::{I2pdPolicy, Ssu2Policy},
     ssu2_send,
 };
 
@@ -230,4 +236,197 @@ fn path_challenge_omits_address_without_room() {
         b.iter().all(|(k, _)| *k != Ssu2BlockType::Address),
         "Address не должен появиться"
     );
+}
+
+// ---- SendFragmentedMessage ---------------------------------------------
+
+/// Детерминированный источник «бросков»: значения по порядку, последнее
+/// залипает (чтобы хватило на любое число вызовов).
+struct Rolls {
+    values: Vec<u32>,
+    index: usize,
+}
+
+impl Rolls {
+    fn constant(value: u32) -> Self {
+        Self {
+            values: vec![value],
+            index: 0,
+        }
+    }
+
+    fn sequence(values: Vec<u32>) -> Self {
+        assert!(!values.is_empty(), "sequence must not be empty");
+        Self { values, index: 0 }
+    }
+}
+
+impl ssu2_send::RandomSource for Rolls {
+    fn roll(&mut self) -> u32 {
+        let i = self.index.min(self.values.len() - 1);
+        self.index += 1;
+        self.values[i]
+    }
+}
+
+/// I2NP-сообщение с фиксированным `msg_id`/expiration (детерминизм).
+fn message(payload_len: usize) -> I2npMessage {
+    let header = I2npHeader {
+        message_type: I2npMessageType::Data,
+        msg_id: 0x0102_0304,
+        expiration_ms: 1_700_000_000_000,
+        size: u16::try_from(payload_len).expect("payload fits"),
+        checksum: None,
+    };
+    I2npMessage::with_header(header, vec![0xAB; payload_len])
+}
+
+/// Прогоняет пакеты плана через сборку фрагментов и возвращает собранное
+/// сообщение (или `None`, если его так и не собрали).
+fn reassemble(plan: &ssu2_send::FragmentedPlan, max_fragments: u8) -> Option<I2npMessage> {
+    let now = Duration::from_secs(0);
+    let mut incomplete = IncompleteMessages::new();
+    for packet in &plan.packets {
+        for (kind, body) in blocks(&packet.payload) {
+            match kind {
+                Ssu2BlockType::FirstFragment => {
+                    let block = FirstFragmentBlock::parse(&body).expect("first fragment");
+                    if let Some(msg) = incomplete.handle_first_fragment(&block, now) {
+                        return Some(msg);
+                    }
+                }
+                Ssu2BlockType::FollowOnFragment => {
+                    let block = FollowOnFragmentBlock::parse(&body).expect("follow-on");
+                    if let Some(msg) =
+                        incomplete.handle_follow_on_fragment(&block, now, max_fragments)
+                    {
+                        return Some(msg);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn fragmented_message_fits_single_block() {
+    let p = I2pdPolicy;
+    // ntcp2_len = 29, ntcp2_len + 3 = 32 <= 100
+    let msg = message(20);
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::fragmented_message(&msg, 100, &empty_ack(), &mut rng, &p).expect("ok");
+    assert_eq!(plan.packets.len(), 1);
+    assert!(!plan.ack_block_sent);
+    assert!(!plan.aborted);
+    assert_eq!(plan.packets[0].flags, 0);
+    let b = blocks(&plan.packets[0].payload);
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].0, Ssu2BlockType::I2npMessage);
+    assert_eq!(I2npMessage::from_ntcp2_bytes(&b[0].1).expect("i2np"), msg);
+}
+
+#[test]
+fn fragmented_message_splits_and_reassembles() {
+    let p = I2pdPolicy;
+    // ntcp2_len = 189: первый фрагмент несёт 97 байт, продолжение — 92.
+    let msg = message(180);
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::fragmented_message(&msg, 100, &empty_ack(), &mut rng, &p).expect("ok");
+    assert!(plan.ack_block_sent);
+    assert!(!plan.aborted);
+    // отдельный ACK-пакет, первый фрагмент и одно продолжение
+    assert_eq!(plan.packets.len(), 3);
+    assert_eq!(
+        blocks(&plan.packets[0].payload),
+        vec![(Ssu2BlockType::Ack, empty_ack().to_body())]
+    );
+    assert_eq!(
+        blocks(&plan.packets[1].payload)[0].0,
+        Ssu2BlockType::FirstFragment
+    );
+    assert_eq!(
+        blocks(&plan.packets[2].payload)[0].0,
+        Ssu2BlockType::FollowOnFragment
+    );
+    assert_eq!(plan.packets[2].flags, 0, "двух фрагментов мало для флага");
+    assert_eq!(reassemble(&plan, p.max_num_fragments()), Some(msg));
+}
+
+#[test]
+fn fragmented_message_pads_and_flags_last_fragment() {
+    let p = I2pdPolicy;
+    // ntcp2_len = 309 -> три продолжения (номера 1, 2, 3).
+    let msg = message(300);
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::fragmented_message(&msg, 100, &empty_ack(), &mut rng, &p).expect("ok");
+    assert_eq!(plan.packets.len(), 5, "ACK + первый + три продолжения");
+    let last = plan.packets.last().expect("last packet");
+    assert_eq!(last.flags, SSU2_FLAG_IMMEDIATE_ACK_REQUESTED);
+    let b = blocks(&last.payload);
+    assert_eq!(
+        b.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        vec![Ssu2BlockType::FollowOnFragment, Ssu2BlockType::Padding]
+    );
+    assert_eq!(reassemble(&plan, p.max_num_fragments()), Some(msg));
+}
+
+#[test]
+fn fragmented_message_keeps_ack_in_first_fragment() {
+    let p = I2pdPolicy;
+    // max_payload = 20: ack (8) + 12 не меньше 20, поэтому ACK не отделяется.
+    let msg = message(21); // ntcp2_len = 30
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::fragmented_message(&msg, 20, &empty_ack(), &mut rng, &p).expect("ok");
+    assert!(plan.ack_block_sent);
+    assert!(!plan.aborted);
+    let kinds: Vec<_> = blocks(&plan.packets[0].payload)
+        .iter()
+        .map(|(k, _)| *k)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![Ssu2BlockType::Ack, Ssu2BlockType::FirstFragment],
+        "ACK должен уйти в начале первого фрагмента"
+    );
+}
+
+#[test]
+fn fragmented_message_rejects_tiny_max_payload() {
+    let p = I2pdPolicy;
+    let msg = message(180);
+    let mut rng = Rolls::constant(0);
+    let err = ssu2_send::fragmented_message(&msg, 8, &empty_ack(), &mut rng, &p)
+        .expect_err("max_payload слишком мал");
+    assert!(
+        matches!(err, I2PError::InvalidLength { .. }),
+        "unexpected {err:?}"
+    );
+}
+
+#[test]
+fn fragmented_message_aborts_when_first_fragment_has_no_room() {
+    let p = I2pdPolicy;
+    // extra_size = 100: offset = 95 оставляет первому фрагменту всего 5 байт.
+    let msg = message(180);
+    let mut rng = Rolls::constant(95);
+    let plan = ssu2_send::fragmented_message(&msg, 100, &empty_ack(), &mut rng, &p).expect("ok");
+    assert!(plan.aborted);
+    assert!(!plan.ack_block_sent, "i2pd вернул бы false");
+    assert_eq!(plan.packets.len(), 1, "успел уйти только ACK-пакет");
+    assert_eq!(plan.packets[0].payload.len(), 8);
+}
+
+#[test]
+fn fragmented_message_shifts_first_fragment_by_offset() {
+    let p = I2pdPolicy;
+    let msg = message(180);
+    // первый offset = 50, дальше нули
+    let mut rng = Rolls::sequence(vec![50, 0]);
+    let plan = ssu2_send::fragmented_message(&msg, 100, &empty_ack(), &mut rng, &p).expect("ok");
+    assert!(!plan.aborted);
+    // первый (после ACK) пакет короче на величину смещения
+    assert_eq!(plan.packets[1].payload.len(), 50);
+    assert_eq!(reassemble(&plan, p.max_num_fragments()), Some(msg));
 }

@@ -245,6 +245,25 @@ impl Ssu2AckBlock {
             ranges,
         })
     }
+
+    /// Тело ACK-блока с не более чем `max_ranges` диапазонами.
+    ///
+    /// Нужно для байтового бюджета: `CreateAckBlock(buf, len)` в i2pd обрезает
+    /// число диапазонов по доступному месту (`maxNumRanges = (len - 8) / 2`).
+    /// Формат тот же, что у [`Ssu2Block::write_body`], но хвостовые (самые
+    /// старые) диапазоны отбрасываются.
+    #[must_use]
+    pub fn to_body_with_max_ranges(&self, max_ranges: usize) -> Vec<u8> {
+        let keep = self.ranges.len().min(max_ranges);
+        let mut out = Vec::with_capacity(SSU2_ACK_MIN_BODY_SIZE + keep * 2);
+        out.extend_from_slice(&self.ack_through.to_be_bytes());
+        out.push(self.acnt);
+        for r in &self.ranges[..keep] {
+            out.push(r.nack);
+            out.push(r.ack);
+        }
+        out
+    }
 }
 
 impl<'a> Ssu2Block<'a> for Ssu2AckBlock {

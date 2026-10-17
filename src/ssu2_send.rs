@@ -1,8 +1,10 @@
-//! SSU2 — сборка payload'ов data phase (управляющие блоки).
+//! SSU2 — сборка payload'ов data phase (управляющие блоки и нарезка I2NP).
 //!
 //! Зеркалит `SendQuickAck`, `SendKeepAlive`, `SendTermination`,
 //! `SendPathChallenge` и `SendPathResponse` из i2pd (`SSU2Session.cpp:3350`,
-//! `:269`, `:3367`, `:3405`, `:3375`).
+//! `:269`, `:3367`, `:3405`, `:3375`), а также `SendFragmentedMessage`
+//! (`:550`) с её помощниками `CreateFirstFragmentBlock` и
+//! `CreateFollowOnFragmentBlock`.
 //!
 //! Функции собирают только `payload` (последовательность блоков) и `flags[0]`
 //! короткого заголовка; шифрование, номер пакета и сокет — на стороне
@@ -13,18 +15,31 @@
 //!
 //! ## Отличия от i2pd
 //!
-//! - ACK-блок строится не «по месту» (`CreateAckBlock(buf, len)`), а принимается
-//!   готовым [`Ssu2AckBlock`]. Если он не помещается целиком, блок не пишется;
-//!   i2pd в этом случае обрезает диапазоны по бюджету места. В управляющих
-//!   payload'ах места заведомо хватает, поэтому расхождение недостижимо.
+//! - ACK-блок принимается готовым [`Ssu2AckBlock`], а не строится «по месту»
+//!   (`CreateAckBlock(buf, len)`). Байтовый бюджет воспроизводится обрезкой
+//!   хвостовых диапазонов ([`Ssu2AckBlock::to_body_with_max_ranges`]); `ack
+//!   through`/`acnt` не пересчитываются — i2pd в этом случае переразбил бы
+//!   `acnt` на диапазоны.
 //! - При переполнении `max_payload` padding не дописывается (i2pd «переполнил
 //!   бы» `size_t` в `CreatePaddingBlock`); конформный вызывающий не допускает
 //!   такой ситуации.
+//! - [`fragmented_message`] возвращает список запланированных пакетов, включая
+//!   отправленный ACK-пакет. Если нарезка рвётся на первом фрагменте
+//!   (`CreateFirstFragmentBlock` вернул 0), план помечается
+//!   [`FragmentedPlan::aborted`], а набранные до обрыва пакеты сохраняются
+//!   (в i2pd они к этому моменту уже ушли бы в сокет).
+//! - Случай `len < 8` в `CreateFollowOnFragmentBlock` (i2pd вызывает `SendData`
+//!   с нулевой длиной — пакет теряется, а в `m_SentPackets` попадает запись с
+//!   номером `0`) здесь просто не порождает пакета, и цикл продолжается с
+//!   уменьшенным `extra_size`. `max_payload <= 8` отсекается ошибкой
+//!   ([`I2PError::InvalidLength`]) — в i2pd это деление по модулю на ноль.
 
 use crate::error::{I2PError, Result};
-use crate::ssu2_ack::Ssu2AckBlock;
+use crate::i2np_message::I2npMessage;
+use crate::ssu2_ack::{SSU2_ACK_MIN_BODY_SIZE, Ssu2AckBlock};
 use crate::ssu2_block::{
-    AddressBlock, SSU2_BLOCK_HEADER_SIZE, Ssu2Block, Ssu2BlockType, write_block,
+    AddressBlock, SSU2_BLOCK_HEADER_SIZE, Ssu2Block, Ssu2BlockType, follow_on_frag_byte,
+    write_block,
 };
 use crate::ssu2_header::SSU2_FLAG_IMMEDIATE_ACK_REQUESTED;
 use crate::ssu2_policy::Ssu2Policy;
@@ -45,13 +60,25 @@ pub struct DataPayload {
     pub flags: u8,
 }
 
-/// `CreateAckBlock`: дописывает ACK-блок, если он помещается целиком.
+/// `CreateAckBlock`: дописывает ACK-блок в пределах `max_size` байт.
 fn append_ack(out: &mut Vec<u8>, ack: &Ssu2AckBlock, max_size: usize) -> Result<()> {
-    let body = ack.to_body();
-    if max_size.saturating_sub(out.len()) < SSU2_BLOCK_HEADER_SIZE + body.len() {
-        return Ok(());
-    }
-    write_block(out, Ssu2BlockType::Ack, &body)
+    let budget = max_size.saturating_sub(out.len());
+    append_ack_limited(out, ack, budget).map(|_| ())
+}
+
+/// `CreateAckBlock(buf, len)`: пишет ACK-блок в пределах `budget` байт.
+///
+/// Число диапазонов обрезается по `(budget - 8) / 2` (`8` — пустой блок),
+/// как `maxNumRanges` в i2pd. Возвращает `false`, если не хватает даже пустого
+/// блока (`budget < 8`).
+fn append_ack_limited(out: &mut Vec<u8>, ack: &Ssu2AckBlock, budget: usize) -> Result<bool> {
+    const ACK_EMPTY_SIZE: usize = SSU2_BLOCK_HEADER_SIZE + SSU2_ACK_MIN_BODY_SIZE;
+    let Some(rest) = budget.checked_sub(ACK_EMPTY_SIZE) else {
+        return Ok(false);
+    };
+    let body = ack.to_body_with_max_ranges(rest / 2);
+    write_block(out, Ssu2BlockType::Ack, &body)?;
+    Ok(true)
 }
 
 /// `CreateAddressBlock`: дописывает `Address`, если он помещается.
@@ -235,4 +262,218 @@ pub fn path_response<P: Ssu2Policy>(
     append_ack(&mut payload, ack, max_payload)?;
     append_padding(policy, &mut payload, roll, max_payload, 0)?;
     Ok(DataPayload { payload, flags: 0 })
+}
+
+/// Источник «бросков» — аналог `m_Server.GetRng()` в i2pd.
+///
+/// Из одного значения берётся `offset` (по модулю) и `roll` для padding'а
+/// (младшие [`Ssu2Policy::padding_roll_mask`] бита). Реализация по умолчанию —
+/// любой [`rand::Rng`].
+pub trait RandomSource {
+    /// Следующее 32-битное значение (`rng()()` в i2pd).
+    fn roll(&mut self) -> u32;
+}
+
+impl<R: rand::Rng + ?Sized> RandomSource for R {
+    fn roll(&mut self) -> u32 {
+        self.next_u32()
+    }
+}
+
+/// План нарезки одного I2NP-сообщения (`SendFragmentedMessage`, `SSU2Session.cpp:550`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentedPlan {
+    /// Пакеты в порядке отправки.
+    pub packets: Vec<DataPayload>,
+    /// Отправлен ли ACK-блок (i2pd `ackBlockSent`).
+    pub ack_block_sent: bool,
+    /// Нарезка оборвалась на первом фрагменте (i2pd `return false`).
+    ///
+    /// Пакеты в [`Self::packets`] к этому моменту уже отправлены, а сообщение —
+    /// нет. i2pd в этом случае вернул бы `false` независимо от
+    /// [`Self::ack_block_sent`].
+    pub aborted: bool,
+}
+
+/// `CreateFirstFragmentBlock(buf, len, msg)`.
+///
+/// Пишет в `out` блок `FirstFragment` с `len - 3` байтами NTCP2-буфера от
+/// `cursor` и сдвигает `cursor`. `false` — не помещается (`len < 12`) или
+/// остаток уже влезает целиком (`remaining + 3 <= len`); в обоих случаях
+/// `cursor` не трогается (i2pd `return 0`).
+fn first_fragment_block(
+    out: &mut Vec<u8>,
+    ntcp2: &[u8],
+    cursor: &mut usize,
+    len: usize,
+) -> Result<bool> {
+    if len < 12 {
+        return Ok(false);
+    }
+    let remaining = ntcp2.len() - *cursor;
+    if remaining + 3 <= len {
+        return Ok(false);
+    }
+    let msg_len = len - 3;
+    write_block(
+        out,
+        Ssu2BlockType::FirstFragment,
+        &ntcp2[*cursor..*cursor + msg_len],
+    )?;
+    *cursor += msg_len;
+    Ok(true)
+}
+
+/// `CreateFollowOnFragmentBlock(buf, len, msg, fragmentNum, msgID)`.
+///
+/// Увеличивает `fragment_num` и сдвигает `cursor`; `Some(is_last)` — блок
+/// записан (`is_last` — сообщение исчерпано), `None` — не помещается
+/// (`len < 8`), ничего не меняется (i2pd `return 0`).
+fn follow_on_fragment_block(
+    out: &mut Vec<u8>,
+    ntcp2: &[u8],
+    cursor: &mut usize,
+    fragment_num: &mut u8,
+    msg_id: u32,
+    len: usize,
+) -> Result<Option<bool>> {
+    if len < 8 {
+        return Ok(None);
+    }
+    let remaining = ntcp2.len() - *cursor;
+    let (msg_len, is_last) = if remaining + 8 > len {
+        (len - 8, false)
+    } else {
+        (remaining, true)
+    };
+    *fragment_num = fragment_num.wrapping_add(1);
+    let mut body = Vec::with_capacity(5 + msg_len);
+    body.push(follow_on_frag_byte(*fragment_num, is_last));
+    body.extend_from_slice(&msg_id.to_be_bytes());
+    body.extend_from_slice(&ntcp2[*cursor..*cursor + msg_len]);
+    write_block(out, Ssu2BlockType::FollowOnFragment, &body)?;
+    *cursor += msg_len;
+    Ok(Some(is_last))
+}
+
+/// `SendFragmentedMessage(packet)`: нарезает I2NP-сообщение на data-пакеты.
+///
+/// Если сообщение влезает целиком (`ntcp2_len + 3 <= max_payload`), план — один
+/// пакет с блоком `I2NP`. Иначе сначала (при `extra_size >= 8`) пишется ACK-блок:
+/// либо отдельным пакетом, либо в начало первого фрагмента. Смещения фрагментов
+/// разыгрываются по `rng`, как `rng() % extraSize` в i2pd; последний фрагмент
+/// может дополняться padding'ом с флагом `IMMEDIATE_ACK_REQUESTED`.
+///
+/// # Errors
+///
+/// [`I2PError::InvalidLength`], если `max_payload <= 8` (в i2pd — деление по
+/// модулю на ноль); [`I2PError::Malformed`] — недостижимо (тело блока > 64 `КиБ`).
+pub fn fragmented_message<P: Ssu2Policy>(
+    msg: &I2npMessage,
+    max_payload: usize,
+    ack: &Ssu2AckBlock,
+    rng: &mut impl RandomSource,
+    policy: &P,
+) -> Result<FragmentedPlan> {
+    let ntcp2 = msg.to_ntcp2_bytes();
+    let ntcp2_len = ntcp2.len();
+
+    // Влезает одним блоком — нарезка не нужна.
+    if ntcp2_len + 3 <= max_payload {
+        let mut payload = Vec::new();
+        write_block(&mut payload, Ssu2BlockType::I2npMessage, &ntcp2)?;
+        return Ok(FragmentedPlan {
+            packets: vec![DataPayload { payload, flags: 0 }],
+            ack_block_sent: false,
+            aborted: false,
+        });
+    }
+    // i2pd: `(msgLen + 3 - len) % (len - 8)` — при `len <= 8` это деление на ноль.
+    if max_payload <= 8 {
+        return Err(I2PError::InvalidLength {
+            expected: 9,
+            got: max_payload,
+        });
+    }
+
+    let last_fragment_size = (ntcp2_len + 3 - max_payload) % (max_payload - 8);
+    let mut extra_size = max_payload - last_fragment_size;
+    let mut packets: Vec<DataPayload> = Vec::new();
+
+    let mut payload: Vec<u8> = Vec::new();
+    let ack_block_sent = if extra_size >= 8 {
+        append_ack_limited(&mut payload, ack, extra_size)?;
+        if payload.len() + 12 < max_payload {
+            // ACK уходит отдельным пакетом, первый фрагмент начинается с нуля.
+            packets.push(DataPayload {
+                payload: std::mem::take(&mut payload),
+                flags: 0,
+            });
+        } else {
+            extra_size -= payload.len();
+        }
+        true
+    } else {
+        false
+    };
+
+    let mut offset = if extra_size > 0 {
+        (rng.roll() as usize) % extra_size
+    } else {
+        0
+    };
+    if offset + payload.len() >= max_payload {
+        offset = 0;
+    }
+    let mut cursor = 0usize;
+    let first_len = max_payload - offset - payload.len();
+    if !first_fragment_block(&mut payload, &ntcp2, &mut cursor, first_len)? {
+        return Ok(FragmentedPlan {
+            packets,
+            ack_block_sent: false,
+            aborted: true,
+        });
+    }
+    extra_size -= offset;
+    packets.push(DataPayload { payload, flags: 0 });
+
+    let msg_id = msg.msg_id();
+    let mut fragment_num: u8 = 0;
+    while cursor < ntcp2_len {
+        let offset = if extra_size > 0 {
+            (rng.roll() as usize) % extra_size
+        } else {
+            0
+        };
+        let len = max_payload.saturating_sub(offset);
+        let mut payload = Vec::new();
+        let written = follow_on_fragment_block(
+            &mut payload,
+            &ntcp2,
+            &mut cursor,
+            &mut fragment_num,
+            msg_id,
+            len,
+        )?;
+        extra_size -= offset;
+        if let Some(is_last) = written {
+            let mut flags = 0;
+            if is_last && payload.len() + 16 < max_payload {
+                let pad_roll = u8::try_from(rng.roll() & u32::from(policy.padding_roll_mask()))
+                    .unwrap_or_default();
+                let remaining = max_payload - payload.len();
+                append_padding(policy, &mut payload, pad_roll, remaining, 0)?;
+                if fragment_num > 2 {
+                    flags |= SSU2_FLAG_IMMEDIATE_ACK_REQUESTED;
+                }
+            }
+            packets.push(DataPayload { payload, flags });
+        }
+    }
+
+    Ok(FragmentedPlan {
+        packets,
+        ack_block_sent,
+        aborted: false,
+    })
 }
