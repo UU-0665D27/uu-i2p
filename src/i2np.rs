@@ -52,6 +52,11 @@ pub const I2NP_HEADER_SIZE: usize = I2NP_HEADER_CHKS_OFFSET + 1;
 /// Время жизни сообщения по умолчанию (8 секунд).
 pub const I2NP_MESSAGE_EXPIRATION_TIMEOUT_MS: u64 = 8_000;
 
+/// `I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_TRANSIT`: сколько микросекунд
+/// сообщение может пролежать в локальной очереди отправки (`m_SendQueue`),
+/// прежде чем его снимут и «уронят».
+pub const I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_TRANSIT_MICROS: u64 = 4_000_000;
+
 /// Допустимое отклонение часов (1 минута).
 pub const I2NP_MESSAGE_CLOCK_SKEW_MS: u64 = 60_000;
 

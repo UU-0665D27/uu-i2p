@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -5,14 +6,14 @@ use uu_i2p::{
     error::I2PError,
     i2np::{I2npHeader, I2npMessageType},
     i2np_message::I2npMessage,
-    ssu2_ack::Ssu2AckBlock,
+    ssu2_ack::{AckRange, Ssu2AckBlock},
     ssu2_block::{
         AddressBlock, Blocks, FirstFragmentBlock, FollowOnFragmentBlock, Ssu2Block, Ssu2BlockType,
     },
     ssu2_fragments::IncompleteMessages,
     ssu2_header::SSU2_FLAG_IMMEDIATE_ACK_REQUESTED,
     ssu2_policy::{I2pdPolicy, Ssu2Policy},
-    ssu2_send,
+    ssu2_send::{self, QueuedMessage, SendQueueConfig},
 };
 
 /// Разбирает payload на пары `(тип, тело)`.
@@ -283,10 +284,13 @@ fn message(payload_len: usize) -> I2npMessage {
 
 /// Прогоняет пакеты плана через сборку фрагментов и возвращает собранное
 /// сообщение (или `None`, если его так и не собрали).
-fn reassemble(plan: &ssu2_send::FragmentedPlan, max_fragments: u8) -> Option<I2npMessage> {
+fn reassemble(
+    packets: &[uu_i2p::ssu2_send::DataPayload],
+    max_fragments: u8,
+) -> Option<I2npMessage> {
     let now = Duration::from_secs(0);
     let mut incomplete = IncompleteMessages::new();
-    for packet in &plan.packets {
+    for packet in packets {
         for (kind, body) in blocks(&packet.payload) {
             match kind {
                 Ssu2BlockType::FirstFragment => {
@@ -351,7 +355,7 @@ fn fragmented_message_splits_and_reassembles() {
         Ssu2BlockType::FollowOnFragment
     );
     assert_eq!(plan.packets[2].flags, 0, "двух фрагментов мало для флага");
-    assert_eq!(reassemble(&plan, p.max_num_fragments()), Some(msg));
+    assert_eq!(reassemble(&plan.packets, p.max_num_fragments()), Some(msg));
 }
 
 #[test]
@@ -369,7 +373,7 @@ fn fragmented_message_pads_and_flags_last_fragment() {
         b.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
         vec![Ssu2BlockType::FollowOnFragment, Ssu2BlockType::Padding]
     );
-    assert_eq!(reassemble(&plan, p.max_num_fragments()), Some(msg));
+    assert_eq!(reassemble(&plan.packets, p.max_num_fragments()), Some(msg));
 }
 
 #[test]
@@ -428,5 +432,225 @@ fn fragmented_message_shifts_first_fragment_by_offset() {
     assert!(!plan.aborted);
     // первый (после ACK) пакет короче на величину смещения
     assert_eq!(plan.packets[1].payload.len(), 50);
-    assert_eq!(reassemble(&plan, p.max_num_fragments()), Some(msg));
+    assert_eq!(reassemble(&plan.packets, p.max_num_fragments()), Some(msg));
+}
+
+// ---- SendQueue ----------------------------------------------------------
+
+/// `expiration_ms` тестовых сообщений; `now_ms` ровно на нём — не истекло.
+const NOW_MS: u64 = 1_700_000_000_000;
+
+fn queued(payload_len: usize, enqueue_time: u64) -> QueuedMessage {
+    QueuedMessage {
+        message: message(payload_len),
+        enqueue_time,
+    }
+}
+
+fn queue(items: Vec<QueuedMessage>) -> VecDeque<QueuedMessage> {
+    items.into()
+}
+
+fn cfg(ack: &Ssu2AckBlock, max_payload: usize) -> SendQueueConfig<'_> {
+    SendQueueConfig {
+        ack,
+        max_payload,
+        window_size: 16,
+        sent_packets: 0,
+        established: true,
+        now_ms: NOW_MS,
+        now_micros: 0,
+    }
+}
+
+/// ACK из двух диапазонов: тело 9, блок 12 байт.
+fn ack_two_ranges() -> Ssu2AckBlock {
+    Ssu2AckBlock {
+        ack_through: 100,
+        acnt: 1,
+        ranges: vec![AckRange { nack: 2, ack: 3 }, AckRange { nack: 4, ack: 5 }],
+    }
+}
+
+fn kinds_of(packet: &uu_i2p::ssu2_send::DataPayload) -> Vec<Ssu2BlockType> {
+    blocks(&packet.payload).iter().map(|(k, _)| *k).collect()
+}
+
+#[test]
+fn send_queue_skips_when_not_established() {
+    let p = I2pdPolicy;
+    let mut q = queue(vec![queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    let ack = empty_ack();
+    let mut c = cfg(&ack, 100);
+    c.established = false;
+    let plan = ssu2_send::send_queue(&mut q, &c, &mut rng, &p).expect("ok");
+    assert_eq!(plan.packets, Vec::new());
+    assert_eq!(q.len(), 1);
+}
+
+#[test]
+fn send_queue_skips_when_window_full() {
+    let p = I2pdPolicy;
+    let mut q = queue(vec![queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    let ack = empty_ack();
+    let mut c = cfg(&ack, 100);
+    c.sent_packets = c.window_size + 1;
+    let plan = ssu2_send::send_queue(&mut q, &c, &mut rng, &p).expect("ok");
+    assert_eq!(plan.packets, Vec::new());
+    assert_eq!(q.len(), 1);
+}
+
+#[test]
+fn send_queue_packs_single_message() {
+    let p = I2pdPolicy;
+    let ack = empty_ack();
+    let mut q = queue(vec![queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    // max_payload = 40: ACK (8) + I2NP (22) = 30, padding не влезает.
+    let plan = ssu2_send::send_queue(&mut q, &cfg(&ack, 40), &mut rng, &p).expect("ok");
+    assert!(plan.ack_block_sent);
+    assert_eq!(plan.dropped, Vec::new());
+    assert!(q.is_empty());
+    assert_eq!(plan.packets.len(), 1);
+    assert_eq!(plan.packets[0].flags, SSU2_FLAG_IMMEDIATE_ACK_REQUESTED);
+    assert_eq!(
+        kinds_of(&plan.packets[0]),
+        vec![Ssu2BlockType::Ack, Ssu2BlockType::I2npMessage]
+    );
+}
+
+#[test]
+fn send_queue_packs_two_messages_into_one_packet() {
+    let p = I2pdPolicy;
+    let ack = empty_ack();
+    let mut q = queue(vec![queued(10, 0), queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    // ACK + 2 x I2NP = 52 <= 60, padding (68) не влезает.
+    let plan = ssu2_send::send_queue(&mut q, &cfg(&ack, 60), &mut rng, &p).expect("ok");
+    assert!(plan.ack_block_sent);
+    assert!(q.is_empty());
+    assert_eq!(plan.packets.len(), 1);
+    assert_eq!(
+        kinds_of(&plan.packets[0]),
+        vec![
+            Ssu2BlockType::Ack,
+            Ssu2BlockType::I2npMessage,
+            Ssu2BlockType::I2npMessage
+        ]
+    );
+}
+
+#[test]
+fn send_queue_flushes_when_message_does_not_fit() {
+    let p = I2pdPolicy;
+    let ack = empty_ack();
+    let mut q = queue(vec![queued(10, 0), queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::send_queue(&mut q, &cfg(&ack, 40), &mut rng, &p).expect("ok");
+    assert!(plan.ack_block_sent);
+    assert!(q.is_empty());
+    assert_eq!(plan.packets.len(), 2);
+    assert_eq!(
+        kinds_of(&plan.packets[0]),
+        vec![Ssu2BlockType::Ack, Ssu2BlockType::I2npMessage]
+    );
+    assert_eq!(plan.packets[0].flags, 0, "промежуточный пакет без флага");
+    assert_eq!(
+        kinds_of(&plan.packets[1]),
+        vec![Ssu2BlockType::Ack, Ssu2BlockType::I2npMessage]
+    );
+    assert_eq!(plan.packets[1].flags, SSU2_FLAG_IMMEDIATE_ACK_REQUESTED);
+}
+
+#[test]
+fn send_queue_reduces_ack_block_to_fit() {
+    let p = I2pdPolicy;
+    let ack = ack_two_ranges();
+    // max_payload = 40, len = 29: ACK (12) + 29 не влезает, но len + 8 < 40,
+    // значит ACK обрезается под сообщение (40 - 29 = 11 -> 10).
+    let mut q = queue(vec![queued(17, 0)]);
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::send_queue(&mut q, &cfg(&ack, 40), &mut rng, &p).expect("ok");
+    assert!(plan.ack_block_sent);
+    assert!(q.is_empty());
+    assert_eq!(plan.packets.len(), 1);
+    assert_eq!(plan.packets[0].flags, 0);
+    let b = blocks(&plan.packets[0].payload);
+    assert_eq!(
+        b.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        vec![Ssu2BlockType::Ack, Ssu2BlockType::I2npMessage]
+    );
+    assert_eq!(b[0].1.len(), 7, "остался один диапазон из двух");
+}
+
+#[test]
+fn send_queue_drops_ack_block_when_message_fills_packet() {
+    let p = I2pdPolicy;
+    let ack = ack_two_ranges();
+    // len = 32: len + 8 не меньше 40, поэтому ACK выбрасывается целиком.
+    let mut q = queue(vec![queued(20, 0)]);
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::send_queue(&mut q, &cfg(&ack, 40), &mut rng, &p).expect("ok");
+    assert!(!plan.ack_block_sent);
+    assert_eq!(plan.packets.len(), 1);
+    assert_eq!(kinds_of(&plan.packets[0]), vec![Ssu2BlockType::I2npMessage]);
+}
+
+#[test]
+fn send_queue_delegates_long_message_to_fragmentation() {
+    let p = I2pdPolicy;
+    let ack = empty_ack();
+    let msg = message(180);
+    let mut q = queue(vec![QueuedMessage {
+        message: msg.clone(),
+        enqueue_time: 0,
+    }]);
+    let mut rng = Rolls::constant(0);
+    let plan = ssu2_send::send_queue(&mut q, &cfg(&ack, 100), &mut rng, &p).expect("ok");
+    assert!(plan.ack_block_sent);
+    assert!(q.is_empty());
+    assert_eq!(plan.packets.len(), 3, "ACK + первый + продолжение");
+    assert_eq!(reassemble(&plan.packets, p.max_num_fragments()), Some(msg));
+}
+
+#[test]
+fn send_queue_drops_expired_message() {
+    let p = I2pdPolicy;
+    let ack = empty_ack();
+    let mut q = queue(vec![queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    let mut c = cfg(&ack, 40);
+    c.now_ms = NOW_MS + 100_000; // за пределами clock skew
+    let plan = ssu2_send::send_queue(&mut q, &c, &mut rng, &p).expect("ok");
+    assert_eq!(plan.dropped.len(), 1);
+    assert_eq!(plan.packets, Vec::new());
+    assert!(q.is_empty());
+}
+
+#[test]
+fn send_queue_drops_message_stuck_in_queue_too_long() {
+    let p = I2pdPolicy;
+    let ack = empty_ack();
+    let mut q = queue(vec![queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    let mut c = cfg(&ack, 40);
+    c.now_micros = 5_000_000; // > I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_TRANSIT
+    let plan = ssu2_send::send_queue(&mut q, &c, &mut rng, &p).expect("ok");
+    assert_eq!(plan.dropped.len(), 1);
+    assert_eq!(plan.packets, Vec::new());
+}
+
+#[test]
+fn send_queue_stops_at_window_size() {
+    let p = I2pdPolicy;
+    let ack = empty_ack();
+    let mut q = queue(vec![queued(10, 0), queued(10, 0)]);
+    let mut rng = Rolls::constant(0);
+    let mut c = cfg(&ack, 40);
+    c.window_size = 0;
+    let plan = ssu2_send::send_queue(&mut q, &c, &mut rng, &p).expect("ok");
+    assert_eq!(plan.packets.len(), 1, "второй пакет не отправляется");
+    assert_eq!(q.len(), 1, "второе сообщение осталось в очереди");
 }

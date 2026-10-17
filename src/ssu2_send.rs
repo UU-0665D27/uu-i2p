@@ -1,10 +1,10 @@
-//! SSU2 — сборка payload'ов data phase (управляющие блоки и нарезка I2NP).
+//! SSU2 — сборка payload'ов data phase (управляющие блоки, нарезка и очередь).
 //!
 //! Зеркалит `SendQuickAck`, `SendKeepAlive`, `SendTermination`,
 //! `SendPathChallenge` и `SendPathResponse` из i2pd (`SSU2Session.cpp:3350`,
-//! `:269`, `:3367`, `:3405`, `:3375`), а также `SendFragmentedMessage`
-//! (`:550`) с её помощниками `CreateFirstFragmentBlock` и
-//! `CreateFollowOnFragmentBlock`.
+//! `:269`, `:3367`, `:3405`, `:3375`), `SendFragmentedMessage` (`:550`) с её
+//! помощниками `CreateFirstFragmentBlock`/`CreateFollowOnFragmentBlock`, а
+//! также упаковку очереди `SendQueue` (`:465`).
 //!
 //! Функции собирают только `payload` (последовательность блоков) и `flags[0]`
 //! короткого заголовка; шифрование, номер пакета и сокет — на стороне
@@ -33,8 +33,17 @@
 //!   номером `0`) здесь просто не порождает пакета, и цикл продолжается с
 //!   уменьшенным `extra_size`. `max_payload <= 8` отсекается ошибкой
 //!   ([`I2PError::InvalidLength`]) — в i2pd это деление по модулю на ноль.
+//! - [`send_queue`] не пишет в сокет: она возвращает готовые пакеты, а номер
+//!   пакета, шифрование и `m_SentPackets` остаются вызывающему (как `SendData`
+//!   в сессии).
+//! - Очередь — [`VecDeque`] из [`QueuedMessage`] без `null`-элементов (проверка
+//!   `!msg` в i2pd не воспроизводится); снятые `Drop`-ом сообщения
+//!   возвращаются в [`SendQueuePlan::dropped`].
+
+use std::collections::VecDeque;
 
 use crate::error::{I2PError, Result};
+use crate::i2np::I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_TRANSIT_MICROS;
 use crate::i2np_message::I2npMessage;
 use crate::ssu2_ack::{SSU2_ACK_MIN_BODY_SIZE, Ssu2AckBlock};
 use crate::ssu2_block::{
@@ -475,5 +484,181 @@ pub fn fragmented_message<P: Ssu2Policy>(
         packets,
         ack_block_sent,
         aborted: false,
+    })
+}
+
+/// Один «бросок» для padding'а: `GetRng()() & padding_roll_mask`.
+fn padding_roll<P: Ssu2Policy>(rng: &mut impl RandomSource, policy: &P) -> u8 {
+    u8::try_from(rng.roll() & u32::from(policy.padding_roll_mask())).unwrap_or_default()
+}
+
+/// Сообщение в очереди отправки (зеркало `I2NPMessage` в `m_SendQueue`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedMessage {
+    /// Само I2NP-сообщение.
+    pub message: I2npMessage,
+    /// Момент постановки в очередь (`enqueueTime`, монотонные микросекунды).
+    pub enqueue_time: u64,
+}
+
+/// Параметры [`send_queue`] — срез состояния сессии из i2pd.
+#[derive(Debug, Clone, Copy)]
+pub struct SendQueueConfig<'a> {
+    /// ACK-блок, который кладётся в начало каждого пакета (`CreateAckBlock`).
+    pub ack: &'a Ssu2AckBlock,
+    /// Максимум payload'а пакета (`m_MaxPayloadSize`).
+    pub max_payload: usize,
+    /// Размер окна (`m_WindowSize`).
+    pub window_size: usize,
+    /// Сколько пакетов отправлено и не подтверждено (`m_SentPackets.size()`).
+    pub sent_packets: usize,
+    /// Установлена ли сессия (`IsEstablished`).
+    pub established: bool,
+    /// `i2p::util::GetMillisecondsSinceEpoch()`.
+    pub now_ms: u64,
+    /// `i2p::util::GetMonotonicMicroseconds()`.
+    pub now_micros: u64,
+}
+
+/// Результат [`send_queue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendQueuePlan {
+    /// Пакеты в порядке отправки; номер, шифрование и `m_SentPackets` — за
+    /// вызывающим (i2pd `SendData`).
+    pub packets: Vec<DataPayload>,
+    /// Отправлен ли где-нибудь ACK-блок (i2pd `ackBlockSent`).
+    pub ack_block_sent: bool,
+    /// Сообщения, снятые с очереди как истёкшие/просроченные (i2pd `Drop`).
+    pub dropped: Vec<I2npMessage>,
+}
+
+/// `SendQueue` (`SSU2Session.cpp:465`): упаковывает очередь в data-пакеты.
+///
+/// Пока в очереди есть что-то, сессия установлена и окно не переполнено,
+/// сообщения складываются в пакеты: в начало каждого идёт ACK-блок
+/// (`CreateAckBlock`), затем блоки `I2NP`; не влезающие целиком сообщения
+/// уходят через [`fragmented_message`]. Истёкшие (`IsExpired`) и «просроченные»
+/// по `I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_TRANSIT` снимаются и попадают в
+/// [`SendQueuePlan::dropped`].
+///
+/// Готовые пакеты возвращаются в порядке отправки: последний несёт флаг
+/// `IMMEDIATE_ACK_REQUESTED` (как и «завершающий» пакет в i2pd).
+///
+/// # Errors
+///
+/// Пробрасывает ошибки сборки блоков ([`I2PError::Malformed`] — недостижимо).
+pub fn send_queue<P: Ssu2Policy>(
+    queue: &mut VecDeque<QueuedMessage>,
+    cfg: &SendQueueConfig<'_>,
+    rng: &mut impl RandomSource,
+    policy: &P,
+) -> Result<SendQueuePlan> {
+    let mut packets: Vec<DataPayload> = Vec::new();
+    let mut dropped: Vec<I2npMessage> = Vec::new();
+    if queue.is_empty() || cfg.sent_packets > cfg.window_size || !cfg.established {
+        return Ok(SendQueuePlan {
+            packets,
+            ack_block_sent: false,
+            dropped,
+        });
+    }
+
+    let mut sent = cfg.sent_packets;
+    let mut ack_block_sent = false;
+
+    // Каждый пакет начинается с ACK-блока, записанного с полным бюджетом
+    // (`CreateAckBlock(payload, m_MaxPayloadSize)`).
+    let mut current: Vec<u8> = Vec::new();
+    append_ack_limited(&mut current, cfg.ack, cfg.max_payload)?;
+    let ack_block_size = current.len();
+
+    while !queue.is_empty() && sent <= cfg.window_size {
+        let (expired, ntcp2) = {
+            let Some(front) = queue.front() else { break };
+            (
+                front.message.is_expired(cfg.now_ms)
+                    || front.enqueue_time + I2NP_MESSAGE_LOCAL_EXPIRATION_TIMEOUT_TRANSIT_MICROS
+                        < cfg.now_micros,
+                front.message.to_ntcp2_bytes(),
+            )
+        };
+        if expired {
+            let Some(msg) = queue.pop_front() else {
+                break;
+            };
+            dropped.push(msg.message);
+            continue;
+        }
+
+        let len = ntcp2.len() + 3;
+        if len > cfg.max_payload {
+            // сообщение слишком длинное — уходит фрагментами
+            let Some(msg) = queue.pop_front() else {
+                break;
+            };
+            let plan = fragmented_message(&msg.message, cfg.max_payload, cfg.ack, rng, policy)?;
+            if !plan.aborted && plan.ack_block_sent {
+                ack_block_sent = true;
+            }
+            sent += plan.packets.len();
+            packets.extend(plan.packets);
+        } else if current.len() + len <= cfg.max_payload {
+            queue.pop_front();
+            write_block(&mut current, Ssu2BlockType::I2npMessage, &ntcp2)?;
+        } else {
+            // новому пакету — копия ACK-блока
+            let new_packet = current[..ack_block_size].to_vec();
+            if current.len() > ack_block_size {
+                // текущий пакет содержит больше, чем ACK-блок — отправляем
+                ack_block_sent = true;
+                if current.len() + 16 < cfg.max_payload {
+                    let roll = padding_roll(rng, policy);
+                    append_padding(policy, &mut current, roll, cfg.max_payload, 0)?;
+                }
+            } else {
+                // в текущем пакете только ACK-блок
+                if len + 8 < cfg.max_payload {
+                    // оставляем ACK-блок, обрезая диапазоны под размер сообщения
+                    ack_block_sent = true;
+                    let mut size = cfg.max_payload - len;
+                    if size % 2 == 1 {
+                        size -= 1; // сделать чётным
+                    }
+                    let mut reduced = Vec::new();
+                    append_ack_limited(&mut reduced, cfg.ack, size)?;
+                    current = reduced;
+                } else {
+                    // ACK-блок не помещается — выбрасываем
+                    current.clear();
+                }
+                queue.pop_front();
+                write_block(&mut current, Ssu2BlockType::I2npMessage, &ntcp2)?;
+            }
+            packets.push(DataPayload {
+                payload: std::mem::take(&mut current),
+                flags: 0,
+            });
+            sent += 1;
+            current = new_packet;
+        }
+    }
+
+    if current.len() > ack_block_size {
+        // последний пакет: padding и флаг IMMEDIATE_ACK_REQUESTED
+        ack_block_sent = true;
+        if current.len() + 16 < cfg.max_payload {
+            let roll = padding_roll(rng, policy);
+            append_padding(policy, &mut current, roll, cfg.max_payload, 0)?;
+        }
+        packets.push(DataPayload {
+            payload: current,
+            flags: SSU2_FLAG_IMMEDIATE_ACK_REQUESTED,
+        });
+    }
+
+    Ok(SendQueuePlan {
+        packets,
+        ack_block_sent,
+        dropped,
     })
 }
