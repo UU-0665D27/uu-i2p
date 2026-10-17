@@ -36,7 +36,8 @@ use tracing::{debug, trace, warn};
 
 use crate::error::{I2PError, Result};
 use crate::ssu2_block::{
-    AddressBlock, Blocks, RouterInfoBlock, Ssu2BlockType, Ssu2TerminationReason,
+    AddressBlock, Blocks, NewTokenBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType,
+    Ssu2TerminationReason,
 };
 use crate::ssu2_crypto::DataPhaseKeys;
 use crate::ssu2_engine::{
@@ -114,8 +115,23 @@ pub struct ConnReport {
     pub established: bool,
     /// Токен из `Retry`: положить в исходящее хранилище.
     pub token: Option<u64>,
+    /// `New Token` из payload'а `SessionCreated` (инициатор): `(expires,
+    /// token)`. i2pd `ProcessSessionCreated` → `HandlePayload` →
+    /// `UpdateOutgoingToken`.
+    ///
+    /// Нужен, чтобы следующий `SessionRequest` ушёл без лишнего `Retry`:
+    /// в `SessionCreated` ответчик выдаёт новый входящий токен, а
+    /// предъявленный в `SessionRequest` — аннулирует
+    /// (`NewIncomingToken`, `SSU2Session.cpp:1020`).
+    pub new_token: Option<(u32, u64)>,
     /// `RouterInfo` собеседника из `SessionConfirmed` (ответчик).
     pub remote_router_info: Option<Vec<u8>>,
+    /// Статический ключ `S` инициатора из `SessionConfirmed` (ответчик).
+    ///
+    /// Вызывающему нужен, чтобы сверить его с `s=` из полученного
+    /// `RouterInfo` (i2pd `ProcessSessionConfirmed`, `SSU2Session.cpp:1415`:
+    /// `memcmp (S, m_Address->s, 32)`).
+    pub remote_static_key: Option<[u8; 32]>,
     /// Собеседник отказал (`Retry` с нулевым токеном).
     pub rejected: bool,
     /// Ответчику нужно отправить `QuickAck` (i2pd `SendQuickAck` в конце
@@ -219,9 +235,13 @@ pub fn peek_long_header_ids(packet: &[u8], intro_key: &[u8; 32]) -> Option<(Conn
 /// `TokenRequest`/`SessionRequest`/`Retry` вторая половина замаскирована
 /// intro-ключом получателя (i2pd `ProcessFirstIncomingMessage`,
 /// `SSU2Session.cpp:683`), у `SessionCreated` — `k_header_2` из состояния
-/// Noise (i2pd `ProcessSessionCreated`, `:1068`).
+/// Noise (i2pd `ProcessSessionCreated`, `:1068`), у `SessionConfirmed` —
+/// `k_header_2` из состояния ответчика (i2pd `ProcessSessionConfirmed`,
+/// `:1219`).
+///
+/// Пакет не изменяется: ключ применяется к копии байтов заголовка.
 #[must_use]
-fn peek_message_type_with(packet: &[u8], k_header_2: &[u8; 32]) -> Option<Ssu2MessageType> {
+pub fn peek_message_type_with(packet: &[u8], k_header_2: &[u8; 32]) -> Option<Ssu2MessageType> {
     if packet.len() < SSU2_LONG_HEADER_SIZE {
         return None;
     }
@@ -395,6 +415,18 @@ impl Ssu2Connection {
     #[must_use]
     pub const fn params(&self) -> &ConnParams {
         &self.params
+    }
+
+    /// Ключ `k_header_2` входящего `SessionConfirmed` (только у ответчика).
+    ///
+    /// Транспорту нужен, чтобы в состоянии `SessionCreatedSent` отличить
+    /// `SessionConfirmed` от повторного `SessionRequest` и не завершать сессию
+    /// (i2pd `ProcessSessionConfirmed`, `SSU2Session.cpp:1223`).
+    #[must_use]
+    pub fn session_confirmed_header_key(&self) -> Option<[u8; 32]> {
+        self.responder
+            .as_ref()
+            .map(ResponderHandshake::session_confirmed_header_key)
     }
 
     // --- рукопожатие -----------------------------------------------------
@@ -754,6 +786,28 @@ impl Ssu2Connection {
         self.set_state(Ssu2SessionState::SessionCreatedReceived);
         debug!(ephemeral = %hex32(&received.ephemeral), "recv_session_created: SessionCreated");
 
+        // i2pd `ProcessSessionCreated` -> `HandlePayload`: в payload'е
+        // `SessionCreated` приходят `DateTime`, `Address` (наш внешний адрес),
+        // `New Token` и `Padding`. Токен отдаём вызывающему: он положит его в
+        // исходящее хранилище и следующий `SessionRequest` уйдёт без `Retry`.
+        //
+        // TODO(ssu2-conn-session-created-address): `Address` из payload'а —
+        // внешний адрес для `i2p::context.UpdateAddress`
+        // (`SSU2Session::HandleAddress`, `:2104`); решение уровня роутера.
+        let mut new_token = None;
+        for block in Blocks::new(&received.payload) {
+            let Ok(block) = block else { break };
+            if block.kind() == Some(Ssu2BlockType::NewToken)
+                && let Ok(token) = NewTokenBlock::parse(block.body)
+            {
+                debug!(
+                    expires = token.expires,
+                    "recv_session_created: NewToken for outgoing requests"
+                );
+                new_token = Some((token.expires, token.token));
+            }
+        }
+
         let params = SessionConfirmedParams {
             dest_conn_id: self.dest_conn_id,
             router_info: &self.params.local_router_info,
@@ -792,6 +846,7 @@ impl Ssu2Connection {
         );
         Ok(ConnReport {
             packets: out,
+            new_token,
             ..ConnReport::default()
         })
     }
@@ -991,6 +1046,7 @@ impl Ssu2Connection {
             established: true,
             quick_ack_pending: true,
             remote_router_info: Some(router_info),
+            remote_static_key: Some(confirmed.static_key),
             ..ConnReport::default()
         })
     }
@@ -1034,7 +1090,9 @@ fn extract_router_info(payload: &[u8]) -> Result<Vec<u8>> {
         ));
     }
     let block: RouterInfoBlock = first.parse()?;
-    Ok(block.router_info.to_vec())
+    // `body()` снимает флаги/`frag` и распаковывает gzip — как
+    // `ExtractRouterInfo` в i2pd (`SSU2Session.cpp:3290`).
+    Ok(block.body()?.into_owned())
 }
 
 /// Младший байт броска генератора.

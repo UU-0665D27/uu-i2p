@@ -51,6 +51,7 @@ pub mod ssu2_handshake;
 pub mod ssu2_header;
 pub mod ssu2_lifecycle;
 pub mod ssu2_policy;
+pub mod ssu2_pool;
 pub mod ssu2_recv;
 pub mod ssu2_send;
 pub mod ssu2_session;
@@ -111,6 +112,7 @@ pub use router_info::{
 pub use router_info_address::{I2PAddress, Introducer, SsuExt, TransportStyle};
 pub use short_tunnel_build::{SHORT_TUNNEL_BUILD_HEADER_SIZE, ShortTunnelBuildBody};
 pub use signature::{CryptoKeyType, SigningKeyType};
+pub use ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool};
 pub use tag::{I2PAesKey, I2PTag, IdentHash, SessionTag};
 pub use tunnel_build_crypto::{GarlicReplyKeys, HopCrypto, RecordKeys};
 pub use tunnel_build_message::{

@@ -667,6 +667,19 @@ impl ResponderHandshake {
         &self.noise.ck
     }
 
+    /// Ключ `k_header_2` входящего `SessionConfirmed`: `HKDF(chainKey, "",
+    /// "SessionConfirmed")` (i2pd `ProcessSessionConfirmed`,
+    /// `SSU2Session.cpp:1219`).
+    ///
+    /// Нужен транспорту, чтобы отличить повторный `SessionRequest` (или иной
+    /// пакет) от `SessionConfirmed` в состоянии `SessionCreatedSent`, не трогая
+    /// Noise-состояние: i2pd в этом случае возвращает `true` и сессию не
+    /// завершает (`SSU2Session.cpp:1223`).
+    #[must_use]
+    pub fn session_confirmed_header_key(&self) -> [u8; 32] {
+        session_confirmed_header_key(&self.noise.ck)
+    }
+
     /// Ключи data phase (доступны после полного `SessionConfirmed`).
     #[must_use]
     pub const fn data_keys(&self) -> Option<&DataPhaseKeys> {
