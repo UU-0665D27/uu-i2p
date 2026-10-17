@@ -94,7 +94,14 @@ fn append_ack_limited(out: &mut Vec<u8>, ack: &Ssu2AckBlock, budget: usize) -> R
 ///
 /// i2pd требует не меньше 9 байт под IPv4-блок и 21 под IPv6 (иначе
 /// `CreateEndpoint` возвращает 0); при нехватке блок просто не пишется.
-fn append_address(out: &mut Vec<u8>, address: &AddressBlock, max_size: usize) -> Result<()> {
+/// `CreateAddressBlock`: дописывает `Address`, если он помещается в `max_size`.
+///
+/// Публична: тот же приём нужен `Retry` (`CreateAddressBlock` в i2pd).
+///
+/// # Errors
+///
+/// [`I2PError::Malformed`], если тело блока не влезает в лимит блока.
+pub fn append_address(out: &mut Vec<u8>, address: &AddressBlock, max_size: usize) -> Result<()> {
     let body = address.to_body();
     if max_size.saturating_sub(out.len()) < SSU2_BLOCK_HEADER_SIZE + body.len() {
         return Ok(());
@@ -107,7 +114,13 @@ fn append_address(out: &mut Vec<u8>, address: &AddressBlock, max_size: usize) ->
 /// Тело `0..=31` (с маской `roll`), обрезается по остатку и поднимается до
 /// `min_size`; если места меньше минимального блока — ничего не пишется
 /// (i2pd возвращает 0).
-fn append_padding<P: Ssu2Policy>(
+///
+/// Публична: тот же приём нужен handshake-пакетам `TokenRequest`/`Retry`.
+///
+/// # Errors
+///
+/// [`I2PError::Malformed`], если тело блока не влезает в лимит блока.
+pub fn append_padding<P: Ssu2Policy>(
     policy: &P,
     out: &mut Vec<u8>,
     roll: u8,

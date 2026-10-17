@@ -1,11 +1,15 @@
 use uu_i2p::{
     crypto::I2PX25519Keys,
-    ssu2_block::{Blocks, DateTimeBlock, RouterInfoBlock, Ssu2BlockType},
+    ssu2_block::{
+        AddressBlock, Blocks, DateTimeBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType,
+        Ssu2TerminationReason,
+    },
     ssu2_crypto::derive_data_phase_keys,
     ssu2_handshake::{
-        ConfirmedOutcome, HandshakeConfig, InitiatorHandshake, ResponderHandshake,
-        SSU2_SESSION_CONFIRMED_MIN_LEN, SSU2_SESSION_REQUEST_MIN_LEN, SessionConfirmedParams,
-        SessionCreatedParams, SessionRequestParams,
+        ConfirmedOutcome, HandshakeConfig, InitiatorHandshake, ResponderHandshake, RetryParams,
+        SSU2_SESSION_CONFIRMED_MIN_LEN, SSU2_SESSION_REQUEST_MIN_LEN, SSU2_TOKEN_MESSAGE_MIN_LEN,
+        SessionConfirmedParams, SessionCreatedParams, SessionRequestParams, TokenRequestParams,
+        build_retry, build_token_request, handle_retry, handle_token_request,
     },
     ssu2_header::ConnectionId,
     ssu2_policy::I2pdPolicy,
@@ -477,4 +481,143 @@ fn oversized_router_info_is_rejected() {
             .build_session_confirmed(&policy, &confirmed_params(&ri))
             .is_err()
     );
+}
+
+// --- TokenRequest / Retry -----------------------------------------------
+
+const BOB_INTRO: [u8; 32] = [0x11; 32];
+
+fn token_request_params() -> TokenRequestParams {
+    TokenRequestParams {
+        dest_conn_id: BOB_ID,
+        source_conn_id: ALICE_ID,
+        packet_num: 0x1020_3040,
+        now_secs: NOW,
+        pad_roll: 0xFF,
+    }
+}
+
+#[test]
+fn token_request_roundtrip() {
+    let policy = I2pdPolicy;
+    let config = HandshakeConfig::default();
+    let mut packet =
+        build_token_request(&policy, &config, &BOB_INTRO, &token_request_params()).unwrap();
+    assert!(
+        packet.len() >= SSU2_TOKEN_MESSAGE_MIN_LEN,
+        "TokenRequest не короче 48 байт, получено {}",
+        packet.len()
+    );
+
+    let received = handle_token_request(&BOB_INTRO, &mut packet).unwrap();
+    assert_eq!(received.dest_conn_id, BOB_ID);
+    assert_eq!(received.source_conn_id, ALICE_ID);
+
+    let mut blocks = Blocks::new(&received.payload);
+    let first = blocks.next().unwrap().unwrap();
+    assert_eq!(first.kind(), Some(Ssu2BlockType::DateTime));
+    let dt: DateTimeBlock = first.parse().unwrap();
+    assert_eq!(dt.timestamp, NOW);
+    // Дальше — только Padding.
+    for block in blocks {
+        assert_eq!(block.unwrap().kind(), Some(Ssu2BlockType::Padding));
+    }
+}
+
+#[test]
+fn retry_roundtrip_with_token_and_address() {
+    let policy = I2pdPolicy;
+    let config = HandshakeConfig::default();
+    let address = AddressBlock {
+        port: 9151,
+        ip: "127.0.0.1".parse().unwrap(),
+    };
+    let params = RetryParams {
+        dest_conn_id: ALICE_ID,
+        source_conn_id: BOB_ID,
+        packet_num: 0x5060_7080,
+        token: TOKEN,
+        now_secs: NOW + 2,
+        valid_packets: 0,
+        address: Some(&address),
+        reason: None,
+        pad_roll: 0xFF,
+    };
+    let mut packet = build_retry(&policy, &config, &BOB_INTRO, &params).unwrap();
+
+    let received = handle_retry(&BOB_INTRO, &mut packet).unwrap();
+    assert_eq!(received.source_conn_id, BOB_ID);
+    assert_eq!(received.dest_conn_id, ALICE_ID);
+    assert_eq!(received.token, TOKEN);
+
+    let mut kinds = Vec::new();
+    let mut seen_address = None;
+    for block in Blocks::new(&received.payload) {
+        let block = block.unwrap();
+        kinds.push(block.kind());
+        if block.kind() == Some(Ssu2BlockType::Address) {
+            seen_address = Some(AddressBlock::parse(block.body).unwrap());
+        }
+    }
+    assert_eq!(kinds.first(), Some(&Some(Ssu2BlockType::DateTime)));
+    assert!(kinds.contains(&Some(Ssu2BlockType::Address)));
+    assert_eq!(seen_address.unwrap().port, address.port);
+}
+
+#[test]
+fn retry_with_termination_reason() {
+    let policy = I2pdPolicy;
+    let config = HandshakeConfig::default();
+    let params = RetryParams {
+        dest_conn_id: ALICE_ID,
+        source_conn_id: BOB_ID,
+        packet_num: 1,
+        token: 0,
+        now_secs: NOW,
+        valid_packets: 0,
+        address: None,
+        reason: Some(Ssu2TerminationReason::BadToken),
+        pad_roll: 0xFF,
+    };
+    let mut packet = build_retry(&policy, &config, &BOB_INTRO, &params).unwrap();
+    let received = handle_retry(&BOB_INTRO, &mut packet).unwrap();
+    assert_eq!(received.token, 0, "при отказе токен нулевой");
+
+    let mut reason = None;
+    for block in Blocks::new(&received.payload) {
+        let block = block.unwrap();
+        if block.kind() == Some(Ssu2BlockType::Termination) {
+            // validPackets(8) + reason(1)
+            reason = Ssu2TerminationReason::from_u8(block.body[8]);
+        }
+    }
+    assert_eq!(reason, Some(Ssu2TerminationReason::BadToken));
+}
+
+#[test]
+fn handle_retry_rejects_token_request() {
+    let policy = I2pdPolicy;
+    let config = HandshakeConfig::default();
+    let mut packet =
+        build_token_request(&policy, &config, &BOB_INTRO, &token_request_params()).unwrap();
+    assert!(handle_retry(&BOB_INTRO, &mut packet).is_err());
+}
+
+#[test]
+fn handle_token_request_rejects_tampered() {
+    let policy = I2pdPolicy;
+    let config = HandshakeConfig::default();
+    let mut packet =
+        build_token_request(&policy, &config, &BOB_INTRO, &token_request_params()).unwrap();
+    let last = packet.len() - 1;
+    packet[last] ^= 0x01;
+    assert!(handle_token_request(&BOB_INTRO, &mut packet).is_err());
+}
+
+#[test]
+fn token_messages_reject_short_packets() {
+    let mut short = vec![0u8; SSU2_TOKEN_MESSAGE_MIN_LEN - 1];
+    assert!(handle_token_request(&BOB_INTRO, &mut short).is_err());
+    let mut short = vec![0u8; SSU2_TOKEN_MESSAGE_MIN_LEN - 1];
+    assert!(handle_retry(&BOB_INTRO, &mut short).is_err());
 }

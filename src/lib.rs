@@ -54,6 +54,7 @@ pub mod ssu2_recv;
 pub mod ssu2_send;
 pub mod ssu2_session;
 pub mod ssu2_timers;
+pub mod ssu2_token;
 pub mod tag;
 pub mod timestamp;
 pub mod tunnel_build_crypto;

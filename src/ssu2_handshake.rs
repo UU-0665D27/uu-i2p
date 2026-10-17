@@ -53,18 +53,22 @@
 //! с обфусцируемым регионом. Реальные handshake-пакеты заведомо длиннее
 //! (i2pd тоже требует >= 90 / >= 80), поэтому проверка не мешает.
 
-use crate::crypto::{I2PX25519Keys, NoiseSymmetricState};
+use crate::crypto::{AeadChaCha20Poly1305, I2PX25519Keys, NoiseSymmetricState};
 use crate::error::{I2PError, Result};
-use crate::ssu2_block::{DateTimeBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType, write_block};
+use crate::ssu2_block::{
+    AddressBlock, DateTimeBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType, Ssu2TerminationReason,
+    write_block,
+};
 use crate::ssu2_crypto::{
-    DataPhaseKeys, derive_data_phase_keys, init_noise_ssu2_state, sess_create_header_key,
-    session_confirmed_header_key,
+    DataPhaseKeys, aead_nonce, derive_data_phase_keys, init_noise_ssu2_state,
+    sess_create_header_key, session_confirmed_header_key,
 };
 use crate::ssu2_header::{
     ConnectionId, LongHeader, SSU2_HEADER_SIZE, SSU2_LONG_HEADER_SIZE, SSU2_MIN_PACKET_SIZE,
     SSU2_VERSION, ShortHeader, Ssu2MessageType, obfuscate_header,
 };
 use crate::ssu2_policy::{SSU2_MAX_PACKET_SIZE, Ssu2Policy};
+use crate::ssu2_send::{append_address, append_padding as append_padding_block};
 
 /// Минимальная длина `SessionRequest` (i2pd: `len < 90`).
 pub const SSU2_SESSION_REQUEST_MIN_LEN: usize = 90;
@@ -929,4 +933,309 @@ impl ResponderHandshake {
             payload,
         })
     }
+}
+
+// --- TokenRequest / Retry -----------------------------------------------
+
+/// Минимальная длина `TokenRequest` / `Retry` (i2pd: `len < 48`).
+pub const SSU2_TOKEN_MESSAGE_MIN_LEN: usize = 48;
+
+/// Целевой размер payload'а `TokenRequest` (i2pd: буфер `25 - payloadSize`).
+const TOKEN_REQUEST_MAX_PAYLOAD: usize = 25;
+/// Буфер payload'а `Retry` (i2pd: `56 - payloadSize`).
+const RETRY_MAX_PAYLOAD: usize = 56;
+/// Размер тела блока `Termination` (`validPackets` + `reason`).
+const TERMINATION_BODY_SIZE: usize = 9;
+
+/// Параметры сборки `TokenRequest` (Alice -> Bob).
+#[derive(Debug, Clone, Copy)]
+pub struct TokenRequestParams {
+    /// id получателя (Bob).
+    pub dest_conn_id: ConnectionId,
+    /// id отправителя (Alice).
+    pub source_conn_id: ConnectionId,
+    /// Случайный номер пакета.
+    pub packet_num: u32,
+    /// Текущее время, секунды Unix.
+    pub now_secs: u32,
+    /// «Бросок» для padding'а.
+    pub pad_roll: u8,
+}
+
+/// Параметры сборки `Retry` (Bob -> Alice).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryParams<'a> {
+    /// id получателя (Alice).
+    pub dest_conn_id: ConnectionId,
+    /// id отправителя (Bob).
+    pub source_conn_id: ConnectionId,
+    /// Случайный номер пакета.
+    pub packet_num: u32,
+    /// Токен для Alice (0 — сервер отказывает, `BadToken`/несовместимость).
+    pub token: u64,
+    /// Текущее время, секунды Unix.
+    pub now_secs: u32,
+    /// Наибольший подряд принятый номер пакета (тело `Termination`).
+    pub valid_packets: u64,
+    /// Адрес, каким его видит Bob (блок `Address`), если известен.
+    pub address: Option<&'a AddressBlock>,
+    /// Причина завершения, если Bob отказывает (`Termination`-блок).
+    pub reason: Option<Ssu2TerminationReason>,
+    /// «Бросок» для padding'а.
+    pub pad_roll: u8,
+}
+
+/// Разобранный `TokenRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedTokenRequest {
+    /// id получателя из заголовка.
+    pub dest_conn_id: ConnectionId,
+    /// id отправителя из заголовка (он же — id Alice).
+    pub source_conn_id: ConnectionId,
+    /// Расшифрованный payload.
+    pub payload: Vec<u8>,
+}
+
+/// Разобранный `Retry`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedRetry {
+    /// id получателя из заголовка.
+    pub dest_conn_id: ConnectionId,
+    /// id отправителя из заголовка (он же — id Bob'а).
+    pub source_conn_id: ConnectionId,
+    /// Выданный токен (0 — не выдан).
+    pub token: u64,
+    /// Расшифрованный payload.
+    pub payload: Vec<u8>,
+}
+
+/// Собирает `TokenRequest` (`SendTokenRequest`).
+///
+/// Первый шаг, когда у Alice ещё нет токена: Bob ответит `Retry`. Пакет
+/// шифруется и обфусцируется intro-ключом **Bob'а** (`m_Address->i`), при
+/// этом extended-заголовок — это только `source id` + нулевой токен.
+///
+/// # Errors
+///
+/// [`Error::Malformed`], если пакет выйдет короче требуемого
+/// [`obfuscate_header`]; ошибки сборки блоков.
+pub fn build_token_request<P: Ssu2Policy>(
+    policy: &P,
+    config: &HandshakeConfig,
+    remote_intro_key: &[u8; 32],
+    params: &TokenRequestParams,
+) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    DateTimeBlock {
+        timestamp: params.now_secs,
+    }
+    .write(&mut payload)?;
+    append_padding_block(
+        policy,
+        &mut payload,
+        params.pad_roll,
+        TOKEN_REQUEST_MAX_PAYLOAD,
+        1,
+    )?;
+
+    let header = LongHeader {
+        dest_conn_id: params.dest_conn_id,
+        packet_num: params.packet_num,
+        msg_type: Ssu2MessageType::TokenRequest,
+        version: config.version,
+        net_id: config.net_id,
+        flag: 0,
+        source_conn_id: params.source_conn_id,
+        token: 0,
+    };
+    let header_bytes = header.to_bytes();
+    let ciphertext = seal(remote_intro_key, params.packet_num, &header_bytes, &payload)?;
+
+    let mut packet = Vec::with_capacity(SSU2_LONG_HEADER_SIZE + ciphertext.len());
+    packet.extend_from_slice(&header_bytes);
+    packet.extend_from_slice(&ciphertext);
+    obfuscate_header(
+        Ssu2MessageType::TokenRequest,
+        remote_intro_key,
+        remote_intro_key,
+        &mut packet,
+    )?;
+    Ok(packet)
+}
+
+/// Собирает `Retry` (`SendRetry`).
+///
+/// Bob отвечает `Retry` на `TokenRequest` и на `SessionRequest` с неверным
+/// токеном. Пакет шифруется и обфусцируется **своим** intro-ключом Bob'а
+/// (`GetSSU2IntroKey`). Если Bob не отказывает (`reason` не задан), в
+/// заголовке — действительный токен; иначе токен нулевой и в payload
+/// добавляется блок `Termination`.
+///
+/// # Errors
+///
+/// [`Error::Malformed`], если пакет выйдет короче требуемого
+/// [`obfuscate_header`]; ошибки сборки блоков.
+pub fn build_retry<P: Ssu2Policy>(
+    policy: &P,
+    config: &HandshakeConfig,
+    local_intro_key: &[u8; 32],
+    params: &RetryParams<'_>,
+) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    DateTimeBlock {
+        timestamp: params.now_secs,
+    }
+    .write(&mut payload)?;
+    if let Some(address) = params.address {
+        append_address(&mut payload, address, RETRY_MAX_PAYLOAD)?;
+    }
+    if let Some(reason) = params.reason {
+        let mut body = Vec::with_capacity(TERMINATION_BODY_SIZE);
+        body.extend_from_slice(&params.valid_packets.to_be_bytes());
+        body.push(reason.as_u8());
+        write_block(&mut payload, Ssu2BlockType::Termination, &body)?;
+    }
+    append_padding_block(policy, &mut payload, params.pad_roll, RETRY_MAX_PAYLOAD, 0)?;
+
+    let header = LongHeader {
+        dest_conn_id: params.dest_conn_id,
+        packet_num: params.packet_num,
+        msg_type: Ssu2MessageType::Retry,
+        version: config.version,
+        net_id: config.net_id,
+        flag: 0,
+        source_conn_id: params.source_conn_id,
+        token: params.token,
+    };
+    let header_bytes = header.to_bytes();
+    let ciphertext = seal(local_intro_key, params.packet_num, &header_bytes, &payload)?;
+
+    let mut packet = Vec::with_capacity(SSU2_LONG_HEADER_SIZE + ciphertext.len());
+    packet.extend_from_slice(&header_bytes);
+    packet.extend_from_slice(&ciphertext);
+    obfuscate_header(
+        Ssu2MessageType::Retry,
+        local_intro_key,
+        local_intro_key,
+        &mut packet,
+    )?;
+    Ok(packet)
+}
+
+/// `ProcessTokenRequest`: расшифровывает `TokenRequest` (Bob, свой intro-ключ).
+///
+/// Пакет деобфусцируется **на месте**.
+///
+/// # Errors
+///
+/// [`Error::InvalidLength`] при слишком коротком пакете; [`Error::Malformed`]
+/// при неверном типе или теге; ошибки обфускации заголовка.
+pub fn handle_token_request(
+    local_intro_key: &[u8; 32],
+    packet: &mut [u8],
+) -> Result<ReceivedTokenRequest> {
+    if packet.len() < SSU2_TOKEN_MESSAGE_MIN_LEN {
+        return Err(I2PError::InvalidLength {
+            expected: SSU2_TOKEN_MESSAGE_MIN_LEN,
+            got: packet.len(),
+        });
+    }
+    obfuscate_header(
+        Ssu2MessageType::TokenRequest,
+        local_intro_key,
+        local_intro_key,
+        packet,
+    )?;
+    let header = LongHeader::parse(&packet[..SSU2_LONG_HEADER_SIZE])?;
+    if header.msg_type != Ssu2MessageType::TokenRequest {
+        return Err(I2PError::Malformed("ssu2: expected TokenRequest"));
+    }
+    let mut header_bytes = [0u8; SSU2_LONG_HEADER_SIZE];
+    header_bytes.copy_from_slice(&packet[..SSU2_LONG_HEADER_SIZE]);
+    let payload = open(
+        local_intro_key,
+        header.packet_num,
+        &header_bytes,
+        &packet[SSU2_LONG_HEADER_SIZE..],
+    )?;
+    Ok(ReceivedTokenRequest {
+        dest_conn_id: header.dest_conn_id,
+        source_conn_id: header.source_conn_id,
+        payload,
+    })
+}
+
+/// `ProcessRetry`: расшифровывает `Retry` (Alice, intro-ключ **Bob'а**).
+///
+/// Пакет деобфусцируется **на месте**.
+///
+/// # Errors
+///
+/// [`Error::InvalidLength`] при слишком коротком пакете; [`Error::Malformed`]
+/// при неверном типе или теге; ошибки обфускации заголовка.
+pub fn handle_retry(remote_intro_key: &[u8; 32], packet: &mut [u8]) -> Result<ReceivedRetry> {
+    if packet.len() < SSU2_TOKEN_MESSAGE_MIN_LEN {
+        return Err(I2PError::InvalidLength {
+            expected: SSU2_TOKEN_MESSAGE_MIN_LEN,
+            got: packet.len(),
+        });
+    }
+    obfuscate_header(
+        Ssu2MessageType::Retry,
+        remote_intro_key,
+        remote_intro_key,
+        packet,
+    )?;
+    let header = LongHeader::parse(&packet[..SSU2_LONG_HEADER_SIZE])?;
+    if header.msg_type != Ssu2MessageType::Retry {
+        return Err(I2PError::Malformed("ssu2: expected Retry"));
+    }
+    let mut header_bytes = [0u8; SSU2_LONG_HEADER_SIZE];
+    header_bytes.copy_from_slice(&packet[..SSU2_LONG_HEADER_SIZE]);
+    let payload = open(
+        remote_intro_key,
+        header.packet_num,
+        &header_bytes,
+        &packet[SSU2_LONG_HEADER_SIZE..],
+    )?;
+    Ok(ReceivedRetry {
+        dest_conn_id: header.dest_conn_id,
+        source_conn_id: header.source_conn_id,
+        token: header.token,
+        payload,
+    })
+}
+
+/// AEAD-запечатывание `TokenRequest`/`Retry`: ключ — intro, nonce — номер
+/// пакета, AAD — 32-байтовый заголовок (i2pd `AEADChaCha20Poly1305`).
+fn seal(key: &[u8; 32], packet_num: u32, header: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    let aead = AeadChaCha20Poly1305::new();
+    let mut out = vec![0u8; payload.len() + 16];
+    let len = aead.encrypt(
+        key,
+        &aead_nonce(u64::from(packet_num)),
+        header,
+        payload,
+        &mut out,
+    )?;
+    out.truncate(len);
+    Ok(out)
+}
+
+/// AEAD-распечатывание `TokenRequest`/`Retry` (обратная к [`seal`]).
+fn open(key: &[u8; 32], packet_num: u32, header: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    let aead = AeadChaCha20Poly1305::new();
+    if ciphertext.len() < 16 {
+        return Err(I2PError::Malformed("ssu2: token message too short"));
+    }
+    let mut out = vec![0u8; ciphertext.len() - 16];
+    let len = aead.decrypt(
+        key,
+        &aead_nonce(u64::from(packet_num)),
+        header,
+        ciphertext,
+        &mut out,
+    )?;
+    out.truncate(len);
+    Ok(out)
 }
