@@ -4,12 +4,14 @@ mod tests {
     use uu_i2p::{
         error::I2PError,
         ssu2_block::{
-            follow_on_frag_byte, write_block, write_raw_block, AddressBlock, Blocks, DateTimeBlock,
-            FirstFragmentBlock, FirstPacketNumberBlock, FollowOnFragmentBlock, I2npBlock,
-            NewTokenBlock, OptionsBlock, PaddingBlock, PathChallengeBlock, PathResponseBlock,
-            RawBlock, RelayTagBlock, RelayTagRequestBlock, RouterInfoBlock, Ssu2Block,
-            Ssu2BlockType, Ssu2TerminationReason, TerminationBlock, SSU2_BLOCK_HEADER_SIZE,
-            SSU2_ROUTER_INFO_FLAG_FLOOD, SSU2_ROUTER_INFO_FLAG_GZIP,
+            AddressBlock, Blocks, DateTimeBlock, FirstFragmentBlock, FirstPacketNumberBlock,
+            FollowOnFragmentBlock, I2npBlock, NewTokenBlock, OptionsBlock, PaddingBlock,
+            PathChallengeBlock, PathResponseBlock, PeerTestBlock, RawBlock, RelayIntroBlock,
+            RelayRequestBlock, RelayResponseBlock, RelayTagBlock, RelayTagRequestBlock,
+            RouterInfoBlock, SSU2_BLOCK_HEADER_SIZE, SSU2_ROUTER_INFO_FLAG_FLOOD,
+            SSU2_ROUTER_INFO_FLAG_GZIP, Ssu2Block, Ssu2BlockType, Ssu2PeerTestCode,
+            Ssu2RelayResponseCode, Ssu2TerminationReason, TerminationBlock, follow_on_frag_byte,
+            write_block, write_raw_block,
         },
     };
 
@@ -529,5 +531,304 @@ mod tests {
         let b = PaddingBlock { data: &data };
         assert_eq!(b.to_body(), data.to_vec());
         assert_eq!(PaddingBlock::parse(&data).unwrap(), b);
+    }
+
+    // ---- RelayRequest ---------------------------------------------------
+
+    fn relay_request_body(signature: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0); // flag
+        body.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+        body.extend_from_slice(&0x5566_7788u32.to_be_bytes());
+        body.extend_from_slice(&0x99AA_BBCCu32.to_be_bytes());
+        body.push(2); // ver
+        body.push(6); // asz
+        body.push(0x12); // port
+        body.push(0x34);
+        body.extend_from_slice(&[10, 0, 0, 1]);
+        body.extend_from_slice(signature);
+        body
+    }
+
+    #[test]
+    fn relay_request_roundtrip_and_layout() {
+        let signature = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let body = relay_request_body(&signature);
+        assert_eq!(body.len(), 25);
+        let b = RelayRequestBlock::parse(&body).unwrap();
+        assert_eq!(b.flag, 0);
+        assert_eq!(b.nonce, 0x1122_3344);
+        assert_eq!(b.relay_tag, 0x5566_7788);
+        assert_eq!(b.timestamp, 0x99AA_BBCC);
+        assert_eq!(b.version, 2);
+        assert_eq!(b.endpoint.port, 0x1234);
+        assert_eq!(b.endpoint.ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(b.signature, &signature);
+        assert_eq!(b.to_body(), body);
+        assert_eq!(RelayRequestBlock::TYPE, Ssu2BlockType::RelayRequest);
+
+        // Проводная сборка/разбор через Blocks.
+        let mut framed = Vec::new();
+        b.write(&mut framed).unwrap();
+        let raw = Blocks::new(&framed).next().unwrap().unwrap();
+        assert_eq!(raw.kind(), Some(Ssu2BlockType::RelayRequest));
+        let parsed: RelayRequestBlock<'_> = raw.parse().unwrap();
+        assert_eq!(parsed, b);
+    }
+
+    #[test]
+    fn relay_request_ipv6_roundtrip() {
+        let endpoint = AddressBlock {
+            port: 0x00FF,
+            ip: IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap()),
+        };
+        let b = RelayRequestBlock {
+            flag: 0,
+            nonce: 1,
+            relay_tag: 2,
+            timestamp: 3,
+            version: 2,
+            endpoint,
+            signature: &[],
+        };
+        let body = b.to_body();
+        assert_eq!(body.len(), 15 + 18);
+        assert_eq!(RelayRequestBlock::parse(&body).unwrap(), b);
+    }
+
+    #[test]
+    fn relay_request_rejects_bad_endpoint_size() {
+        let mut body = relay_request_body(&[]);
+        body[14] = 5; // asz
+        assert!(matches!(
+            RelayRequestBlock::parse(&body),
+            Err(I2PError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn relay_request_too_short() {
+        assert!(matches!(
+            RelayRequestBlock::parse(&[0u8; 14]),
+            Err(I2PError::InvalidLength {
+                expected: 15,
+                got: 14
+            })
+        ));
+        // asz=6, но endpoint обрезан.
+        let body = relay_request_body(&[]);
+        assert!(matches!(
+            RelayRequestBlock::parse(&body[..20]),
+            Err(I2PError::InvalidLength {
+                expected: 21,
+                got: 20
+            })
+        ));
+    }
+
+    // ---- RelayResponse --------------------------------------------------
+
+    #[test]
+    fn relay_response_accept_with_endpoint() {
+        // Подпись + 8-байтовый токен (code == Accept).
+        let sig_and_token = hex::<12>("112233440102030405060708");
+        let mut body = Vec::new();
+        body.push(0); // flag
+        body.push(Ssu2RelayResponseCode::Accept.as_u8());
+        body.extend_from_slice(&0x0A0B_0C0Du32.to_be_bytes());
+        body.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        body.push(2); // ver
+        body.push(6); // csz
+        body.push(0xAB); // port
+        body.push(0xCD);
+        body.extend_from_slice(&[1, 2, 3, 4]);
+        body.extend_from_slice(&sig_and_token);
+
+        let b = RelayResponseBlock::parse(&body).unwrap();
+        assert_eq!(b.code, 0);
+        assert_eq!(b.code_kind(), Some(Ssu2RelayResponseCode::Accept));
+        assert_eq!(b.nonce, 0x0A0B_0C0D);
+        assert_eq!(b.timestamp, 0x0102_0304);
+        assert_eq!(b.version, 2);
+        assert_eq!(b.endpoint.unwrap().port, 0xABCD);
+        assert_eq!(b.signature, &sig_and_token);
+        assert_eq!(b.to_body(), body);
+        assert_eq!(RelayResponseBlock::TYPE, Ssu2BlockType::RelayResponse);
+    }
+
+    #[test]
+    fn relay_response_reject_has_no_endpoint() {
+        let b = RelayResponseBlock {
+            flag: 0,
+            code: Ssu2RelayResponseCode::BobRelayTagNotFound.as_u8(),
+            nonce: 7,
+            timestamp: 8,
+            version: 2,
+            endpoint: None,
+            signature: &[0xAA; 64],
+        };
+        let body = b.to_body();
+        assert_eq!(body.len(), 12 + 64);
+        assert_eq!(body[11], 0); // csz
+        let parsed = RelayResponseBlock::parse(&body).unwrap();
+        assert_eq!(
+            parsed.code_kind(),
+            Some(Ssu2RelayResponseCode::BobRelayTagNotFound)
+        );
+        assert_eq!(parsed.endpoint, None);
+        assert_eq!(parsed, b);
+    }
+
+    #[test]
+    fn relay_response_rejects_bad_csz_and_too_short() {
+        assert!(matches!(
+            RelayResponseBlock::parse(&[0u8; 11]),
+            Err(I2PError::InvalidLength {
+                expected: 12,
+                got: 11
+            })
+        ));
+        let mut body = vec![0u8; 12];
+        body[11] = 5; // csz
+        assert!(matches!(
+            RelayResponseBlock::parse(&body),
+            Err(I2PError::Malformed(_))
+        ));
+    }
+
+    // ---- RelayIntro -----------------------------------------------------
+
+    #[test]
+    fn relay_intro_roundtrip_and_layout() {
+        let alice_hash = [0x42u8; 32];
+        let signature = [0x01u8, 0x02, 0x03];
+        let b = RelayIntroBlock {
+            flag: 0,
+            alice_hash,
+            nonce: 0x0102_0304,
+            relay_tag: 0x0506_0708,
+            timestamp: 0x090A_0B0C,
+            version: 2,
+            endpoint: AddressBlock {
+                port: 0x0D0E,
+                ip: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            },
+            signature: &signature,
+        };
+        let body = b.to_body();
+        assert_eq!(body.len(), 47 + 6 + 3);
+        assert_eq!(body[46], 6); // asz
+        assert_eq!(RelayIntroBlock::parse(&body).unwrap(), b);
+        assert_eq!(RelayIntroBlock::TYPE, Ssu2BlockType::RelayIntro);
+    }
+
+    #[test]
+    fn relay_intro_too_short_and_bad_endpoint() {
+        assert!(matches!(
+            RelayIntroBlock::parse(&[0u8; 46]),
+            Err(I2PError::InvalidLength {
+                expected: 47,
+                got: 46
+            })
+        ));
+        let mut body = vec![0u8; 47];
+        body[46] = 5; // asz
+        assert!(matches!(
+            RelayIntroBlock::parse(&body),
+            Err(I2PError::Malformed(_))
+        ));
+    }
+
+    // ---- PeerTest -------------------------------------------------------
+
+    #[test]
+    fn peer_test_msg1_without_hash_roundtrip() {
+        let data = [2u8, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+        let mut body = vec![1u8, 0, 0];
+        body.extend_from_slice(&data);
+        let b = PeerTestBlock::parse(&body).unwrap();
+        assert_eq!(b.msg, 1);
+        assert_eq!(b.code, 0);
+        assert_eq!(b.code_kind(), Some(Ssu2PeerTestCode::Accept));
+        assert_eq!(b.flag, 0);
+        assert_eq!(b.router_hash, None);
+        assert_eq!(b.data, &data);
+        assert_eq!(b.to_body(), body);
+        assert_eq!(PeerTestBlock::TYPE, Ssu2BlockType::PeerTest);
+    }
+
+    #[test]
+    fn peer_test_msg2_with_hash_roundtrip() {
+        let hash = [0x99u8; 32];
+        let data = [0u8; 6];
+        let mut body = vec![2u8, 0, 0];
+        body.extend_from_slice(&hash);
+        body.extend_from_slice(&data);
+        let b = PeerTestBlock::parse(&body).unwrap();
+        assert_eq!(b.msg, 2);
+        assert_eq!(b.router_hash, Some(hash));
+        assert_eq!(b.data, &data);
+        assert_eq!(b.to_body(), body);
+        assert!(PeerTestBlock::has_router_hash(2));
+        assert!(PeerTestBlock::has_router_hash(4));
+        assert!(!PeerTestBlock::has_router_hash(1));
+        assert!(!PeerTestBlock::has_router_hash(3));
+    }
+
+    #[test]
+    fn peer_test_too_short() {
+        assert!(matches!(
+            PeerTestBlock::parse(&[1u8, 0]),
+            Err(I2PError::InvalidLength {
+                expected: 3,
+                got: 2
+            })
+        ));
+        // msg=1 требует 3 + 5 = 8 байт подписанных данных.
+        assert!(matches!(
+            PeerTestBlock::parse(&[1u8, 0, 0, 0, 0, 0, 0]),
+            Err(I2PError::InvalidLength {
+                expected: 8,
+                got: 7
+            })
+        ));
+        // msg=2 требует хеш: 35 + 5 = 40.
+        assert!(matches!(
+            PeerTestBlock::parse(&[2u8, 0, 0]),
+            Err(I2PError::InvalidLength {
+                expected: 40,
+                got: 3
+            })
+        ));
+    }
+
+    // ---- коды ----------------------------------------------------------
+
+    #[test]
+    fn relay_response_code_roundtrip_all() {
+        let known = [0u8, 5, 65, 67, 70];
+        for v in known {
+            let c = Ssu2RelayResponseCode::from_u8(v).unwrap();
+            assert_eq!(c.as_u8(), v);
+            assert_ne!(c.name(), "");
+            assert_eq!(format!("{c}"), c.name());
+        }
+        for v in [1u8, 6, 64, 66, 71, 255] {
+            assert!(Ssu2RelayResponseCode::from_u8(v).is_none(), "code {v}");
+        }
+    }
+
+    #[test]
+    fn peer_test_code_roundtrip_all() {
+        let known = [0u8, 1, 2, 3, 4, 64, 65, 66, 67, 68, 69, 70, 128];
+        for v in known {
+            let c = Ssu2PeerTestCode::from_u8(v).unwrap();
+            assert_eq!(c.as_u8(), v);
+            assert_ne!(c.name(), "");
+            assert_eq!(format!("{c}"), c.name());
+        }
+        for v in [5u8, 63, 71, 127, 129, 255] {
+            assert!(Ssu2PeerTestCode::from_u8(v).is_none(), "code {v}");
+        }
     }
 }

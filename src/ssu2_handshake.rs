@@ -38,9 +38,8 @@
 //!
 //! - TODO(ssu2-scf-multifrag): > 2 фрагментов `SessionConfirmed` (i2pd тоже
 //!   ограничен двумя);
-//! - TODO(ssu2-blocks): разбор `RouterInfo` (подпись, адрес, статический ключ),
-//!   `RelayRequest` / `RelayResponse` / `RelayIntro`, `PeerTest`, `Congestion`,
-//!   `NextNonce`.
+//! - TODO(ssu2-blocks): разбор `RouterInfo` (подпись, адрес, статический
+//!   ключ); `Congestion` (21) и `NextNonce` (11) — формат в i2pd не определён.
 //!
 //! ## Замечание по длине
 //!
