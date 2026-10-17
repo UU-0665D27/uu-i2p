@@ -59,6 +59,17 @@ pub const SSU2_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Таймаут ожидания Termination после его отправки.
 pub const SSU2_TERMINATION_TIMEOUT: Duration = Duration::from_secs(165);
 
+/// Период тика терминации (i2pd `SSU2_TERMINATION_CHECK_TIMEOUT`,
+/// `SSU2.h:29`).
+///
+/// У i2pd по этому тику (`SSU2Server::HandleTerminationTimer`,
+/// `SSU2.cpp:1109`) сессия в состоянии `Closing` получает `Done ()` —
+/// то есть **живёт ещё до одного тика** (23 с + разброс до 5 с,
+/// `SSU2.h:30`) после того, как стороны обменялись `Termination`. Это
+/// окно нужно, чтобы успеть подтвердить (Ack) пакеты, которые собеседник
+/// отправил до того, как узнал о закрытии.
+pub const SSU2_TERMINATION_CHECK_TIMEOUT: Duration = Duration::from_secs(23);
+
 /// Период общей уборки сессий (i2pd `SSU2_CLEANUP_INTERVAL`, `SSU2.h:31`).
 ///
 /// У нас из `SSU2Session::CleanUp` (`SSU2Session.cpp:3440`) воспроизведён один

@@ -39,8 +39,12 @@
 //!   `SessionConfirmed`, совпадение опубликованного `host` с источником).
 //! - **Ограничения на новые сессии** (`m_ReceivedPacketsQueue`,
 //!   `IsInReservedRange`, бан-лист).
-//! - **Ожидание подтверждения при закрытии**: [`Ssu2Pool::close`] забывает
-//!   сессию сразу, а не ждёт `Closing`/`ClosingConfirmed`.
+//! - **Полный обмен `Closing`/`ClosingConfirmed`**: [`Ssu2Pool::close`] шлёт
+//!   `Termination` и сразу сообщает наружу `Disconnected` (сессия исчезает из
+//!   карт и из `session_idents`), но сам `conn_id` ещё
+//!   `SSU2_TERMINATION_CHECK_TIMEOUT` подтверждает чужие пакеты и молча
+//!   игнорирует их содержимое (`Session::drain_until`): у i2pd сессия живёт
+//!   столько же, но он ещё и держит пира в `m_SessionsByRouterHash`.
 //!
 //! Смена пути собеседника (`Path Challenge`/`Path Response`, i2pd
 //! `ProcessData`, `SSU2Session.cpp:1752`) — реализована; из уборки i2pd
@@ -78,8 +82,8 @@ use crate::ssu2_header::{ConnectionId, SSU2_MIN_PACKET_SIZE, SSU2_VERSION, Ssu2M
 use crate::ssu2_lifecycle::Ssu2SessionState;
 use crate::ssu2_policy::{
     DateTimeAction, I2pdCongestionPolicy, I2pdPolicy, SSU2_CLEANUP_INTERVAL, SSU2_MAX_PACKET_SIZE,
-    SSU2_TERMINATION_TIMEOUT, SSU2_TOKEN_EXPIRATION_THRESHOLD, SSU2_TOKEN_EXPIRATION_TIMEOUT,
-    Ssu2Policy,
+    SSU2_TERMINATION_CHECK_TIMEOUT, SSU2_TERMINATION_TIMEOUT, SSU2_TOKEN_EXPIRATION_THRESHOLD,
+    SSU2_TOKEN_EXPIRATION_TIMEOUT, Ssu2Policy,
 };
 use crate::ssu2_send::{RandomSource, append_address};
 use crate::ssu2_token::{Token, TokenSource, TokenStore};
@@ -577,6 +581,24 @@ struct Session {
     path_challenge: Option<(SocketAddr, Duration)>,
     /// I2NP-сообщения, ждущие установления (i2pd `m_IntermediateQueue`).
     queue: VecDeque<I2npMessage>,
+    /// До какого момента «доигрываем» закрытую сессию.
+    ///
+    /// [`PoolState::close_session`] убирает сессию из `by_ident` (и сообщает
+    /// наружу `Disconnected`) сразу, но сам `conn_id` ещё живёт: так мы
+    /// успеваем подтвердить (Ack) пакеты, которые собеседник отправил
+    /// раньше, чем получил `Termination`. i2pd держит такую сессию в
+    /// `Closing` до тика терминации
+    /// ([`SSU2_TERMINATION_CHECK_TIMEOUT`]); без этого его окно
+    /// переполняется (`Outgoing messages queue ... is semi-full`) и
+    /// `Termination` переотправляется до лимита (`Resend`).
+    drain_until: Option<Duration>,
+    /// `Disconnected` по этой сессии уже отправлен.
+    ///
+    /// Один `conn_id` — не более одного события: при закрытии мы сообщаем
+    /// сразу, а когда доигранная сессия наконец исчезает — молчим (иначе
+    /// роутер узнал бы о разрыве дважды, а при быстром переподключении ещё
+    /// и «убил» бы уже новую сессию).
+    disconnected: bool,
 }
 
 /// Состояние задачи пула (всё синхронно).
@@ -687,6 +709,27 @@ impl PoolState {
         }
     }
 
+    /// Тик «доигрывания» закрытой сессии (см.
+    /// [`PoolState::close_session`]).
+    ///
+    /// Сессия уже убрана из `by_ident`, но по `conn_id` ещё живёт: так мы
+    /// успеваем подтвердить пакеты, которые собеседник отправил, не зная о
+    /// нашем `Termination`. i2pd держит `Closing` до тика терминации
+    /// ([`SSU2_TERMINATION_CHECK_TIMEOUT`]).
+    ///
+    /// Возвращает `true`, если сессия доигрывается (или только что убрана):
+    /// остальная часть тика ей не нужна.
+    fn tick_drain(&mut self, key: ConnectionId, now: Duration) -> bool {
+        let Some(until) = self.sessions.get(&key).and_then(|s| s.drain_until) else {
+            return false;
+        };
+        if now >= until {
+            debug!(conn_id = ?key, "tick_drain: close drain expired");
+            self.remove_session(key);
+        }
+        true
+    }
+
     /// Тик одного соединения.
     fn tick_session(&mut self, key: ConnectionId, now: Duration, out: &mut OutQueue) {
         // Connect-таймаут (i2pd `HandleConnectTimer`).
@@ -697,6 +740,13 @@ impl PoolState {
         if expired {
             warn!(conn_id = ?key, "tick_session: connection timed out");
             self.remove_session(key);
+            return;
+        }
+
+        // Сессию, которую мы закрыли (`close_session`), держим до срока
+        // «доигрывания»: она уже не в `by_ident`, но по `conn_id` ещё
+        // принимает и подтверждает чужие пакеты.
+        if self.tick_drain(key, now) {
             return;
         }
 
@@ -1122,6 +1172,8 @@ impl PoolState {
                 outgoing: false,
                 queue: VecDeque::new(),
                 path_challenge: None,
+                drain_until: None,
+                disconnected: false,
             },
         );
         self.deliver(source_conn_id, packet, from, out);
@@ -1224,6 +1276,8 @@ impl PoolState {
                 outgoing: true,
                 queue: VecDeque::new(),
                 path_challenge: None,
+                drain_until: None,
+                disconnected: false,
             },
         );
         self.by_endpoint.insert(remote, source_conn_id);
@@ -1290,7 +1344,28 @@ impl PoolState {
         debug!(ident = %ident.to_base64(), conn_id = ?key, "close_session: closing");
         self.request_termination(key, Ssu2TerminationReason::NormalClose);
         self.send_termination(key, out);
-        self.remove_session(key);
+        // Сессия больше не «сессия этого собеседника»: по ней нельзя
+        // отправлять, новый `connect` её не увидит, а роутер узнаёт о
+        // разрыве сразу. Сам `conn_id` ещё немного живёт
+        // (`drain_until`), чтобы подтвердить чужие пакеты, — как i2pd,
+        // который убирает `Closing`-сессию лишь на тике терминации.
+        let now = now();
+        let remote = self.sessions.get(&key).map(|s| s.remote);
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.drain_until = Some(now + SSU2_TERMINATION_CHECK_TIMEOUT);
+            session.queue.clear();
+        }
+        self.by_ident.remove(ident);
+        // Незавершённое рукопожатие больше не «занимает» адрес: новый
+        // `connect` на тот же endpoint должен пройти (i2pd освобождает
+        // `m_PendingOutgoingSessions` по таймауту, см. `notes/i2pd-bugs.md`,
+        // п. 7).
+        if let Some(remote) = remote
+            && self.by_endpoint.get(&remote) == Some(&key)
+        {
+            self.by_endpoint.remove(&remote);
+        }
+        self.emit_disconnected(key);
         true
     }
 
@@ -1509,46 +1584,24 @@ impl PoolState {
         let Some(ident) = session.ident else {
             return;
         };
+        // Сессия, которую мы уже закрыли: содержимое — не наше дело (роутеру
+        // про неё сказано), но мы продолжаем подтверждать чужие пакеты, чтобы
+        // окно отправки у собеседника не висло.
+        let draining = session.drain_until.is_some();
         if report.invalid_message {
             warn!(ident = %ident.to_base64(), "apply_data_report: invalid block in payload");
         }
-        for message in report.i2np {
-            self.emit(Ssu2Event::Message {
-                from: ident,
-                message,
-            });
-        }
-        for block in report.pending {
-            match block {
-                PendingBlock::RouterInfo(body) => {
-                    // i2pd `HandleRouterInfo` (`SSU2Session.cpp:2001`): тело
-                    // блока = `flags` + `frag` + `RouterInfo` (возможно,
-                    // gzip-сжатый) — снимаем их перед разбором; подпись
-                    // проверяется, как при добавлении в netDb
-                    // (`netdb.AddRouterInfo`).
-                    match RouterInfoBlock::parse(&body).and_then(|block| block.body()) {
-                        Ok(ri_bytes) => match FullRouterInfo::from_buffer(&ri_bytes)
-                            .and_then(|ri| ri.verify(&ri_bytes))
-                        {
-                            Ok(()) => self.emit(Ssu2Event::RouterInfo {
-                                from: ident,
-                                ri_bytes: ri_bytes.into_owned(),
-                            }),
-                            Err(error) => {
-                                warn!(ident = %ident.to_base64(), %error, "apply_data_report: RouterInfo signature rejected");
-                            }
-                        },
-                        Err(error) => {
-                            warn!(ident = %ident.to_base64(), %error, "apply_data_report: malformed RouterInfo block");
-                        }
-                    }
-                }
-                other => {
-                    // TODO(suu2-pool-relay): `RelayRequest`/`RelayResponse`/
-                    // `RelayIntro`/`PeerTest` (i2pd `HandlePayload`).
-                    debug!(ident = %ident.to_base64(), block = ?other, "apply_data_report: block not handled");
-                }
+        if draining {
+            if !report.i2np.is_empty() || !report.pending.is_empty() {
+                trace!(
+                    ident = %ident.to_base64(),
+                    i2np = report.i2np.len(),
+                    blocks = report.pending.len(),
+                    "apply_data_report: session is closing; payload content ignored"
+                );
             }
+        } else {
+            self.handle_payload_content(ident, report.i2np, report.pending);
         }
         if let Some((expires, token)) = report.new_token {
             debug!(token, %remote, "apply_data_report: new outgoing token");
@@ -1595,7 +1648,20 @@ impl PoolState {
             }
             Some(TerminationAction::CloseNow) => {
                 debug!(ident = %ident.to_base64(), "apply_data_report: peer closed the session");
-                self.remove_session(key);
+                // i2pd здесь просто `Done ()` — без Ack, из-за чего его
+                // собственный `Termination` остаётся неподтверждённым и
+                // переотправляется до лимита (`Resend`: «Packet was not
+                // Acked after 6 attempts»). Отвечаем Ack'ом: собеседник
+                // закрывает сессию спокойно. (`data_received` для блока
+                // `Termination` не выставляется — подтверждаем всегда.)
+                self.send_quick_ack(key, out);
+                // Свою сессию (мы её закрыли первыми) не убираем сразу:
+                // собеседник ещё в `Closing` и продолжает писать в неё —
+                // пусть его пакеты будут подтверждены. Сессию доберёт
+                // `tick_drain`.
+                if !draining {
+                    self.remove_session(key);
+                }
                 return;
             }
             Some(TerminationAction::RecordReason(reason)) => {
@@ -1609,6 +1675,54 @@ impl PoolState {
         let sent = self.flush_session(key, out);
         if report.data_received && !sent {
             self.send_quick_ack(key, out);
+        }
+    }
+
+    /// Содержимое payload'а, которое обрабатывает вызывающий (в i2pd —
+    /// уровень роутера): I2NP-сообщения и блоки вроде `RouterInfo`.
+    fn handle_payload_content(
+        &self,
+        ident: IdentHash,
+        i2np: Vec<I2npMessage>,
+        pending: Vec<PendingBlock>,
+    ) {
+        for message in i2np {
+            self.emit(Ssu2Event::Message {
+                from: ident,
+                message,
+            });
+        }
+        for block in pending {
+            match block {
+                PendingBlock::RouterInfo(body) => {
+                    // i2pd `HandleRouterInfo` (`SSU2Session.cpp:2001`): тело
+                    // блока = `flags` + `frag` + `RouterInfo` (возможно,
+                    // gzip-сжатый) — снимаем их перед разбором; подпись
+                    // проверяется, как при добавлении в netDb
+                    // (`netdb.AddRouterInfo`).
+                    match RouterInfoBlock::parse(&body).and_then(|block| block.body()) {
+                        Ok(ri_bytes) => match FullRouterInfo::from_buffer(&ri_bytes)
+                            .and_then(|ri| ri.verify(&ri_bytes))
+                        {
+                            Ok(()) => self.emit(Ssu2Event::RouterInfo {
+                                from: ident,
+                                ri_bytes: ri_bytes.into_owned(),
+                            }),
+                            Err(error) => {
+                                warn!(ident = %ident.to_base64(), %error, "handle_payload_content: RouterInfo signature rejected");
+                            }
+                        },
+                        Err(error) => {
+                            warn!(ident = %ident.to_base64(), %error, "handle_payload_content: malformed RouterInfo block");
+                        }
+                    }
+                }
+                other => {
+                    // TODO(suu2-pool-relay): `RelayRequest`/`RelayResponse`/
+                    // `RelayIntro`/`PeerTest` (i2pd `HandlePayload`).
+                    debug!(ident = %ident.to_base64(), block = ?other, "handle_payload_content: block not handled");
+                }
+            }
         }
     }
 
@@ -1760,32 +1874,48 @@ impl PoolState {
 
     /// Убирает соединение с причиной и сообщает наружу.
     fn remove_session_reason(&mut self, key: ConnectionId, reason: Ssu2TerminationReason) {
-        let Some(session) = self.sessions.remove(&key) else {
+        let Some(session) = self.sessions.get(&key) else {
             return;
         };
-        if self.by_endpoint.get(&session.remote) == Some(&key) {
-            self.by_endpoint.remove(&session.remote);
-        }
+        let remote = session.remote;
         let ident = session.ident;
-        if let Some(ident) = ident
-            && self.by_ident.get(&ident) == Some(&key)
-        {
-            self.by_ident.remove(&ident);
-        }
-        if !session.queue.is_empty() {
+        let state = session.conn.state();
+        let queued = session.queue.len();
+        if queued > 0 {
             debug!(
                 conn_id = ?key,
-                queued = session.queue.len(),
-                "remove_session: dropping queued messages"
+                queued, "remove_session: dropping queued messages"
             );
         }
         debug!(
             conn_id = ?key,
             ?reason,
-            state = session.conn.state().name(),
+            state = state.name(),
             "remove_session: session removed"
         );
-        if let Some(ident) = ident {
+        // Событие — до удаления: сессия нужна, чтобы знать `ident`.
+        self.emit_disconnected(key);
+        self.sessions.remove(&key);
+        if self.by_endpoint.get(&remote) == Some(&key) {
+            self.by_endpoint.remove(&remote);
+        }
+        if let Some(ident) = ident
+            && self.by_ident.get(&ident) == Some(&key)
+        {
+            self.by_ident.remove(&ident);
+        }
+    }
+
+    /// Сообщает наружу, что сессии больше нет (по одной сессии — один раз).
+    fn emit_disconnected(&mut self, key: ConnectionId) {
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        if session.disconnected {
+            return;
+        }
+        session.disconnected = true;
+        if let Some(ident) = session.ident {
             self.emit(Ssu2Event::Disconnected { ident });
         }
     }

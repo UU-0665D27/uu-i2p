@@ -334,6 +334,65 @@ async fn reconnect_after_close() {
     assert_ne!(alice_ident, bob_ident);
 }
 
+/// `close` сразу говорит роутеру `Disconnected` (и ровно один раз), а сама
+/// сессия ещё немного «доигрывается» по `conn_id` (`Session::drain_until`):
+/// собеседнику подтверждают его пакеты, чтобы окно отправки не висело.
+///
+/// Наружу это не видно: пира нет ни в `session_idents`, ни в `send_to`,
+/// а в потоке событий во время доигрывания — тишина.
+#[tokio::test]
+async fn close_emits_disconnected_once_and_frees_the_peer() {
+    init_tracing();
+    let alice = make_node().await;
+    let bob = make_node().await;
+    let bob_ident = *bob.pool.ident();
+    let mut alice_events: Vec<Ssu2Event> = Vec::new();
+
+    let ident = alice.pool.connect(&bob.ri).await.expect("connect");
+    assert_eq!(ident, bob_ident);
+
+    assert!(alice.pool.close(&ident).await.expect("close"));
+    let event = wait_event(&alice.pool, &mut alice_events, "alice Disconnected", |e| {
+        matches!(e, Ssu2Event::Disconnected { .. })
+    })
+    .await;
+    assert_eq!(event, Ssu2Event::Disconnected { ident: bob_ident });
+
+    assert!(
+        alice
+            .pool
+            .session_idents()
+            .await
+            .expect("sessions")
+            .is_empty(),
+        "закрытый пир не должен остаться в сессиях пула"
+    );
+    assert!(
+        !alice.pool.close(&ident).await.expect("close again"),
+        "второй раз закрывать нечего"
+    );
+    let error = alice
+        .pool
+        .send_to(&ident, message(1, b"hi"))
+        .await
+        .expect_err("no session");
+    assert!(
+        error.to_string().contains("no session"),
+        "unexpected error: {error}"
+    );
+
+    // Доигрывание молчаливое: второго `Disconnected` (или чего-то ещё) быть
+    // не должно, хотя собеседник ещё пишет в эту сессию.
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < deadline {
+        match timeout(Duration::from_millis(150), alice.pool.next_event()).await {
+            Ok(Ok(event)) => panic!("unexpected event during drain: {event:?}"),
+            Ok(Err(error)) => panic!("pool died: {error}"),
+            Err(_) => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn connect_to_explicit_address() {
     init_tracing();
