@@ -24,7 +24,7 @@
 //! HKDF-Extract с пустым `ikm` и последующим Expand — именно так работает
 //! [`crate::crypto::hkdf`] при `key = &[]`.
 
-use crate::crypto::{hkdf, NoiseSymmetricState};
+use crate::crypto::{NoiseSymmetricState, hkdf};
 
 /// Информационная строка KDF для `k_header_2` сообщения `SessionCreated`.
 const INFO_SESS_CREATE_HEADER: &[u8] = b"SessCreateHeader";

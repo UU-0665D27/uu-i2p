@@ -362,9 +362,12 @@ impl ParticipatingTunnel {
     /// Читает нашу запись из тела ответа и возвращает её в
     /// «слоёном» виде, чтобы предыдущий хоп её снял.
     fn read_reply(&self, body: &mut ShortTunnelBuildBody) -> Result<ShortBuildResponseRecord> {
-        let record = body.records.get_mut(self.record_index).ok_or(
-            I2PError::Malformed("tunnel build reply: record index out of range"),
-        )?;
+        let record = body
+            .records
+            .get_mut(self.record_index)
+            .ok_or(I2PError::Malformed(
+                "tunnel build reply: record index out of range",
+            ))?;
         let response = decrypt_reply_record(&self.keys, self.record_index, record)?;
         apply_reply_layer(&self.keys.reply_key, self.record_index, record)?;
         Ok(response)
@@ -377,7 +380,8 @@ impl ParticipatingTunnel {
 /// поэтому складываем с `request_expiration_secs` без привязки к
 /// локальным часам.
 fn tunnel_expiry_ms(request: &ShortBuildRequestRecord) -> u64 {
-    u64::from(request.request_time_minutes) * 60_000 + u64::from(request.request_expiration_secs) * 1_000
+    u64::from(request.request_time_minutes) * 60_000
+        + u64::from(request.request_expiration_secs) * 1_000
 }
 
 /// Завернулывает тело ответа в I2NP-сообщение с заданным `msg_id`.
@@ -515,8 +519,7 @@ impl TunnelParticipation {
         }
 
         let receive_tunnel = request.receive_tunnel;
-        let tunnel =
-            ParticipatingTunnel::new(&request, keys, index, *from, role, now_ms);
+        let tunnel = ParticipatingTunnel::new(&request, keys, index, *from, role, now_ms);
         self.tunnels.insert(receive_tunnel, tunnel);
         self.by_msg_id.insert(send_msg_id, receive_tunnel);
         log_accepted(role, receive_tunnel, request.next_tunnel);

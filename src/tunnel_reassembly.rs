@@ -189,7 +189,10 @@ impl FragmentReassembler {
                 msg_id: Some(msg_id),
             } => {
                 if self.partial.contains_key(msg_id) {
-                    trace!(msg_id, "fragment reassembly: duplicate first fragment; ignored");
+                    trace!(
+                        msg_id,
+                        "fragment reassembly: duplicate first fragment; ignored"
+                    );
                     return;
                 }
                 if self.partial.len() >= MAX_PARTIAL_MESSAGES {
@@ -242,13 +245,15 @@ impl FragmentReassembler {
         if fragment_num == 0 || fragment_num > MAX_FRAGMENT_NUMBER {
             trace!(
                 msg_id,
-                fragment_num,
-                "fragment reassembly: invalid fragment number; ignored"
+                fragment_num, "fragment reassembly: invalid fragment number; ignored"
             );
             return;
         }
         if !self.partial.contains_key(&msg_id) {
-            trace!(msg_id, fragment_num, "fragment reassembly: orphan follow-on; ignored");
+            trace!(
+                msg_id,
+                fragment_num, "fragment reassembly: orphan follow-on; ignored"
+            );
             return;
         }
 
@@ -259,8 +264,7 @@ impl FragmentReassembler {
             if partial.parts.contains_key(&fragment_num) {
                 trace!(
                     msg_id,
-                    fragment_num,
-                    "fragment reassembly: duplicate fragment; ignored"
+                    fragment_num, "fragment reassembly: duplicate fragment; ignored"
                 );
                 return;
             }
@@ -361,7 +365,10 @@ impl FragmentReassembler {
             .retain(|_, p| now_ms.saturating_sub(p.started_ms) <= PARTIAL_MESSAGE_EXPIRATION_MS);
         let removed = before - self.partial.len();
         if removed > 0 {
-            debug!(removed, "fragment reassembly: expired partial messages dropped");
+            debug!(
+                removed,
+                "fragment reassembly: expired partial messages dropped"
+            );
         }
         removed
     }
