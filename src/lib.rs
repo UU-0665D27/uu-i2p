@@ -46,6 +46,8 @@ pub mod tunnel_build_crypto;
 pub mod tunnel_build_message;
 pub mod tunnel_build_record;
 pub mod tunnel_config;
+pub mod tunnel_fragments;
+pub mod tunnel_gateway;
 pub mod tunnel_layer;
 pub mod tunnel_messages;
 pub mod variable_tunnel_build;
