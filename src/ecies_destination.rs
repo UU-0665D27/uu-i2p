@@ -36,6 +36,7 @@ use crate::{
     crypto::I2PX25519Keys,
     ecies_ratchet::{RatchetSession, SessionState},
     error::{I2PError, Result},
+    garlic_block::GarlicBlock,
 };
 use std::collections::HashMap;
 
@@ -143,10 +144,26 @@ impl EciesGarlicDestination {
         now_ms: u64,
         cloves: &[EciesGarlicClove],
     ) -> Result<Vec<u8>> {
+        self.send_blocks_extra(remote_static, now_ms, cloves, &[])
+    }
+
+    /// То же, что [`Self::send_blocks`], но с дополнительными
+    /// garlic-блоками — см. [`RatchetSession::wrap_blocks_extra`].
+    ///
+    /// # Errors
+    ///
+    /// Ошибки [`RatchetSession::wrap_blocks_extra`].
+    pub fn send_blocks_extra(
+        &mut self,
+        remote_static: [u8; 32],
+        now_ms: u64,
+        cloves: &[EciesGarlicClove],
+        extra: &[GarlicBlock],
+    ) -> Result<Vec<u8>> {
         let session = self.sessions.entry(remote_static).or_insert_with(|| {
             RatchetSession::new_initiator(clone_x25519_keys(&self.local_static), remote_static)
         });
-        session.wrap_blocks(now_ms, cloves)
+        session.wrap_blocks_extra(now_ms, cloves, extra)
     }
 
     /// `msgID`, подтверждённые пиром (пришли в `Ack`-блоках) —

@@ -1188,7 +1188,31 @@ impl RatchetSession {
     /// - [`Error::Malformed`] — состояние не позволяет отправить;
     /// - ошибки сериализации блоков и AEAD.
     pub fn wrap_blocks(&mut self, now_ms: u64, cloves: &[EciesGarlicClove]) -> Result<Vec<u8>> {
-        let mut blocks: Vec<GarlicBlock> = Vec::with_capacity(cloves.len() + 3);
+        self.wrap_blocks_extra(now_ms, cloves, &[])
+    }
+
+    /// То же, что [`Self::wrap_blocks`], но с дополнительными блоками
+    /// `extra`, которые ставятся **сразу после clove'ов** и до
+    /// служебных `Ack`/`NextKey`.
+    ///
+    /// Нужен для проверок на живом i2pd (POC вредоносных блоков):
+    /// так можно гарантировать, что наш блок окажется первым блоком
+    /// своего типа в payload'е, раньше автоматических `NextKey`.
+    ///
+    /// Порядок: `AckRequest`, cloves, `extra`, `Ack`, `NextKey`
+    /// (reverse, затем forward) — та же схема, что в
+    /// [`Self::wrap_blocks`], только с врезкой.
+    ///
+    /// # Errors
+    ///
+    /// См. [`Self::wrap_blocks`].
+    pub fn wrap_blocks_extra(
+        &mut self,
+        now_ms: u64,
+        cloves: &[EciesGarlicClove],
+        extra: &[GarlicBlock],
+    ) -> Result<Vec<u8>> {
+        let mut blocks: Vec<GarlicBlock> = Vec::with_capacity(cloves.len() + extra.len() + 3);
 
         // `AckRequest` — i2pd пишет его **перед** clove'ом
         // (`CreatePayload`, `:1240`).
@@ -1199,6 +1223,7 @@ impl RatchetSession {
         for clove in cloves {
             blocks.push(GarlicBlock::EciesGarlicClove(clove.clone()));
         }
+        blocks.extend_from_slice(extra);
 
         // `Ack` — после clove'а (`CreatePayload`, `:1246`); очередь пар
         // опустошается: повторять `Ack` без нового `AckRequest` не нужно.
@@ -1524,4 +1549,56 @@ impl RatchetSession {
     pub fn current_receive_tagset(&self) -> Option<&RatchetTagSet> {
         self.receive_tagsets.last()
     }
+}
+
+/// Оборачивает garlic-clove'ы в «симметричное» ECIES-garlic сообщение —
+/// ответ на `DatabaseLookup`, в котором запрашивающий заранее прислал
+/// одноразовый симметричный ключ и тег (`replyKey` / `replyTag`).
+///
+/// Зеркало `WrapECIESX25519Message` из i2pd
+/// (`ECIESX25519AEADRatchetSession.cpp`): так floodfill отвечает на
+/// зашифрованный lookup, не устанавливая сессию:
+///
+/// ```text
+///   tag(8) || AEAD_ChaCha20Poly1305(blocks, key, nonce = 0, AD = tag)
+/// ```
+///
+/// `tag` пишется в host-порядке (i2pd делает `memcpy` из `uint64_t`,
+/// т.е. little-endian на всех поддерживаемых платформах) — так же, как
+/// его ищет `GarlicDestination::HandleECIESx25519TagMessage`.
+///
+/// Получатель (`SymmetricKeyTagSet::HandleNextMessage`) расшифровывает
+/// payload тем же ключом и требует, чтобы **первым** блоком был clove;
+/// `DateTime`/`Padding` i2pd сюда не пишет, не пишем и мы.
+///
+/// # Errors
+///
+/// Ошибки [`serialize_blocks`] и AEAD.
+pub fn wrap_symmetric_message(
+    key: &[u8; 32],
+    tag: u64,
+    cloves: &[EciesGarlicClove],
+) -> Result<Vec<u8>> {
+    let blocks: Vec<GarlicBlock> = cloves
+        .iter()
+        .map(|c| GarlicBlock::EciesGarlicClove(c.clone()))
+        .collect();
+    let plaintext = serialize_blocks(&blocks)?;
+
+    let tag_bytes = tag.to_le_bytes();
+    let nonce = [0u8; 12];
+    let mut ciphertext = vec![0u8; plaintext.len() + 16];
+    let len = AeadChaCha20Poly1305::new().encrypt(
+        key,
+        &nonce,
+        &tag_bytes,
+        &plaintext,
+        &mut ciphertext,
+    )?;
+    ciphertext.truncate(len);
+
+    let mut wire = Vec::with_capacity(8 + ciphertext.len());
+    wire.extend_from_slice(&tag_bytes);
+    wire.extend_from_slice(&ciphertext);
+    Ok(wire)
 }
