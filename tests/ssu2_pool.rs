@@ -354,3 +354,46 @@ async fn connect_to_explicit_address() {
     .await;
     assert_eq!(established, Ssu2Event::Established { ident: bob_ident });
 }
+
+/// Пока `SessionCreated` не принят, endpoint занят исходящей сессией
+/// (i2pd `m_PendingOutgoingSessions` + `CheckPendingOutgoingSession`,
+/// `SSU2.cpp:865`), а после смерти сессии — освобождается.
+///
+/// Второй конец здесь — сокет, который никогда не отвечает: так сессия
+/// детерминированно остаётся в `SessionRequestSent`.
+#[tokio::test]
+async fn pending_endpoint_blocks_duplicate_connect_until_session_dies() {
+    init_tracing();
+    let alice = make_node().await;
+    let peer1 = make_node_advertising(None).await;
+    let peer2 = make_node_advertising(None).await;
+    let silent = UdpSocket::bind("127.0.0.1:0").await.expect("bind silent");
+    let silent_addr = silent.local_addr().expect("local_addr");
+
+    let ident1 = alice
+        .pool
+        .connect_to(&peer1.ri, silent_addr)
+        .await
+        .expect("first connect_to");
+    assert_eq!(ident1, *peer1.pool.ident());
+
+    let error = alice
+        .pool
+        .connect_to(&peer2.ri, silent_addr)
+        .await
+        .expect_err("endpoint is already pending");
+    assert!(
+        error.to_string().contains("already pending"),
+        "unexpected error: {error}"
+    );
+
+    // Сессия умерла до `SessionCreated` — запись освобождается
+    // (`remove_session`; i2pd так не делает, см. `notes/i2pd-bugs.md`, п. 7).
+    assert!(alice.pool.close(&ident1).await.expect("close"));
+    let ident2 = alice
+        .pool
+        .connect_to(&peer2.ri, silent_addr)
+        .await
+        .expect("second connect_to");
+    assert_eq!(ident2, *peer2.pool.ident());
+}

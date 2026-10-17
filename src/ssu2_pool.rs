@@ -814,6 +814,15 @@ impl PoolState {
         let Some(mut session) = self.sessions.remove(&key) else {
             return;
         };
+        // i2pd `SSU2Server::ProcessNextPacket` (`SSU2.cpp:758-763`) держит
+        // исходящую сессию в `m_PendingOutgoingSessions` по адресу ровно до
+        // успешного `ProcessSessionCreated`: тот добавляет сессию в
+        // `m_Sessions` (по `destConnID`, `SSU2Session.cpp:1125`), а запись по
+        // адресу сразу стирается («we are done with that endpoint»).
+        // У нас `sessions` ключуется нашим `sourceConnID` с самого начала, так
+        // что `by_endpoint` — только тот же «адрес до `SessionCreated`».
+        let awaiting_session_created = session.conn.role() == HandshakeRole::Initiator
+            && session.conn.state() == Ssu2SessionState::SessionRequestSent;
         let env = ResponderEnv {
             expected_token,
             address: Some(address),
@@ -831,7 +840,20 @@ impl PoolState {
             .recv(&policy, &congestion, packet, &mut ctx, &env)
         {
             Ok(report) => {
+                // Переход из `SessionRequestSent` в следующее состояние — это и
+                // есть принятый `SessionCreated` (`Retry` возвращает сессию в
+                // `SessionRequestSent` после `send_session_request`).
+                let session_created = awaiting_session_created
+                    && session.conn.state() != Ssu2SessionState::SessionRequestSent;
                 self.sessions.insert(key, session);
+                if session_created && self.by_endpoint.get(&from) == Some(&key) {
+                    self.by_endpoint.remove(&from);
+                    debug!(
+                        %from,
+                        conn_id = ?key,
+                        "deliver: SessionCreated accepted; endpoint entry dropped"
+                    );
+                }
                 self.apply_report(key, report, out);
             }
             Err(error) => {
@@ -1243,7 +1265,9 @@ impl PoolState {
                 session.queue.drain(..).collect::<Vec<I2npMessage>>(),
             )
         };
-        self.by_endpoint.remove(&remote);
+        // `by_endpoint` уже очищен при приёме `SessionCreated` (см. `deliver`),
+        // как в i2pd; `remove_session` вычистит запись, если сессия умерла
+        // раньше.
         if let Some(ident) = ident {
             debug!(ident = %ident.to_base64(), conn_id = ?key, "on_established: established");
             self.emit(Ssu2Event::Established { ident });

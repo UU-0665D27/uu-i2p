@@ -119,6 +119,37 @@
   `session_confirmed_header_key()`) — иначе расходились бы с i2pd; там же
   отмечено `// TODO` на исправленный вариант.
 
+## 7. SSU2: запись `m_PendingOutgoingSessions` переживает неудачное подключение
+
+- Файлы: `SSU2.cpp`, `RemoveSession` (`:504`), `HandleConnectTimer` /
+  `Terminate` (`SSU2Session.cpp:146`, `:279`), разбор в `SSU2Server::ProcessNextPacket`
+  (`:755-766`), очистка в `HandleTerminationTimer` (`SSU2.cpp:1094-1105`).
+- Исходящая сессия живёт в `m_PendingOutgoingSessions` (ключ — endpoint) до
+  принятого `SessionCreated`. Запись удаляется ровно в двух местах: успешный
+  `ProcessSessionCreated` (`SSU2.cpp:762`) и `HandleTerminationTimer`, когда
+  `IsTerminationTimeoutExpired` (`:1099`).
+- Connect-таймаут (`SSU2_CONNECT_TIMEOUT`, 5 с) зовёт `Terminate()`, тот —
+  `m_Server.RemoveSession (m_SourceConnID)` (`SSU2Session.cpp:308`), а
+  `RemoveSession` чистит только `m_Sessions`; `m_PendingOutgoingSessions` не
+  трогает. (`HandleTerminationTimer` рядом специально закомментировал
+  `Terminate()` — расчёт на то, что запись уберёт метла.)
+- Метла (`HandleTerminationTimer`) ходит раз в `SSU2_TERMINATION_CHECK_TIMEOUT`
+  (23 с) ± 5 с, а порог для ещё не установленной сессии — тот же
+  `SSU2_CONNECT_TIMEOUT` (5 с: базовый конструктор `TransportSession` получает
+  его как termination timeout, `Established()` поднимает до
+  `SSU2_TERMINATION_TIMEOUT` только после установления).
+- Последствие: после одной неудачной попытки подключения (`CreateSession` →
+  таймаут) запись живёт ещё ~23-28 с, и всё это время
+  `CheckPendingOutgoingSession` (`SSU2.cpp:865`) заставляет `CreateSession`
+  для того же endpoint вернуть `false`, а входящие пакеты с этого endpoint
+  уходят в уже завершённую сессию (`ProcessRetry`), а не в новую. То есть
+  повторное подключение к узлу откладывается на десятки секунд.
+- Статус: в локальном клоне (`79ae673d`) не исправлено.
+- У нас: `remove_session` чистит `by_endpoint`/`by_ident` вместе с сессией, так
+  что endpoint освобождается сразу; зафиксировано тестом
+  `pending_endpoint_blocks_duplicate_connect_until_session_dies`
+  (`tests/ssu2_pool.rs`).
+
 ---
 
 ## Шаблон новой записи
