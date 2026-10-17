@@ -40,6 +40,8 @@ pub mod router_info_address;
 pub mod short_tunnel_build;
 pub mod signature;
 pub mod siphash;
+pub mod ssu2_crypto;
+pub mod ssu2_header;
 pub mod tag;
 pub mod timestamp;
 pub mod tunnel_build_crypto;
@@ -50,6 +52,8 @@ pub mod tunnel_fragments;
 pub mod tunnel_gateway;
 pub mod tunnel_layer;
 pub mod tunnel_messages;
+pub mod tunnel_participating;
+pub mod tunnel_reassembly;
 pub mod variable_tunnel_build;
 
 pub use config::{
@@ -107,6 +111,16 @@ pub use tunnel_build_record::{
 pub use tunnel_config::{TunnelConfig, TunnelHopConfig};
 pub use tunnel_layer::{TUNNEL_LAYER_SIZE, TunnelDecryption, TunnelEncryption, TunnelLayerChain};
 pub use tunnel_messages::{TunnelDataBody, TunnelGatewayBody, TunnelTestBody};
+pub use tunnel_participating::{
+    BUILD_RET_EXPIRED, BUILD_RET_NO_NEXT_TUNNEL_IDREQ, BUILD_RET_NO_TUNNEL_IDREQ,
+    BUILD_RET_TUNNEL_ID_EXISTS, BuildHandling, DEFAULT_AVAILABLE_BANDWIDTH_KB,
+    MAX_PARTICIPATING_TUNNELS, ParticipatingTunnel, ReplyHandling, TunnelDataAction,
+    TunnelParticipation, TunnelRole,
+};
+pub use tunnel_reassembly::{
+    FragmentReassembler, MAX_PARTIAL_MESSAGES, MAX_REASSEMBLED_MESSAGE_SIZE,
+    PARTIAL_MESSAGE_EXPIRATION_MS,
+};
 pub use variable_tunnel_build::{EncryptedLongRecord, VariableTunnelBuildBody};
 
 /// Версия библиотеки.

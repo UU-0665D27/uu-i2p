@@ -18,6 +18,8 @@ pub enum I2PError {
     UnknownNtcp2BlockType(u8),
     /// Неизвестный NTCP2 termination reason.
     UnknownNtcp2TerminationReason(u8),
+    /// Неизвестный тип сообщения SSU2.
+    UnknownSsu2MessageType(u8),
     /// Неизвестный signing key type.
     UnknownSigningKeyType(u16),
     /// Неизвестный crypto key type.
@@ -52,6 +54,9 @@ impl fmt::Display for I2PError {
             }
             Self::UnknownNtcp2TerminationReason(v) => {
                 write!(f, "unknown NTCP2 termination reason: {v}")
+            }
+            Self::UnknownSsu2MessageType(v) => {
+                write!(f, "unknown SSU2 message type: {v}")
             }
             Self::UnknownSigningKeyType(v) => {
                 write!(f, "unknown signing key type: {v}")
