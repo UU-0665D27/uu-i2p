@@ -1,19 +1,39 @@
-//! `ECIES-X25519-AEAD-Ratchet` — установление сессии (NS/NSR).
+//! `ECIES-X25519-AEAD-Ratchet` — установление сессии (NS/NSR) и
+//! existing session messages.
 //!
-//! Реализована первая фаза протокола — **New Session** (Alice → Bob)
-//! и **New Session Reply** (Bob → Alice). После успешного обмена
-//! стороны получают tag-set'ы для приёма/отправки existing session
-//! messages (шаг 2x-3b).
+//! Реализованы все три фазы: **New Session** (Alice → Bob), **New
+//! Session Reply** (Bob → Alice) и обмен сообщениями под session tag
+//! (шаг 2x-3b), включая DH-ratchet (`NextKey`) и подтверждения
+//! (`Ack`/`AckRequest`, см. ниже).
+//!
+//! ## `Ack` / `AckRequest`
+//!
+//! Копия `CreatePayload`/`HandlePayload` из i2pd
+//! (`ECIESX25519AEADRatchetSession.cpp`):
+//!
+//! - принятый `AckRequest` запоминает **то** сообщение, в котором он
+//!   пришёл (`(tagset_id, index)`) — на него уйдёт `Ack`
+//!   (`MessageConfirmed` наоборот, `:442`);
+//! - принятый `Ack` подтверждает наши `msgID`
+//!   `(tagset_id << 16) | index` — см. [`RatchetSession::take_confirmed_msg_ids`]
+//!   (`:420`, `MessageConfirmed`, `:242`);
+//! - свой `AckRequest` шлём не чаще `DEFAULT_ACK_REQUEST_INTERVAL_MS`,
+//!   неподтверждённый повторяем через `ACK_REQUEST_RETRY_TIMEOUT_MS`
+//!   (`CreatePayload`, `:1186`).
+//!
+//! `msgID` сообщения совпадает с парой `(tagset_id, index)`, которую
+//! видит получатель: обе стороны считают `index` как номер тега в
+//! tag-set'е ([`RatchetTagSet::msg_id`]).
 //!
 //! ## Что не реализовано
 //!
-//! - **Elligator2** — i2pd кодирует ephemeral public key через
-//!   Elligator, чтобы он выглядел как случайный шум. Мы пока передаём
-//!   raw 32-байтовый X25519 pub key.
 //! - **ML-KEM hybrid** — i2pd поддерживает ML-KEM-512/768/1024 в NS
 //!   как второй слой. Мы только X25519.
-//! - **Existing session messages** — сообщения под session tag.
-//!   Отдельный шаг.
+//! - **Подтверждение доставки `LeaseSet`** — в i2pd `AckRequest` для
+//!   `LeaseSet` ставит `GetLeaseSetUpdateStatus() == eLeaseSetUpdated`
+//!   (`CreatePayload`, `:1176`); наши сессии LeaseSet-блок не носят
+//!   (публикация lease set'ов в garlic пока не сделана), поэтому
+//!   работает только «обычная» ветка запроса.
 //!
 //! ## Wire-формат
 //!
@@ -33,6 +53,27 @@ use crate::{
     ratchet_tagset::RatchetTagSet,
 };
 use std::collections::HashMap;
+use tracing::debug;
+
+/// Интервал обычных `AckRequest`, мс — i2pd
+/// `ECIESX25519_DEFAULT_ACK_REQUEST_INTERVAL`
+/// (`ECIESX25519AEADRatchetSession.h:38`).
+pub const DEFAULT_ACK_REQUEST_INTERVAL_MS: u64 = 33_000;
+
+/// Если подтверждение не пришло за это время, `AckRequest` повторяем
+/// (i2pd `LEASESET_CONFIRMATION_TIMEOUT`, `Garlic.h:56`).
+pub const ACK_REQUEST_RETRY_TIMEOUT_MS: u64 = 4000;
+
+/// Сколько раз повторять `AckRequest` для одного `msgID` (i2pd
+/// `ECIESX25519_ACK_REQUEST_MAX_NUM_ATTEMPTS`, `:39`).
+pub const ACK_REQUEST_MAX_NUM_ATTEMPTS: u32 = 3;
+
+/// Сколько подтверждённых `msgID` держим до вычитывания вызывающим.
+///
+/// i2pd не хранит их вовсе (только чистит свой `m_AckRequestMsgID`);
+/// список нужен, чтобы отдать подтверждение наружу, и ограничен, чтобы
+/// поток `Ack` не рос неограниченно.
+const CONFIRMED_MSG_IDS_CAP: usize = 64;
 
 /// Состояние сессии на этапе установления.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +189,32 @@ pub struct RatchetSession {
     /// сессию — она больше не принимает и не отправляет существующие
     /// сессионные сообщения (кроме Termination-блока).
     is_terminated: bool,
+
+    /// Пары `(tagset_id, index)` принятых сообщений, на которые пир
+    /// просил `Ack` — i2pd `m_AckRequests`.
+    ///
+    /// Опустошается при сборке очередного сообщения: блок `Ack` уходит
+    /// один раз (`CreatePayload`, `:1246`).
+    ack_requests: Vec<(u16, u16)>,
+    /// `msgID` (`(tagset_id << 16) | index`) сообщения, подтверждение
+    /// которого мы ждём — i2pd `m_AckRequestMsgID`. `0` — не ждём.
+    ack_request_msg_id: u32,
+    /// Сколько раз мы просили подтверждение для текущего `msgID` —
+    /// i2pd `m_AckRequestNumAttempts`.
+    ack_request_attempts: u32,
+    /// Когда отправили `AckRequest` в последний раз, мс since epoch —
+    /// i2pd `m_LastAckRequestSendTime`.
+    last_ack_request_sent_ms: u64,
+    /// Интервал обычных `AckRequest`, мс — i2pd `m_AckRequestInterval`.
+    ack_request_interval_ms: u64,
+    /// `(tagset_id, index)` последнего принятого existing-session
+    /// сообщения — из него собирается пара для `Ack` (i2pd
+    /// `HandlePayload` кладёт `receiveTagset->GetTagSetID (), index`).
+    last_received: Option<(u16, u16)>,
+    /// `msgID`, подтверждённые пришедшими `Ack` — i2pd
+    /// `MessageConfirmed`. Отдаются наружу через
+    /// [`Self::take_confirmed_msg_ids`].
+    confirmed_msg_ids: Vec<u32>,
 }
 
 impl RatchetSession {
@@ -196,6 +263,13 @@ impl RatchetSession {
             send_forward_key: false,
             send_reverse_key: false,
             is_terminated: false,
+            ack_requests: Vec::new(),
+            ack_request_msg_id: 0,
+            ack_request_attempts: 0,
+            last_ack_request_sent_ms: 0,
+            ack_request_interval_ms: DEFAULT_ACK_REQUEST_INTERVAL_MS,
+            last_received: None,
+            confirmed_msg_ids: Vec::new(),
         }
     }
 
@@ -218,6 +292,13 @@ impl RatchetSession {
             send_forward_key: false,
             send_reverse_key: false,
             is_terminated: false,
+            ack_requests: Vec::new(),
+            ack_request_msg_id: 0,
+            ack_request_attempts: 0,
+            last_ack_request_sent_ms: 0,
+            ack_request_interval_ms: DEFAULT_ACK_REQUEST_INTERVAL_MS,
+            last_received: None,
+            confirmed_msg_ids: Vec::new(),
         }
     }
 
@@ -1031,7 +1112,15 @@ impl RatchetSession {
             self.state = SessionState::Established;
         }
 
-        // 6. Пополняем карту.
+        // 6. Запоминаем, на какое сообщение отвечать `Ack`, если в
+        //    payload'е окажется `AckRequest` — i2pd кладёт в
+        //    `m_AckRequests` ровно эту пару (`HandlePayload`,
+        //    `:442`).
+        let index_pair = u16::try_from(index)
+            .map_err(|_| I2PError::Malformed("ecies_ratchet: tag index out of range"))?;
+        self.last_received = Some((tagset_id, index_pair));
+
+        // 7. Пополняем карту.
         self.refill_receive_tags()?;
         Ok(payload)
     }
@@ -1080,10 +1169,13 @@ impl RatchetSession {
 
     /// Оборачивает список clove'ов в wire-сообщение.
     ///
-    /// Каждый clove превращается в `GarlicBlock::GarlicClove`; кроме
-    /// них, метод добавляет служебные блоки (`Ack`, `AckRequest`,
-    /// `NextKey`), если сессия в них нуждается. Пока таких нет —
-    /// задел на будущее (2x-3e и ack-tracking).
+    /// Каждый clove превращается в `GarlicBlock::EciesGarlicClove`; кроме
+    /// них, метод добавляет служебные блоки. Порядок — как в i2pd
+    /// `CreatePayload`: `AckRequest`, cloves, `Ack`, `NextKey`
+    /// (reverse, затем forward).
+    ///
+    /// `now_ms` нужен только для `AckRequest` (см. `plan_ack_request`);
+    /// в NS/NSR он не используется.
     ///
     /// Тип сообщения выбирается по состоянию:
     /// - `New` — NS (Alice инициирует);
@@ -1095,20 +1187,30 @@ impl RatchetSession {
     ///
     /// - [`Error::Malformed`] — состояние не позволяет отправить;
     /// - ошибки сериализации блоков и AEAD.
-    pub fn wrap_blocks(&mut self, cloves: &[EciesGarlicClove]) -> Result<Vec<u8>> {
-        // Служебные блоки (NextKey, Ack, AckRequest) идут **перед**
-        // cloves — так же, как в i2pd `CreatePayload`.
-        let mut blocks: Vec<GarlicBlock> = Vec::with_capacity(cloves.len() + 2);
+    pub fn wrap_blocks(&mut self, now_ms: u64, cloves: &[EciesGarlicClove]) -> Result<Vec<u8>> {
+        let mut blocks: Vec<GarlicBlock> = Vec::with_capacity(cloves.len() + 3);
 
-        // `send_forward_key` НЕ сбрасывается здесь: i2pd держит его,
-        // пока не придёт reverse-key (см. `HandleNextKey`). Это даёт
-        // ретрансмиссию — блок уходит в каждом outgoing-сообщении,
-        // пока peer не ответит.
-        if self.send_forward_key
-            && let Some(b) = self.build_forward_key_block()
-        {
-            blocks.push(b);
+        // `AckRequest` — i2pd пишет его **перед** clove'ом
+        // (`CreatePayload`, `:1240`).
+        if self.plan_ack_request(now_ms) {
+            blocks.push(GarlicBlock::AckRequest);
         }
+
+        for clove in cloves {
+            blocks.push(GarlicBlock::EciesGarlicClove(clove.clone()));
+        }
+
+        // `Ack` — после clove'а (`CreatePayload`, `:1246`); очередь пар
+        // опустошается: повторять `Ack` без нового `AckRequest` не нужно.
+        if !self.ack_requests.is_empty() {
+            let pairs = std::mem::take(&mut self.ack_requests);
+            debug!(
+                pairs = pairs.len(),
+                "ecies_ratchet: sending Ack for received messages"
+            );
+            blocks.push(GarlicBlock::Ack(pairs));
+        }
+
         // `send_reverse_key` — аналогично, до момента, пока не
         // появится новый forward. Сбрасывать не надо: повторные
         // reverse-key-блоки peer игнорирует как дубликаты.
@@ -1117,11 +1219,14 @@ impl RatchetSession {
         {
             blocks.push(b);
         }
-        // TODO(ack-tracking): здесь же по состоянию сессии добавлять
-        // `Ack` (в ответ на `AckRequest`) и `AckRequest`.
-
-        for clove in cloves {
-            blocks.push(GarlicBlock::EciesGarlicClove(clove.clone()));
+        // `send_forward_key` НЕ сбрасывается здесь: i2pd держит его,
+        // пока не придёт reverse-key (см. `HandleNextKey`). Это даёт
+        // ретрансмиссию — блок уходит в каждом outgoing-сообщении,
+        // пока peer не ответит.
+        if self.send_forward_key
+            && let Some(b) = self.build_forward_key_block()
+        {
+            blocks.push(b);
         }
 
         let payload = serialize_blocks(&blocks)?;
@@ -1137,6 +1242,48 @@ impl RatchetSession {
         }
     }
 
+    /// Решает, добавлять ли `AckRequest` в это сообщение — i2pd
+    /// `CreatePayload` (`:1186`).
+    ///
+    /// Запрос шлётся в двух случаях:
+    ///
+    /// - «обычный»: ничего не ждём и прошёл
+    ///   [`Self::ack_request_interval_ms`];
+    /// - «повтор»: ждём подтверждения дольше
+    ///   [`ACK_REQUEST_RETRY_TIMEOUT_MS`] — тогда просим заново про
+    ///   **новое** сообщение (i2pd тоже переписывает
+    ///   `m_AckRequestMsgID`).
+    ///
+    /// В NS/NSR (`first` у i2pd) запрос не шлётся; в самых первых
+    /// сообщениях сессии `msgID` равен `0`, что для i2pd означает
+    /// «запроса нет» — такой `AckRequest` пропускаем.
+    fn plan_ack_request(&mut self, now_ms: u64) -> bool {
+        if self.state != SessionState::Established {
+            return false;
+        }
+        let regular = self.ack_request_msg_id == 0
+            && now_ms > self.last_ack_request_sent_ms + self.ack_request_interval_ms;
+        let retry = self.ack_request_msg_id != 0
+            && now_ms > self.last_ack_request_sent_ms + ACK_REQUEST_RETRY_TIMEOUT_MS;
+        if !regular && !retry {
+            return false;
+        }
+        let msg_id = self.send_tagset.as_ref().map_or(0, RatchetTagSet::msg_id);
+        if msg_id == 0 {
+            return false;
+        }
+        self.ack_request_msg_id = msg_id;
+        self.ack_request_attempts = self.ack_request_attempts.saturating_add(1);
+        self.last_ack_request_sent_ms = now_ms;
+        debug!(
+            msg_id,
+            attempts = self.ack_request_attempts,
+            retry,
+            "ecies_ratchet: requesting Ack"
+        );
+        true
+    }
+
     /// Принимает wire-сообщение и возвращает распарсенные garlic-cloves.
     ///
     /// Тип сообщения определяется по состоянию:
@@ -1145,10 +1292,14 @@ impl RatchetSession {
     /// - `NewReplySent`, `Established` — existing session message;
     /// - `NewReceived` — ошибка (Bob должен отправить NSR, а не принимать).
     ///
-    /// Внутренние блоки (`Ack`, `AckRequest`, `NextKey`, `Termination`,
-    /// `DateTime`, `Padding`, `SessionId`, `Options`) обрабатываются
-    /// самой сессией и **не** попадают в возвращаемый список. Caller
-    /// видит только те cloves, которые реально предназначены ему.
+    /// Внутренние блоки (`NextKey`, `Termination`, `DateTime`, `Padding`,
+    /// `SessionId`, `Options`, `Unknown`) обрабатываются самой сессией и
+    /// **не** попадают в возвращаемый список. `AckRequest`, попавший в
+    /// это сообщение, ставит его пару `(tagset_id, index)` в очередь на
+    /// `Ack` (уйдёт в следующем [`Self::wrap_blocks`]); `Ack`
+    /// подтверждает наши `msgID` и копится в
+    /// [`Self::take_confirmed_msg_ids`]. Caller видит только те cloves,
+    /// которые реально предназначены ему.
     ///
     /// После успеха, если [`Self::needs_reply`] вернёт `true`, caller
     /// должен вызвать [`Self::wrap_blocks`] с ответными clove'ами
@@ -1166,6 +1317,10 @@ impl RatchetSession {
                 got: buf.len(),
             });
         }
+
+        // Пары для `Ack` относятся только к тому сообщению, в котором
+        // пришёл `AckRequest`; у NS/NSR такой пары быть не может.
+        self.last_received = None;
 
         // Peek tagset_id до вызова `handle_existing_session_message`:
         // сама функция удаляет тег из карты, после чего информацию
@@ -1207,8 +1362,24 @@ impl RatchetSession {
                     // NS/NSR не должны содержать NextKey; если пришло —
                     // игнорируем.
                 }
-                GarlicBlock::Ack(_pairs) => {
-                    // См. общий комментарий ниже про AckRequest/Ack.
+                GarlicBlock::Ack(pairs) => {
+                    for (tagset_id, index) in pairs {
+                        let msg_id = (u32::from(tagset_id) << 16) | u32::from(index);
+                        debug!(msg_id, "ecies_ratchet: Ack received");
+                        self.confirm_msg_id(msg_id);
+                    }
+                }
+                GarlicBlock::AckRequest => {
+                    // i2pd `HandlePayload` (`:442`): подтверждаем то
+                    // сообщение, в котором пришёл запрос.
+                    if let Some(pair) = self.last_received {
+                        debug!(
+                            tagset_id = pair.0,
+                            index = pair.1,
+                            "ecies_ratchet: AckRequest received; will Ack"
+                        );
+                        self.ack_requests.push(pair);
+                    }
                 }
                 GarlicBlock::Termination { .. } => {
                     // i2pd: `RemoveECIESx25519Session` + `receiveTagset->Expire()`.
@@ -1216,17 +1387,11 @@ impl RatchetSession {
                     // помечаем; удаление делает `EciesGarlicDestination`.
                     self.is_terminated = true;
                 }
-                GarlicBlock::AckRequest
-                | GarlicBlock::DateTime(_)
+                GarlicBlock::DateTime(_)
                 | GarlicBlock::Padding(_)
                 | GarlicBlock::SessionId(_)
                 | GarlicBlock::Options(_)
                 | GarlicBlock::Unknown { .. } => {
-                    // AckRequest / Ack — не реализованы, tracking
-                    // отправленных сообщений отсутствует. Не влияет
-                    // на корректность обмена: доставка I2NP
-                    // подтверждается через `DeliveryStatus` выше по стеку.
-                    //
                     // DateTime — clock-skew проверка отложена до
                     // момента, когда появится реальное системное время.
                     //
@@ -1265,6 +1430,77 @@ impl RatchetSession {
     #[must_use]
     pub const fn is_terminated(&self) -> bool {
         self.is_terminated
+    }
+
+    /// `msgID` сообщения, подтверждение которого мы ждём — i2pd
+    /// `m_AckRequestMsgID`. `0` — не ждём.
+    #[must_use]
+    pub const fn ack_request_msg_id(&self) -> u32 {
+        self.ack_request_msg_id
+    }
+
+    /// Сколько раз просили подтверждение для текущего `msgID` — i2pd
+    /// `m_AckRequestNumAttempts`.
+    #[must_use]
+    pub const fn ack_request_attempts(&self) -> u32 {
+        self.ack_request_attempts
+    }
+
+    /// Сколько пар ждёт отправки в ближайшем `Ack`. Для тестов и
+    /// диагностики.
+    #[must_use]
+    pub const fn pending_ack_requests(&self) -> usize {
+        self.ack_requests.len()
+    }
+
+    /// Забирает `msgID`, подтверждённые пришедшими `Ack` — i2pd
+    /// `MessageConfirmed`. Порядок — как пришли.
+    #[must_use]
+    pub fn take_confirmed_msg_ids(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.confirmed_msg_ids)
+    }
+
+    /// Интервал обычных `AckRequest`, мс — i2pd
+    /// `SetAckRequestInterval` (`:196`). В i2pd его уменьшает
+    /// datagram-сессия (`DATAGRAM_SESSION_ACK_REQUEST_INTERVAL` = 5500).
+    pub const fn set_ack_request_interval(&mut self, interval_ms: u64) {
+        self.ack_request_interval_ms = interval_ms;
+    }
+
+    /// i2pd `CleanupUnconfirmedTags` (`:254`): подтверждение так и не
+    /// пришло за [`ACK_REQUEST_MAX_NUM_ATTEMPTS`] попыток — забываем
+    /// текущий `msgID`.
+    ///
+    /// Возвращает `true`, если запрос был забыт. В i2pd это зовётся
+    /// периодически (`GarlicDestination::CleanupExpiredTags`); у нас
+    /// момент выбирает владелец сессии.
+    #[must_use]
+    pub fn cleanup_unconfirmed_tags(&mut self) -> bool {
+        if self.ack_request_msg_id != 0 && self.ack_request_attempts > ACK_REQUEST_MAX_NUM_ATTEMPTS
+        {
+            debug!(
+                msg_id = self.ack_request_msg_id,
+                attempts = self.ack_request_attempts,
+                "ecies_ratchet: dropping unconfirmed Ack request"
+            );
+            self.ack_request_msg_id = 0;
+            self.ack_request_attempts = 0;
+            return true;
+        }
+        false
+    }
+
+    /// `MessageConfirmed(msgID)` — i2pd `:242`: принятый `Ack` снимает
+    /// наш `AckRequest` и попадает в список подтверждённых.
+    fn confirm_msg_id(&mut self, msg_id: u32) {
+        if self.ack_request_msg_id != 0 && self.ack_request_msg_id == msg_id {
+            self.ack_request_msg_id = 0;
+            self.ack_request_attempts = 0;
+        }
+        if self.confirmed_msg_ids.len() >= CONFIRMED_MSG_IDS_CAP {
+            self.confirmed_msg_ids.remove(0);
+        }
+        self.confirmed_msg_ids.push(msg_id);
     }
 
     /// Отправляет `Termination`-блок peer'у и помечает сессию закрытой.

@@ -12,6 +12,10 @@ use uu_i2p::{
     router_info_address::I2PAddress,
 };
 
+/// Нулевое время для прямых вызовов `send_blocks`: `AckRequest` не
+/// шлётся, тесты видят только свои блоки.
+const NO_ACK_TIME: u64 = 0;
+
 /// Минимальный роутер с одним неопубликованным listen-эндпоинтом.
 ///
 /// `listen_unpublished` — чтобы `RouterConfigBuilder::build` не
@@ -736,7 +740,7 @@ fn handle_garlic_ns_from_alice_produces_nsr_reply() {
 
     // 3. Alice формирует пустой NS (без cloves).
     let ns_ecies_wire = alice
-        .send_blocks(bob_ecies_pub, &[])
+        .send_blocks(bob_ecies_pub, NO_ACK_TIME, &[])
         .expect("Alice: build NS");
     assert_ne!(ns_ecies_wire.len(), 0, "NS wire пустой");
 
@@ -797,7 +801,7 @@ fn handle_garlic_i2np_roundtrip_with_database_store_clove() {
     let mut alice = EciesGarlicDestination::new(alice_static);
 
     // 1. Alice устанавливает сессию с Bob: NS → NSR.
-    let ns_ecies = alice.send_blocks(bob_ecies_pub, &[]).unwrap();
+    let ns_ecies = alice.send_blocks(bob_ecies_pub, NO_ACK_TIME, &[]).unwrap();
     let request_envelope = GarlicBody::new(ns_ecies).to_buffer().unwrap();
     let nsr_reply = bob_ctx
         .handle_garlic(&request_envelope)
@@ -853,7 +857,7 @@ fn handle_garlic_i2np_roundtrip_with_database_store_clove() {
 
     // 4. Alice оборачивает clove, шифрует через established-сессию.
     let garlic_wire = alice
-        .send_blocks(bob_ecies_pub, &[clove])
+        .send_blocks(bob_ecies_pub, NO_ACK_TIME, &[clove])
         .expect("Alice builds garlic");
     let i2np_payload = GarlicBody::new(garlic_wire).to_buffer().unwrap();
 

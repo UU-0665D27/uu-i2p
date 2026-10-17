@@ -185,11 +185,26 @@ impl RouterContext {
             }
         }
 
+        // 3a. Подтверждения (`Ack`-блоки) наших сообщений этой сессии.
+        //     В i2pd на них завязана доставка `LeaseSet`
+        //     (`GarlicRoutingSession::MessageConfirmed`); у нас пока
+        //     только видимость — сам `LeaseSet` в garlic не уходит.
+        let confirmed = self.ecies.take_confirmed_msg_ids(&result.remote_static);
+        if !confirmed.is_empty() {
+            debug!(
+                remote_static = %hex8(&result.remote_static),
+                confirmed = ?confirmed,
+                "handle_garlic: peer confirmed our messages"
+            );
+        }
+
         // 4. Если Bob получил NS и должен ответить NSR — собираем
         //    пустой ответ, оборачиваем его в GarlicBody + I2npMessage
         //    и возвращаем наружу. Caller отправит как обычное I2NP.
         if result.needs_reply {
-            let ecies_wire = self.ecies.send_blocks(result.remote_static, &[])?;
+            let ecies_wire = self
+                .ecies
+                .send_blocks(result.remote_static, now_ms(), &[])?;
             let i2np_payload = GarlicBody::new(ecies_wire).to_buffer()?;
             let message = I2npMessage::new(I2npMessageType::Garlic, i2np_payload);
             info!(

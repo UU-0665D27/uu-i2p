@@ -4,8 +4,8 @@
 //! каждый remote static X25519-ключ, и прячет NS / NSR / existing
 //! session от вызывающего кода:
 //!
-//! - `send_blocks(remote_static, blocks)` — «отправить garlic такому-то
-//!   роутеру». Внутри: найти/создать сессию → `wrap_blocks`.
+//! - `send_blocks(remote_static, now_ms, blocks)` — «отправить garlic
+//!   такому-то роутеру». Внутри: найти/создать сессию → `wrap_blocks`.
 //! - `handle_message(wire)` — «принять входящий garlic». Внутри:
 //!   найти сессию по тегу или создать новую (NS) → `handle_blocks`.
 //!
@@ -16,10 +16,11 @@
 //! ## Что НЕ реализовано
 //!
 //! - ElGamal/AES сессии (`ElGamalAESSession`);
-//! - DH-ratchet advance при исчерпании tag-set'а (см. `next_root_key`);
 //! - автоматическая очистка неактивных сессий (i2pd делает это через
 //!   `CleanupExpiredTags`, у нас caller сам решает, когда вызвать
-//!   [`EciesGarlicDestination::remove_session`]).
+//!   [`EciesGarlicDestination::remove_session`] —
+//!   [`EciesGarlicDestination::cleanup_unconfirmed_tags`] по той же
+//!   причине вызывается вручную).
 //!
 //! ## Разделение обязанностей
 //!
@@ -130,18 +131,44 @@ impl EciesGarlicDestination {
     /// - `NewReplySent` / `Established` → existing-session message;
     /// - `NewSent` → ошибка (ждём NSR от пира).
     ///
+    /// `now_ms` — текущее время; нужно session'у для расписания
+    /// `AckRequest` (см. [`RatchetSession::wrap_blocks`]).
+    ///
     /// # Errors
     ///
     /// Ошибки [`RatchetSession::wrap_blocks`].
     pub fn send_blocks(
         &mut self,
         remote_static: [u8; 32],
+        now_ms: u64,
         cloves: &[EciesGarlicClove],
     ) -> Result<Vec<u8>> {
         let session = self.sessions.entry(remote_static).or_insert_with(|| {
             RatchetSession::new_initiator(clone_x25519_keys(&self.local_static), remote_static)
         });
-        session.wrap_blocks(cloves)
+        session.wrap_blocks(now_ms, cloves)
+    }
+
+    /// `msgID`, подтверждённые пиром (пришли в `Ack`-блоках) —
+    /// i2pd `MessageConfirmed`. Список сессии опустошается.
+    ///
+    /// Возвращает пустой список, если сессии с таким `remote_static`
+    /// нет.
+    #[must_use]
+    pub fn take_confirmed_msg_ids(&mut self, remote_static: &[u8; 32]) -> Vec<u32> {
+        self.sessions
+            .get_mut(remote_static)
+            .map_or_else(Vec::new, RatchetSession::take_confirmed_msg_ids)
+    }
+
+    /// i2pd `CleanupUnconfirmedTags`: забыть неотвеченный `AckRequest`
+    /// сессии. `true`, если сессия что-то забыла; для неизвестной сессии
+    /// — `false`.
+    #[must_use]
+    pub fn cleanup_unconfirmed_tags(&mut self, remote_static: &[u8; 32]) -> bool {
+        self.sessions
+            .get_mut(remote_static)
+            .is_some_and(RatchetSession::cleanup_unconfirmed_tags)
     }
 
     /// Разбирает входящее garlic-сообщение.

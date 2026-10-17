@@ -7,6 +7,13 @@ use uu_i2p::{
     i2np::I2npMessageType,
 };
 
+/// Время отправки в этих тестах: i2pd шлёт `AckRequest` только если
+/// `ts > m_LastAckRequestSendTime + m_AckRequestInterval`, поэтому с
+/// нулевым временем служебных `AckRequest` в wire нет и тесты
+/// разбирают ровно те блоки, которые положили сами. Ack-механизм
+/// проверяется отдельно (`ack_*` тесты) с настоящим временем.
+const NO_ACK_TIME: u64 = 0;
+
 fn pair() -> (RatchetSession, RatchetSession) {
     let bob_static = I2PX25519Keys::generate();
     let alice_static = I2PX25519Keys::generate();
@@ -324,7 +331,7 @@ fn blocks_full_handshake_and_data_exchange() {
     let mut bob = RatchetSession::new_responder(bob_static);
 
     // 1. Alice шлёт NS с clove[1].
-    let ns = alice.wrap_blocks(&[simple_clove(1)]).unwrap();
+    let ns = alice.wrap_blocks(NO_ACK_TIME, &[simple_clove(1)]).unwrap();
     assert_eq!(alice.state(), SessionState::NewSent);
 
     // 2. Bob принимает NS, видит clove[1], нужен reply.
@@ -334,7 +341,7 @@ fn blocks_full_handshake_and_data_exchange() {
     assert!(bob.needs_reply());
 
     // 3. Bob шлёт NSR с clove[2].
-    let nsr = bob.wrap_blocks(&[simple_clove(2)]).unwrap();
+    let nsr = bob.wrap_blocks(NO_ACK_TIME, &[simple_clove(2)]).unwrap();
     assert!(!bob.needs_reply());
 
     // 4. Alice принимает NSR, видит clove[2], становится Established.
@@ -344,16 +351,18 @@ fn blocks_full_handshake_and_data_exchange() {
     assert_eq!(alice.state(), SessionState::Established);
 
     // 5. Alice шлёт existing с clove[3]. Bob получает и переходит в Established.
-    let ex = alice.wrap_blocks(&[simple_clove(3)]).unwrap();
+    let ex = alice.wrap_blocks(NO_ACK_TIME, &[simple_clove(3)]).unwrap();
     let got = bob.handle_blocks(&ex).unwrap();
     assert_eq!(got[0], simple_clove(3));
     assert_eq!(bob.state(), SessionState::Established);
 
     // 6. Обмен в обе стороны.
     for i in 4..10_u8 {
-        let m = alice.wrap_blocks(&[simple_clove(i)]).unwrap();
+        let m = alice.wrap_blocks(NO_ACK_TIME, &[simple_clove(i)]).unwrap();
         assert_eq!(bob.handle_blocks(&m).unwrap()[0], simple_clove(i));
-        let m = bob.wrap_blocks(&[simple_clove(i + 100)]).unwrap();
+        let m = bob
+            .wrap_blocks(NO_ACK_TIME, &[simple_clove(i + 100)])
+            .unwrap();
         assert_eq!(alice.handle_blocks(&m).unwrap()[0], simple_clove(i + 100));
     }
 }
@@ -368,17 +377,17 @@ fn blocks_empty_list() {
     let mut bob = RatchetSession::new_responder(bob_static);
 
     // NS с пустым списком
-    let ns = alice.wrap_blocks(&[]).unwrap();
+    let ns = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let got = bob.handle_blocks(&ns).unwrap();
     assert!(got.is_empty(), "expected no blocks in NS");
 
     // NSR с пустым списком
-    let nsr = bob.wrap_blocks(&[]).unwrap();
+    let nsr = bob.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let got = alice.handle_blocks(&nsr).unwrap();
     assert!(got.is_empty(), "expected no blocks in NSR");
 
     // Existing с пустым списком
-    let ex = alice.wrap_blocks(&[]).unwrap();
+    let ex = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let got = bob.handle_blocks(&ex).unwrap();
     assert!(got.is_empty(), "expected no blocks in existing");
 }
@@ -393,7 +402,7 @@ fn blocks_multiple_in_one_message() {
     let mut bob = RatchetSession::new_responder(bob_static);
 
     let blocks = vec![simple_clove(1), simple_clove(2), simple_clove(3)];
-    let ns = alice.wrap_blocks(&blocks).unwrap();
+    let ns = alice.wrap_blocks(NO_ACK_TIME, &blocks).unwrap();
     let got = bob.handle_blocks(&ns).unwrap();
     assert_eq!(got, blocks);
 }
@@ -405,9 +414,9 @@ fn blocks_wrap_in_new_sent_fails() {
     let bob_pub = *bob_static.public_key();
 
     let mut alice = RatchetSession::new_initiator(alice_static, bob_pub);
-    let _ = alice.wrap_blocks(&[]).unwrap(); // NS отправлен
+    let _ = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap(); // NS отправлен
     // Повторный wrap_blocks — ошибка, ждём NSR.
-    assert!(alice.wrap_blocks(&[]).is_err());
+    assert!(alice.wrap_blocks(NO_ACK_TIME, &[]).is_err());
 }
 
 #[test]
@@ -419,7 +428,7 @@ fn blocks_handle_in_new_received_fails() {
     let mut alice = RatchetSession::new_initiator(alice_static, bob_pub);
     let mut bob = RatchetSession::new_responder(bob_static);
 
-    let ns = alice.wrap_blocks(&[]).unwrap();
+    let ns = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let _ = bob.handle_blocks(&ns).unwrap();
     // Bob теперь в NewReceived, приём не разрешён.
     assert!(bob.handle_blocks(&[]).is_err());
@@ -437,11 +446,11 @@ fn blocks_needs_reply_transitions() {
     assert!(!alice.needs_reply());
     assert!(!bob.needs_reply());
 
-    let ns = alice.wrap_blocks(&[]).unwrap();
+    let ns = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let _ = bob.handle_blocks(&ns).unwrap();
     assert!(bob.needs_reply());
 
-    let _ = bob.wrap_blocks(&[]).unwrap();
+    let _ = bob.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     assert!(!bob.needs_reply());
 }
 
@@ -454,7 +463,7 @@ fn blocks_tampered_wire_fails() {
     let mut alice = RatchetSession::new_initiator(alice_static, bob_pub);
     let mut bob = RatchetSession::new_responder(bob_static);
 
-    let ns = alice.wrap_blocks(&[simple_clove(1)]).unwrap();
+    let ns = alice.wrap_blocks(NO_ACK_TIME, &[simple_clove(1)]).unwrap();
     let mut tampered = ns;
     // Портим байт в зашифрованной части
     let last = tampered.len() - 1;
@@ -586,7 +595,7 @@ fn wrap_blocks_keeps_forward_flag_until_reverse() {
     assert!(alice.send_forward_key);
 
     // Первое сообщение: forward-key уходит.
-    let wire1 = alice.wrap_blocks(&[]).unwrap();
+    let wire1 = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     assert!(
         alice.send_forward_key,
         "flag must NOT be cleared after emit — i2pd retransmits until reverse"
@@ -597,7 +606,7 @@ fn wrap_blocks_keeps_forward_flag_until_reverse() {
     // Второе сообщение от Alice — тот же forward-key-блок, но
     // новый тег. Это retransmission, peer должен проигнорировать
     // дубликат.
-    let wire2 = alice.wrap_blocks(&[]).unwrap();
+    let wire2 = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     assert!(alice.send_forward_key, "flag still set");
     let _ = bob.handle_blocks(&wire2).unwrap();
     // У Bob'а по-прежнему только один receive-tagset — второй
@@ -605,7 +614,7 @@ fn wrap_blocks_keeps_forward_flag_until_reverse() {
     assert_eq!(bob.num_receive_tagsets(), 2, "1 + новый tagset");
 
     // Bob отвечает reverse, Alice принимает → флаг снят.
-    let reverse = bob.wrap_blocks(&[]).unwrap();
+    let reverse = bob.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let _ = alice.handle_blocks(&reverse).unwrap();
     assert!(!alice.send_forward_key, "flag cleared after reverse");
 }
@@ -637,7 +646,7 @@ fn dh_ratchet_forward_then_reverse() {
 
     // 1. Alice инициирует ratchet.
     alice.new_next_send_ratchet().unwrap();
-    let forward = alice.wrap_blocks(&[]).unwrap();
+    let forward = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     // `send_forward_key` не сбрасывается сразу — retransmission.
     assert!(alice.send_forward_key);
 
@@ -651,7 +660,7 @@ fn dh_ratchet_forward_then_reverse() {
     );
 
     // 3. Bob отвечает reverse.
-    let reverse = bob.wrap_blocks(&[]).unwrap();
+    let reverse = bob.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     // Флаг ещё выставлен: i2pd шлёт reverse в каждом сообщении,
     // пока не увидит входящее на новом tagset'е от Alice.
     assert!(
@@ -687,9 +696,9 @@ fn dh_ratchet_data_flows_on_new_tagsets() {
     let (mut alice, mut bob) = established();
 
     alice.new_next_send_ratchet().unwrap();
-    let forward = alice.wrap_blocks(&[]).unwrap();
+    let forward = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let _ = bob.handle_blocks(&forward).unwrap();
-    let reverse = bob.wrap_blocks(&[]).unwrap();
+    let reverse = bob.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let _ = alice.handle_blocks(&reverse).unwrap();
 
     // С этого момента Alice шлёт existing-сообщения под новым
@@ -736,7 +745,7 @@ fn dh_ratchet_dh_agreement_matches() {
         .private_key();
 
     // Alice шлёт forward, Bob принимает.
-    let forward = alice.wrap_blocks(&[]).unwrap();
+    let forward = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
     let _ = bob.handle_blocks(&forward).unwrap();
 
     // Bob's ephemeral
@@ -773,8 +782,8 @@ fn dh_ratchet_duplicate_forward_ignored() {
     // Два подряд forward-key-блока — i2pd шлёт forward в каждом
     // outgoing, пока не придёт reverse. Это не идентичные wire'ы:
     // у каждого свой тег, но один и тот же key_id.
-    let forward1 = alice.wrap_blocks(&[]).unwrap();
-    let forward2 = alice.wrap_blocks(&[]).unwrap();
+    let forward1 = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
+    let forward2 = alice.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
 
     let _ = bob.handle_blocks(&forward1).unwrap();
     let id_after_first = bob.current_receive_tagset().unwrap().tagset_id();
@@ -799,7 +808,7 @@ fn dh_ratchet_reverse_without_forward_ignored() {
     bob.next_receive_ratchet.as_mut().unwrap().key = Some(I2PX25519Keys::generate());
     bob.next_receive_ratchet.as_mut().unwrap().new_key = true;
     bob.send_reverse_key = true;
-    let reverse = bob.wrap_blocks(&[]).unwrap();
+    let reverse = bob.wrap_blocks(NO_ACK_TIME, &[]).unwrap();
 
     let before = alice.send_tagset().unwrap().tagset_id();
     let _ = alice.handle_blocks(&reverse).unwrap();
@@ -807,5 +816,175 @@ fn dh_ratchet_reverse_without_forward_ignored() {
         alice.send_tagset().unwrap().tagset_id(),
         before,
         "send tagset must be unchanged for unsolicited reverse"
+    );
+}
+
+// ---- Ack / AckRequest -----------------------------------------------
+
+/// «Настоящее» время для ack-тестов: с `NO_ACK_TIME` запросов нет
+/// (`ts > m_LastAckRequestSendTime + m_AckRequestInterval`), поэтому
+/// здесь берём значение из эпохи.
+const ACK_T0: u64 = 1_700_000_000_000;
+
+#[test]
+fn ack_request_then_ack_confirms_message() {
+    let (mut alice, mut bob) = established();
+    // Сообщение `hello` из `established` — index 0, msgID 0; i2pd такой
+    // запрос пропускает, поэтому запрашивает уже следующее (index 1).
+    let message = alice.wrap_blocks(ACK_T0, &[]).unwrap();
+    assert_eq!(
+        alice.ack_request_msg_id(),
+        1,
+        "msgID = (tagset_id << 16) | index"
+    );
+    assert_eq!(alice.ack_request_attempts(), 1);
+
+    let _ = bob.handle_blocks(&message).unwrap();
+    assert_eq!(
+        bob.pending_ack_requests(),
+        1,
+        "Bob подтверждает то сообщение, в котором пришёл AckRequest"
+    );
+
+    // Bob отвечает — в его сообщении уезжает `Ack` с парой (0, 1).
+    let back = bob.wrap_blocks(ACK_T0, &[]).unwrap();
+    assert_eq!(bob.pending_ack_requests(), 0, "копится ровно до отправки");
+
+    let _ = alice.handle_blocks(&back).unwrap();
+    assert_eq!(alice.take_confirmed_msg_ids(), vec![1]);
+    assert_eq!(alice.ack_request_msg_id(), 0, "наш AckRequest подтверждён");
+    assert_eq!(alice.ack_request_attempts(), 0);
+    assert!(
+        alice.take_confirmed_msg_ids().is_empty(),
+        "подтверждения отдаются один раз"
+    );
+}
+
+#[test]
+fn ack_request_is_not_repeated_within_interval() {
+    let (mut alice, mut bob) = established();
+
+    // Первый запрос и подтверждение.
+    let first = alice.wrap_blocks(ACK_T0, &[]).unwrap();
+    let _ = bob.handle_blocks(&first).unwrap();
+    let ack = bob.wrap_blocks(ACK_T0, &[]).unwrap();
+    let _ = alice.handle_blocks(&ack).unwrap();
+    assert_eq!(alice.ack_request_msg_id(), 0);
+
+    // Через секунду: интервал (33 с) не прошёл, повторять нечего.
+    let second = alice.wrap_blocks(ACK_T0 + 1000, &[]).unwrap();
+    assert_eq!(alice.ack_request_msg_id(), 0, "AckRequest не ушёл");
+    let _ = bob.handle_blocks(&second).unwrap();
+    assert_eq!(bob.pending_ack_requests(), 0, "в сообщении не было запроса");
+
+    // А через 34 секунды — обычный запрос, уже про новое сообщение.
+    let third = alice.wrap_blocks(ACK_T0 + 34_000, &[]).unwrap();
+    assert_ne!(alice.ack_request_msg_id(), 0, "обычный запрос по интервалу");
+    let _ = bob.handle_blocks(&third).unwrap();
+    assert_eq!(bob.pending_ack_requests(), 1);
+}
+
+#[test]
+fn unconfirmed_ack_request_is_retried() {
+    let (mut alice, _bob) = established();
+
+    let _ = alice.wrap_blocks(ACK_T0, &[]).unwrap();
+    assert_eq!(alice.ack_request_attempts(), 1);
+    assert_eq!(alice.ack_request_msg_id(), 1);
+
+    // Ответа нет: через 4 с повторяем — уже про новое сообщение (i2pd
+    // переписывает `m_AckRequestMsgID`).
+    let _ = alice.wrap_blocks(ACK_T0 + 4001, &[]).unwrap();
+    assert_eq!(alice.ack_request_attempts(), 2);
+    assert_eq!(alice.ack_request_msg_id(), 2);
+
+    let _ = alice.wrap_blocks(ACK_T0 + 8002, &[]).unwrap();
+    assert_eq!(alice.ack_request_attempts(), 3);
+    assert!(
+        !alice.cleanup_unconfirmed_tags(),
+        "лимит попыток ещё не превышен"
+    );
+
+    let _ = alice.wrap_blocks(ACK_T0 + 12_003, &[]).unwrap();
+    assert_eq!(alice.ack_request_attempts(), 4);
+    assert!(
+        alice.cleanup_unconfirmed_tags(),
+        "превысили лимит — забываем"
+    );
+    assert_eq!(alice.ack_request_msg_id(), 0);
+    assert_eq!(alice.ack_request_attempts(), 0);
+    assert!(!alice.cleanup_unconfirmed_tags(), "забывать больше нечего");
+}
+
+#[test]
+fn ack_block_carries_all_requested_pairs() {
+    let (mut alice, mut bob) = established();
+
+    // Три запроса подряд (интервал 33 с не проходил — значит это
+    // повтор), Bob отвечать не спешит и копит пары.
+    for offset in [0_u64, 4001, 8002] {
+        let message = alice.wrap_blocks(ACK_T0 + offset, &[]).unwrap();
+        let _ = bob.handle_blocks(&message).unwrap();
+    }
+    assert_eq!(bob.pending_ack_requests(), 3);
+
+    let back = bob.wrap_blocks(ACK_T0, &[]).unwrap();
+    assert_eq!(bob.pending_ack_requests(), 0, "все пары уехали одним Ack");
+
+    let _ = alice.handle_blocks(&back).unwrap();
+    assert_eq!(alice.take_confirmed_msg_ids(), vec![1, 2, 3]);
+    assert_eq!(alice.ack_request_msg_id(), 0, "текущий запрос подтверждён");
+}
+
+#[test]
+fn ack_request_interval_is_configurable() {
+    let (mut alice, mut bob) = established();
+    alice.set_ack_request_interval(1000);
+
+    // Первый запрос и подтверждение (в i2pd интервал уменьшают для
+    // datagram-сессий: `DATAGRAM_SESSION_ACK_REQUEST_INTERVAL` = 5500).
+    let first = alice.wrap_blocks(ACK_T0, &[]).unwrap();
+    assert_eq!(alice.ack_request_msg_id(), 1);
+    let _ = bob.handle_blocks(&first).unwrap();
+    let ack = bob.wrap_blocks(ACK_T0, &[]).unwrap();
+    let _ = alice.handle_blocks(&ack).unwrap();
+    assert_eq!(alice.ack_request_msg_id(), 0);
+
+    // Через секунду просим снова: с интервалом по умолчанию (33 с)
+    // запроса здесь бы не было. Пока запрос висит, интервал не
+    // действует — работает только повтор через 4 с (как в i2pd).
+    let _ = alice.wrap_blocks(ACK_T0 + 1001, &[]).unwrap();
+    assert_eq!(alice.ack_request_attempts(), 1);
+    assert_eq!(alice.ack_request_msg_id(), 2);
+
+    // Второй раз за секунду — уже ничего (запрос висит, 4 с не прошло).
+    let _ = alice.wrap_blocks(ACK_T0 + 2002, &[]).unwrap();
+    assert_eq!(alice.ack_request_attempts(), 1);
+}
+
+#[test]
+fn ack_for_stale_message_does_not_clear_pending_request() {
+    let (mut alice, mut bob) = established();
+
+    // Alice просит подтверждение для msgID 1; Bob готовит `Ack`, но
+    // сообщение задерживается в пути.
+    let message = alice.wrap_blocks(ACK_T0, &[]).unwrap();
+    let _ = bob.handle_blocks(&message).unwrap();
+    let delayed_ack = bob.wrap_blocks(ACK_T0, &[]).unwrap();
+
+    // За это время Alice успела попросить подтверждение уже для msgID 2
+    // (повтор не дождался ответа за 4 с).
+    let _ = alice.wrap_blocks(ACK_T0 + 4001, &[]).unwrap();
+    assert_eq!(alice.ack_request_msg_id(), 2);
+
+    // Старый `Ack` (msgID 1) виден наружу, но ожидание не снимает:
+    // i2pd сверяет с текущим `m_AckRequestMsgID` (`MessageConfirmed`,
+    // `:242`).
+    let _ = alice.handle_blocks(&delayed_ack).unwrap();
+    assert_eq!(alice.take_confirmed_msg_ids(), vec![1]);
+    assert_eq!(
+        alice.ack_request_msg_id(),
+        2,
+        "ждём подтверждения именно msgID 2"
     );
 }

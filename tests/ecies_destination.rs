@@ -1,8 +1,16 @@
-
 use uu_i2p::{
     EciesDelivery, EciesGarlicClove, EciesGarlicDestination, I2PError, SessionState,
     crypto::I2PX25519Keys, i2np::I2npMessageType,
 };
+
+/// Нулевое время: `AckRequest` не шлётся (i2pd сравнивает `ts` с
+/// `m_LastAckRequestSendTime + m_AckRequestInterval`), поэтому wire
+/// содержит только те блоки, что положил тест.
+const NO_ACK_TIME: u64 = 0;
+
+/// «Настоящее» время: с ним сессия шлёт `AckRequest` (интервал с
+/// `m_LastAckRequestSendTime = 0` уже прошёл).
+const ACK_TIME_MS: u64 = 1_700_000_000_000;
 
 /// Собирает облегчённый garlic-clove с delivery `Local`,
 /// одним байтом payload'а и типом I2NP `DeliveryStatus`.
@@ -36,7 +44,7 @@ fn established_pair() -> (
     let alice_pub = *alice.local_static_public();
 
     // 1. Alice → NS
-    let ns = alice.send_blocks(bob_pub, &[]).unwrap();
+    let ns = alice.send_blocks(bob_pub, NO_ACK_TIME, &[]).unwrap();
     assert_eq!(alice.session_state(&bob_pub), Some(SessionState::NewSent));
     assert_eq!(alice.session_count(), 1);
 
@@ -50,7 +58,7 @@ fn established_pair() -> (
     );
 
     // 3. Bob → NSR
-    let nsr = bob.send_blocks(alice_pub, &[]).unwrap();
+    let nsr = bob.send_blocks(alice_pub, NO_ACK_TIME, &[]).unwrap();
     assert_eq!(
         bob.session_state(&alice_pub),
         Some(SessionState::NewReplySent)
@@ -67,7 +75,7 @@ fn established_pair() -> (
 
     // 5. Alice → первое existing-session сообщение,
     //    Bob переходит в Established
-    let hello = alice.send_blocks(bob_pub, &[]).unwrap();
+    let hello = alice.send_blocks(bob_pub, NO_ACK_TIME, &[]).unwrap();
     let r = bob.handle_message(&hello).unwrap();
     assert_eq!(r.remote_static, alice_pub);
     assert!(!r.needs_reply);
@@ -95,7 +103,9 @@ fn full_handshake() {
 #[test]
 fn alice_to_bob_existing() {
     let (mut alice, bob_pub, mut bob, alice_pub) = established_pair();
-    let msg = alice.send_blocks(bob_pub, &[clove(3)]).unwrap();
+    let msg = alice
+        .send_blocks(bob_pub, NO_ACK_TIME, &[clove(3)])
+        .unwrap();
     let r = bob.handle_message(&msg).unwrap();
     assert_eq!(r.remote_static, alice_pub);
     assert_eq!(r.blocks, vec![clove(3)]);
@@ -104,7 +114,9 @@ fn alice_to_bob_existing() {
 #[test]
 fn bob_to_alice_existing() {
     let (mut alice, bob_pub, mut bob, alice_pub) = established_pair();
-    let msg = bob.send_blocks(alice_pub, &[clove(4)]).unwrap();
+    let msg = bob
+        .send_blocks(alice_pub, NO_ACK_TIME, &[clove(4)])
+        .unwrap();
     let r = alice.handle_message(&msg).unwrap();
     assert_eq!(r.remote_static, bob_pub);
     assert_eq!(r.blocks, vec![clove(4)]);
@@ -114,11 +126,15 @@ fn bob_to_alice_existing() {
 fn bidirectional_many() {
     let (mut alice, bob_pub, mut bob, alice_pub) = established_pair();
     for i in 0..10u8 {
-        let m = alice.send_blocks(bob_pub, &[clove(i)]).unwrap();
+        let m = alice
+            .send_blocks(bob_pub, NO_ACK_TIME, &[clove(i)])
+            .unwrap();
         let r = bob.handle_message(&m).unwrap();
         assert_eq!(r.blocks, vec![clove(i)]);
 
-        let m = bob.send_blocks(alice_pub, &[clove(i + 100)]).unwrap();
+        let m = bob
+            .send_blocks(alice_pub, NO_ACK_TIME, &[clove(i + 100)])
+            .unwrap();
         let r = alice.handle_message(&m).unwrap();
         assert_eq!(r.blocks, vec![clove(i + 100)]);
     }
@@ -128,7 +144,7 @@ fn bidirectional_many() {
 fn multiple_blocks_in_one_message() {
     let (mut alice, bob_pub, mut bob, alice_pub) = established_pair();
     let blocks = vec![clove(1), clove(2), clove(3)];
-    let msg = alice.send_blocks(bob_pub, &blocks).unwrap();
+    let msg = alice.send_blocks(bob_pub, NO_ACK_TIME, &blocks).unwrap();
     let r = bob.handle_message(&msg).unwrap();
     assert_eq!(r.remote_static, alice_pub);
     assert_eq!(r.blocks, blocks);
@@ -140,7 +156,7 @@ fn alice_send_creates_session_on_first_call() {
     let bob_pub = *bob_keys.public_key();
     let mut alice = EciesGarlicDestination::new(I2PX25519Keys::generate());
     assert_eq!(alice.session_count(), 0);
-    let _ = alice.send_blocks(bob_pub, &[]).unwrap();
+    let _ = alice.send_blocks(bob_pub, NO_ACK_TIME, &[]).unwrap();
     assert_eq!(alice.session_count(), 1);
     assert_eq!(alice.session_state(&bob_pub), Some(SessionState::NewSent));
 }
@@ -153,8 +169,8 @@ fn send_to_unknown_after_establishing_is_new_session() {
     let b2 = I2PX25519Keys::generate();
     let b2_pub = *b2.public_key();
     let mut alice = EciesGarlicDestination::new(I2PX25519Keys::generate());
-    let _ = alice.send_blocks(b1_pub, &[]).unwrap();
-    let _ = alice.send_blocks(b2_pub, &[]).unwrap();
+    let _ = alice.send_blocks(b1_pub, NO_ACK_TIME, &[]).unwrap();
+    let _ = alice.send_blocks(b2_pub, NO_ACK_TIME, &[]).unwrap();
     assert_eq!(alice.session_count(), 2);
     assert!(alice.has_session(&b1_pub));
     assert!(alice.has_session(&b2_pub));
@@ -189,7 +205,7 @@ fn remove_session_drops_it() {
     let bob_keys = I2PX25519Keys::generate();
     let bob_pub = *bob_keys.public_key();
     let mut alice = EciesGarlicDestination::new(I2PX25519Keys::generate());
-    let _ = alice.send_blocks(bob_pub, &[]).unwrap();
+    let _ = alice.send_blocks(bob_pub, NO_ACK_TIME, &[]).unwrap();
     assert!(alice.has_session(&bob_pub));
     assert!(alice.remove_session(&bob_pub).is_some());
     assert!(!alice.has_session(&bob_pub));
@@ -243,4 +259,38 @@ fn incoming_termination_terminates_and_removes_session() {
     assert!(result.terminated, "Termination must set the flag");
     assert!(!bob.has_session(&alice_pub));
     assert_eq!(bob.session_count(), 0);
+}
+
+#[test]
+fn ack_confirmation_is_visible_to_destination() {
+    let (mut alice, bob_pub, mut bob, alice_pub) = established_pair();
+
+    // `established_pair` уже отправил одно existing-сообщение (index 0,
+    // msgID 0 — такой запрос i2pd пропускает); следующее (index 1) уже
+    // просит подтверждение.
+    let message = alice
+        .send_blocks(bob_pub, ACK_TIME_MS, &[clove(1)])
+        .unwrap();
+    let r = bob.handle_message(&message).unwrap();
+    assert_eq!(r.blocks, vec![clove(1)]);
+
+    // Ответ Bob'а несёт `Ack` с парой (0, 1).
+    let answer = bob
+        .send_blocks(alice_pub, ACK_TIME_MS, &[clove(2)])
+        .unwrap();
+    let r = alice.handle_message(&answer).unwrap();
+    assert_eq!(r.blocks, vec![clove(2)]);
+    assert_eq!(alice.take_confirmed_msg_ids(&bob_pub), vec![1]);
+    assert!(
+        alice.take_confirmed_msg_ids(&bob_pub).is_empty(),
+        "подтверждения отдаются один раз"
+    );
+
+    // Неизвестная сессия — пусто/ложь, без паники.
+    let unknown = [0x5Au8; 32];
+    assert!(
+        alice.take_confirmed_msg_ids(&unknown).is_empty(),
+        "для неизвестной сессии подтверждать нечего"
+    );
+    assert!(!alice.cleanup_unconfirmed_tags(&unknown));
 }
