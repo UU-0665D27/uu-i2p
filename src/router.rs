@@ -787,6 +787,30 @@ impl Router {
         transport.send_to(to, message).await
     }
 
+    /// Завершает сессию с собеседником (i2pd `Transports::CloseSession`).
+    ///
+    /// Закрытие — не «удалить из карты»: транспорт сам скажет
+    /// [`TransportEvent::Disconnected`], и только по нему роутер убирает
+    /// собеседника (i2pd `Transports::PeerDisconnected`). Так карта
+    /// всегда отражает то, что видит транспорт.
+    ///
+    /// # Errors
+    ///
+    /// Ошибки транспорта.
+    pub async fn close(&self, ident: &IdentHash) -> Result<bool> {
+        let Some(kind) = self.session_transport(ident) else {
+            return Ok(false);
+        };
+        let Some(transport) = self.transport(kind) else {
+            return Ok(false);
+        };
+        let closed = transport.close(ident).await?;
+        if closed {
+            debug!(transport = %kind, peer = %ident.to_base64(), "router: сессия закрыта");
+        }
+        Ok(closed)
+    }
+
     /// Крутит цикл событий до `shutdown`.
     ///
     /// Тик задаёт [`RouterPolicy::tick_interval`]; он же ведёт

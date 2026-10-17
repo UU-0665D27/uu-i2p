@@ -80,6 +80,8 @@ struct FakeTransport {
     sent: Mutex<Vec<(IdentHash, I2npMessage)>>,
     /// Кого роутер пытался набрать: `(ident, адрес вместо RI)`.
     connects: Mutex<Vec<(IdentHash, Option<SocketAddr>)>>,
+    /// Кого роутер просил закрыть.
+    closes: Mutex<Vec<IdentHash>>,
     /// Очередь событий для роутера; её читает pump-таска.
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<Result<TransportEvent>>>,
     incoming_tx: mpsc::UnboundedSender<Result<TransportEvent>>,
@@ -94,6 +96,7 @@ impl FakeTransport {
             kind,
             sent: Mutex::new(Vec::new()),
             connects: Mutex::new(Vec::new()),
+            closes: Mutex::new(Vec::new()),
             incoming: tokio::sync::Mutex::new(incoming),
             incoming_tx,
             stopped: AtomicBool::new(false),
@@ -113,6 +116,11 @@ impl FakeTransport {
     /// Кого роутер пытался набрать.
     fn connects(&self) -> Vec<(IdentHash, Option<SocketAddr>)> {
         self.connects.lock().expect("fake: connects").clone()
+    }
+
+    /// Кого роутер просил закрыть.
+    fn closes(&self) -> Vec<IdentHash> {
+        self.closes.lock().expect("fake: closes").clone()
     }
 
     /// Сообщает роутеру, что транспорт больше не работает.
@@ -155,8 +163,11 @@ impl TransportPool for FakeTransport {
         })
     }
 
-    fn close<'a>(&'a self, _ident: &'a IdentHash) -> uu_i2p::BoxFuture<'a, Result<bool>> {
-        Box::pin(async move { Ok(true) })
+    fn close<'a>(&'a self, ident: &'a IdentHash) -> uu_i2p::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            self.closes.lock().expect("fake: closes").push(*ident);
+            Ok(true)
+        })
     }
 
     fn next_event(&self) -> uu_i2p::BoxFuture<'_, Result<TransportEvent>> {
@@ -695,6 +706,52 @@ async fn send_uses_session_transport() {
 
     assert_eq!(fake.sent().len(), 1);
     assert_eq!(fake.sent()[0].0, ident);
+}
+
+#[tokio::test]
+async fn close_routes_to_the_session_transport() {
+    let clock = FakeClock::new(NOW_MS);
+    let (mut router, _observer) = new_router(context(false), &clock, TestPolicy::answering());
+    let fake = attach_fake(&mut router, Transport::Ssu2);
+    let (ident, _) = foreign_ri(false);
+    let (unknown, _) = foreign_ri(false);
+
+    router
+        .handle_event(Transport::Ssu2, TransportEvent::Established { ident })
+        .await
+        .expect("established");
+
+    assert!(router.close(&ident).await.expect("close"));
+    assert_eq!(fake.closes(), vec![ident], "закрытие ушло в транспорт");
+
+    // Пира в карте нет — закрывать нечего, и транспорт не дёргаем.
+    assert!(!router.close(&unknown).await.expect("close"));
+    assert_eq!(fake.closes(), vec![ident]);
+}
+
+#[tokio::test]
+async fn disconnected_event_removes_session() {
+    let clock = FakeClock::new(NOW_MS);
+    let (mut router, _observer) = new_router(context(false), &clock, TestPolicy::answering());
+    attach_fake(&mut router, Transport::Ssu2);
+    let (ident, _) = foreign_ri(false);
+
+    router
+        .handle_event(Transport::Ssu2, TransportEvent::Established { ident })
+        .await
+        .expect("established");
+    assert_eq!(router.session_transport(&ident), Some(Transport::Ssu2));
+
+    router
+        .handle_event(Transport::Ssu2, TransportEvent::Disconnected { ident })
+        .await
+        .expect("disconnected");
+
+    assert_eq!(
+        router.session_transport(&ident),
+        None,
+        "карта сессий не должна держать отключённого пира"
+    );
 }
 
 // --- роутерный garlic ------------------------------------------------------

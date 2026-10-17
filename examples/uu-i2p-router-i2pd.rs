@@ -21,6 +21,21 @@
 //! 5. крутит `Router::run_until` (тик = запросы netDb + публикация RI +
 //!    обслуживание транспорта) заданное время и печатает счётчики.
 //!
+//! ## `--accept`: входящая сессия
+//!
+//! С флагом `--accept` пример дополнительно проверяет **входящий** путь:
+//! после размена он закрывает свою сессию (`Router::close`) и ждёт, чтобы
+//! i2pd позвонил сам. i2pd так и делает, когда ему есть что отправить
+//! (`Transports::PostMessages` → `ConnectToPeer`), а адрес берёт из нашего
+//! RI в своём netDb (туда он попал из `SessionConfirmed`). Дальше всё
+//! делает тот же `Router`: пул принимает `SessionRequest`, поднимает
+//! сессию в роли ответчика, а события `Established`/`Message` идут в общий
+//! цикл.
+//!
+//! Признак успеха: в логе наблюдателя второй `Established` (`nth=2`) —
+//! значит сессию начал он, а не мы; следом на эту сессию приходят его
+//! сообщения (`ShortTunnelBuild`, `PeerTest`), хотя мы ничего не слали.
+//!
 //! ## Запуск
 //!
 //! Нужен запущенный тестовый i2pd (`~/.local/opt/i2pd-uu/run-ssu2.sh`:
@@ -90,6 +105,19 @@ const DEFAULT_PROXY: &str = "127.0.0.1:4445";
 /// Сколько ждём установки сессии, прежде чем считать прогон неудачным.
 const ESTABLISH_TIMEOUT_SECS: u64 = 20;
 
+/// Сколько ждём после оправки RI/lookup, прежде чем закрыть свою сессию и
+/// ждать входящую (`--accept`).
+///
+/// Пул разбирает пакеты своей задачей, так что рукопожатие завершается
+/// независимо от того, читает ли роутер свои события; пауза нужна лишь
+/// чтобы i2pd успел положить наш RI в свой netDb.
+const INBOUND_SETTLE_SECS: u64 = 5;
+
+/// Сколько ещё раз дёрнуть прокси (и с каким периодом), когда мы ждём
+/// входящую сессию.
+const POKE_ATTEMPTS: usize = 3;
+const POKE_PERIOD: Duration = Duration::from_secs(15);
+
 fn init_tracing() {
     let _ = fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -101,6 +129,8 @@ fn init_tracing() {
 /// Счётчики того, что роутер увидел.
 #[derive(Debug, Default)]
 struct Counters {
+    /// Сколько раз сессия доходила до `Established`.
+    established: AtomicUsize,
     /// Принятых `DatabaseLookup` (на них роутер отвечает сам).
     lookups: AtomicUsize,
     /// Принятых `DatabaseStore`.
@@ -115,6 +145,10 @@ struct Counters {
 
 impl Counters {
     fn print(&self) {
+        println!(
+            "Сессий установлено: {}",
+            self.established.load(Ordering::Relaxed)
+        );
         println!(
             "I2NP принято: DatabaseLookup={} DatabaseStore={} прочих={} | RI в netDb={} | необработано={}",
             self.lookups.load(Ordering::Relaxed),
@@ -140,7 +174,8 @@ impl RouterObserver for DemoObserver {
     fn on_transport_event(&mut self, kind: Transport, event: &TransportEvent) {
         match event {
             TransportEvent::Established { ident } => {
-                info!(transport = %kind, peer = %ident.to_base64(), "demo: соединение установлено");
+                let nth = self.counters.established.fetch_add(1, Ordering::Relaxed) + 1;
+                info!(transport = %kind, peer = %ident.to_base64(), nth, "demo: соединение установлено");
                 let sender = {
                     let mut slot = self.established.lock().expect("demo: established");
                     slot.take()
@@ -192,17 +227,22 @@ struct Args {
     addr: SocketAddr,
     proxy: SocketAddr,
     secs: u64,
+    /// После размена закрыть свою сессию и ждать, чтобы i2pd позвонил сам
+    /// (проверка входящего пути — мы в роли ответчика).
+    accept: bool,
 }
 
 fn parse_args() -> Args {
     let mut positional = Vec::new();
     let mut secs = None;
     let mut proxy = None;
+    let mut accept = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--secs" => secs = args.next().and_then(|s| s.parse().ok()),
             "--proxy" => proxy = args.next().and_then(|s| s.parse().ok()),
+            "--accept" => accept = Some(true),
             _ => positional.push(arg),
         }
     }
@@ -213,9 +253,9 @@ fn parse_args() -> Args {
         .or_else(|| std::env::var("UU_I2P_LIVE_RI").ok());
     let Some(ri_path) = ri_path else {
         eprintln!(
-            "usage: uu-i2p-router-i2pd <router.info> [host:port] [--secs N] [--proxy host:port]\n\
+            "usage: uu-i2p-router-i2pd <router.info> [host:port] [--secs N] [--proxy host:port] [--accept]\n\
              \n\
-             env: UU_I2P_LIVE_RI, UU_I2P_LIVE_SSU2, UU_I2P_LIVE_PROXY, UU_I2P_SECS"
+             env: UU_I2P_LIVE_RI, UU_I2P_LIVE_SSU2, UU_I2P_LIVE_PROXY, UU_I2P_SECS, UU_I2P_ACCEPT"
         );
         std::process::exit(1);
     };
@@ -244,6 +284,9 @@ fn parse_args() -> Args {
         addr,
         proxy,
         secs,
+        accept: accept
+            .or_else(|| std::env::var("UU_I2P_ACCEPT").ok().map(|v| v != "0"))
+            .unwrap_or(false),
     }
 }
 
@@ -262,6 +305,31 @@ async fn poke_proxy(proxy: SocketAddr, host: &str) -> Option<String> {
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf)).await;
     Some(String::from_utf8_lossy(&buf).lines().next()?.to_owned())
+}
+
+/// Один заход через прокси случайным b32-адресом.
+async fn poke_once(proxy: SocketAddr) {
+    let b32 = I2PTag::from_array(rand::random::<[u8; 32]>()).to_base32();
+    let host = format!("{b32}.b32.i2p");
+    println!("Триггер: GET http://{host}/ через прокси i2pd {proxy}");
+    match poke_proxy(proxy, &host).await {
+        Some(status) => println!("Прокси ответил: {status}"),
+        None => println!("Прокси не ответил (для этой демонстрации это не смертельно)"),
+    }
+}
+
+/// Дёргает прокси ещё `attempts` раз с периодом `period`.
+///
+/// Нужно, когда мы уже закрыли свою сессию: i2pd может не сразу собраться
+/// пойти за `LeaseSet` к флудфиллу, а нам важно, чтобы это случилось, пока
+/// сессии нет — тогда он обязан позвонить сам.
+fn spawn_pokes(proxy: SocketAddr, attempts: usize, period: Duration) {
+    tokio::spawn(async move {
+        for _ in 0..attempts {
+            tokio::time::sleep(period).await;
+            poke_once(proxy).await;
+        }
+    });
 }
 
 // --- сборка локального роутера ---------------------------------------------
@@ -332,6 +400,26 @@ impl LocalRouter {
     }
 }
 
+/// Параметры прогона из аргументов командной строки.
+#[derive(Clone, Copy, Debug)]
+struct RunOptions {
+    addr: SocketAddr,
+    proxy: SocketAddr,
+    secs: u64,
+    accept: bool,
+}
+
+impl RunOptions {
+    const fn from_args(args: &Args) -> Self {
+        Self {
+            addr: args.addr,
+            proxy: args.proxy,
+            secs: args.secs,
+            accept: args.accept,
+        }
+    }
+}
+
 /// Тело задачи с роутером: подключить пул, позвонить i2pd, отправить
 /// пару I2NP и крутить цикл.
 ///
@@ -341,13 +429,13 @@ async fn run_router(
     mut router: Router,
     pool: Arc<dyn TransportPool>,
     ri_bytes: &[u8],
-    addr: SocketAddr,
-    secs: u64,
     own: IdentHash,
+    options: RunOptions,
+    script: impl Future<Output = ()> + Send,
 ) -> uu_i2p::Result<Router> {
     router.attach(pool)?;
     let i2pd = router
-        .dial(ri_bytes, Some(addr), Some(Transport::Ssu2))
+        .dial(ri_bytes, Some(options.addr), Some(Transport::Ssu2))
         .await?;
     info!(peer = %i2pd.to_base64(), "demo: dial");
 
@@ -373,15 +461,47 @@ async fn run_router(
         .await?;
     println!("Запрошен RouterInfo i2pd (DatabaseLookup)");
 
-    router
-        .run_until(async move {
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(secs)) => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        })
-        .await?;
+    if options.accept {
+        // Проверка входящего пути: рвём свою сессию и ждём, чтобы i2pd
+        // позвонил сам. Он это делает по необходимости
+        // (`Transports::PostMessages` → `ConnectToPeer`), а адрес берёт из
+        // нашего RI в своём netDb — туда он попал из `SessionConfirmed`.
+        //
+        // События (`Established`/`Disconnected`) пока копятся в канале
+        // роутера: их разберёт `run_until` ниже — потому и `nth=1`
+        // (наша сессия) с `nth=2` (входящая) видны уже в цикле.
+        tokio::time::sleep(Duration::from_secs(INBOUND_SETTLE_SECS)).await;
+        println!();
+        println!("--- Рвём свою сессию (её события разберёт цикл ниже) ---");
+        let closed = router.close(&i2pd).await?;
+        println!("Свою сессию закрыли ({closed}); дальше ждём входящую: i2pd должен позвонить сам");
+    }
+
+    // Сценарий прогона — отдельная футура: она живёт, пока роутер крутит
+    // цикл (`run_until`), и делает то, что не является обработкой событий:
+    // дёргает прокси и ждёт отведённое время.
+    router.run_until(script).await?;
     Ok(router)
+}
+
+/// Что делает демонстрация, пока роутер крутит цикл.
+///
+/// Прокси дёргаем уже внутри цикла: i2pd должен пойти за `LeaseSet` к
+/// ближайшему флудфиллу (к нам) — так он либо пишет нам в готовую сессию,
+/// либо, если мы её закрыли, звонит сам.
+async fn run_script(counters: Arc<Counters>, options: RunOptions) {
+    poke_once(options.proxy).await;
+    if options.accept {
+        spawn_pokes(options.proxy, POKE_ATTEMPTS, POKE_PERIOD);
+    }
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_secs(options.secs)) => {
+            println!();
+            println!("--- Итог по счётчикам (на момент остановки) ---");
+            counters.print();
+        }
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 /// Итог прогона: что осталось в состоянии роутера.
@@ -433,28 +553,17 @@ async fn main() {
         own,
         addr: local_addr,
     } = local;
-    let (addr, secs) = (args.addr, args.secs);
+    let options = RunOptions::from_args(&args);
+    let script = run_script(Arc::clone(&counters), options);
     let loop_task =
-        tokio::spawn(async move { run_router(router, pool, &ri_bytes, addr, secs, own).await });
+        tokio::spawn(
+            async move { run_router(router, pool, &ri_bytes, own, options, script).await },
+        );
 
     // Ждём `Established`: его приносит наблюдатель из цикла роутера.
     match tokio::time::timeout(Duration::from_secs(ESTABLISH_TIMEOUT_SECS), established).await {
         Ok(Ok(ident)) => println!("SSU2: сессия с i2pd установлена ({})", ident.to_base64()),
         _ => eprintln!("SSU2: сессия не установилась за {ESTABLISH_TIMEOUT_SECS} с — смотрим логи"),
-    }
-    println!();
-
-    // Триггер: i2pd спросит LeaseSet у ближайшего флудфилла — у нас.
-    let b32 = I2PTag::from_array(rand::random::<[u8; 32]>()).to_base32();
-    let host = format!("{b32}.b32.i2p");
-    println!(
-        "Триггер: GET http://{host}/ через прокси i2pd {}",
-        args.proxy
-    );
-    if let Some(status) = poke_proxy(args.proxy, &host).await {
-        println!("Прокси ответил: {status}");
-    } else {
-        println!("Прокси не ответил (для этой демонстрации это не смертельно)");
     }
     println!();
 
