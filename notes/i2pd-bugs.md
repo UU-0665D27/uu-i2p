@@ -1,8 +1,11 @@
 # Баги и уязвимости в самом i2pd
 
 Список находок по коду i2pd (не по нашему порту). Референс-клон для разбора:
-`/home/u_uu/FOR_LLM/libi2pd` (i2pd, HEAD `7ab983ac`). Нумерация — сквозная,
+`/home/u_uu/FOR_LLM/libi2pd` (i2pd, HEAD `79ae673d`). Нумерация — сквозная,
 чтобы на неё ссылаться из коммитов и заметок.
+
+Пункты 1-4 найдены на HEAD `7ab983ac`, пункты 5-6 — на `79ae673d`; на момент
+проверки ни один из них не исправлен.
 
 Для каждой находки: что именно, где, как воспроизводится, чем грозит и в каком
 фиксе (если есть) i2pd это починил.
@@ -70,6 +73,51 @@
   `Base64ToByteStream`).
 - TODO(uu): найти конкретный вход с атакующим `pos`/`length`, оформить
   отдельным пунктом с точным стеком.
+
+## 5. SSU2: `TokenRequest` и `Retry` не переотправляются
+
+- Файл: `SSU2Session.cpp`, `SendTokenRequest` (`:1475`), `SendRetry` (`:1562`).
+- Каждый handshake-пакет, который i2pd умеет повторять, кладётся в
+  `m_SentHandshakePacket` (`SendSessionRequest` `:733`, `SendSessionCreated`
+  `:963`, `SendSessionConfirmed` `:1135`), а `Resend` раз в
+  `SSU2_HANDSHAKE_RESEND_INTERVAL` (1 с) зовёт `ResendHandshakePacket`
+  (`:619-625`). `SendTokenRequest` и `SendRetry` в `m_SentHandshakePacket`
+  ничего не кладут, поэтому повторить их нечем.
+- При этом `Resend` для них всё равно вызывается: `SSU2Server::HandleResendTimer`
+  обходит и `m_PendingOutgoingSessions` (`SSU2.cpp:1232`), где живёт сессия
+  Alice до `ProcessSessionCreated`.
+- Последствие: одна потерянная UDP-датаграмма (`TokenRequest` от Alice или
+  `Retry` от Bob) лечится только `SSU2_CONNECT_TIMEOUT` (5 с) — сессия просто
+  падает по таймауту, хотя у i2pd есть всё, чтобы повторить пакет.
+  Состояния на стороне Bob при этом не остаётся вовсе: `ProcessTokenRequest`
+  (`:1519`) возвращает `true`, но сессию в `m_Sessions` добавляет только
+  `ProcessSessionRequest` (`m_Server.AddSession`), так что временный объект
+  сессии из `ProcessNextPacket` (`SSU2.cpp:778-782`) умирает вместе с
+  обработчиком.
+- Статус: в локальном клоне (`79ae673d`) не исправлено.
+- У нас: `ConnReport::packets` повторяются одинаково для всех handshake-пакетов
+  (`Ssu2Connection::remember_handshake` + `poll_resend`), так что `TokenRequest`
+  и `Retry` переотправляются как в исправленном варианте.
+
+## 6. SSU2: повторный `SessionRequest` в `SessionCreatedSent` игнорируется
+
+- Файлы: `SSU2.cpp:712-718`, `SSU2Session.cpp:1227-1232`.
+- Пакет для сессии в состоянии `SessionCreatedSent` уходит в
+  `ProcessSessionConfirmed`, потому что диспетчер i2pd выбирает обработчик по
+  состоянию сессии, а не по типу пакета. Тот снимает маску второй половины
+  заголовка ключом `k_header_2` из Noise-состояния, видит там `SessionRequest`
+  вместо `SessionConfirmed` и возвращает `true`, не отвечая ничего
+  (`// TODO: queue up`).
+- То есть повторный `SessionRequest` от Alice не приводит ни к повтору
+  `SessionCreated`, ни к завершению сессии: i2pd полагается на свой
+  `SSU2_HANDSHAKE_RESEND_INTERVAL` (1 с) для повтора `SessionCreated`.
+- Последствие: при потере `SessionCreated` рукопожатие ждёт до секунды, хотя
+  повторный `SessionRequest` — явный сигнал, что пакет не дошёл. Плюс сессия
+  висит в `m_Sessions` до общего таймаута.
+- Статус: в локальном клоне (`79ae673d`) не исправлено.
+- У нас: поведение повторено намеренно (`PoolState::deliver`, проверка типа по
+  `session_confirmed_header_key()`) — иначе расходились бы с i2pd; там же
+  отмечено `// TODO` на исправленный вариант.
 
 ---
 
