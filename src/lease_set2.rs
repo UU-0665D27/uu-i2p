@@ -28,11 +28,15 @@
 //!
 //! Каждая key section: `key_type(2 BE u16) | key_len(2 BE u16) | key`.
 //!
+//! Сам store type (`0x03`) в буфере не лежит — он в I2NP
+//! `DatabaseStore`. Но **подпись его покрывает**: signed-данные — это
+//! `store_type || body` (Java I2P: «unlike LS1, sig covers type»; i2pd
+//! `LeaseSet.cpp:969`: `// LS + leading store type`).
+//!
 //! ## Что не реализовано
 //!
 //! - `OFFLINE_KEYS` (transient signing key) — будет отдельно;
-//! - `PUBLISHED_ENCRYPTED` (type 5) — отдельный модуль;
-//! - верификация подписи.
+//! - `PUBLISHED_ENCRYPTED` (type 5) — отдельный модуль.
 
 use crate::IdentHash;
 use crate::endian::{read_u16_be, read_u32_be};
@@ -146,6 +150,12 @@ impl LeaseSet2 {
 
     /// Сериализует в wire-формат (type 3).
     ///
+    /// Store type (**3**) сюда **не** входит — в I2NP `DatabaseStore`
+    /// он лежит отдельным полем перед payload'ом (см.
+    /// [`DatabaseStore::new_lease_set2`](crate::database_store::DatabaseStore::new_lease_set2)).
+    /// Но подпись store type покрывает: [`Self::verify`] и
+    /// [`LeaseSet2Builder::build`] считают её по `0x03 || body`.
+    ///
     /// # Errors
     ///
     /// [`Error::Malformed`], если `leases.len() > 255` или
@@ -227,7 +237,8 @@ impl LeaseSet2 {
     ///   32-байтовым X25519 public;
     /// - `flags` = 0 (published, не encrypted, без offline keys);
     /// - `properties` = пусто;
-    /// - `signature` = Ed25519 над `unsigned_bytes()`.
+    /// - `signature` = Ed25519 над `store_type || unsigned_bytes()`
+    ///   (store type покрывается, см. [`Self::verify`]).
     ///
     /// Для нестандартных LS2 (свой `flags`, properties, несколько
     /// key sections) используйте [`Self::unsigned_bytes`] напрямую
@@ -371,8 +382,12 @@ impl LeaseSet2 {
     /// Проверяет подпись над исходными байтами `buf`.
     ///
     /// `buf` — это **исходные байты** `LeaseSet2`, ровно те, что
-    /// были прочитаны из `DatabaseStore` payload. Публичный ключ
-    /// берётся из [`Self::identity`].
+    /// были прочитаны из `DatabaseStore` payload (то есть без
+    /// store type, см. [`Self::to_buffer`]). Публичный ключ берётся из
+    /// [`Self::identity`].
+    ///
+    /// Подпись покрывает **и store type**, который в `DatabaseStore`
+    /// лежит перед телом LS2 — см. [`Self::signing_bytes`].
     ///
     /// # Errors
     ///
@@ -388,7 +403,22 @@ impl LeaseSet2 {
             });
         }
         let (signed, sig) = buf.split_at(buf.len() - sig_len);
-        self.identity.verify(signed, sig)
+        let signed = Self::signing_bytes(NETDB_STORE_TYPE_STANDARD_LEASESET2, signed);
+        self.identity.verify(&signed, sig)
+    }
+
+    /// Байты, которые покрывает подпись: `store_type || body`.
+    ///
+    /// I2NP `DatabaseStore` кладёт store type **перед** телом LS2, и
+    /// подпись покрывает его тоже — «unlike LS1, sig covers type»
+    /// (`LeaseSet2.sign` в Java I2P; i2pd так же —
+    /// `LeaseSet.cpp:969`: `keys.Sign (m_Buffer, offset, ...) // LS + leading store type`).
+    /// Для стандартного LS2 это `0x03 || unsigned_bytes()`.
+    fn signing_bytes(store_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(body.len() + 1);
+        out.push(store_type);
+        out.extend_from_slice(body);
+        out
     }
 }
 
@@ -496,8 +526,10 @@ impl LeaseSet2Builder {
 
     /// Собирает и подписывает `LeaseSet2` ключами `keys`.
     ///
-    /// Подпись — Ed25519 над `identity || body` (то есть над всем,
-    /// что до хвостовой signature).
+    /// Подпись — Ed25519 над `store_type || identity || body`, где
+    /// `store_type` = 3: LS2-подпись покрывает и байт store type,
+    /// который в `DatabaseStore` лежит перед телом (см.
+    /// [`Self::signing_bytes`]).
     ///
     /// # Errors
     ///
@@ -533,6 +565,7 @@ impl LeaseSet2Builder {
             &self.key_sections,
             &self.leases,
         )?;
+        let unsigned = LeaseSet2::signing_bytes(NETDB_STORE_TYPE_STANDARD_LEASESET2, &unsigned);
         let signature = keys.sign(&unsigned)?;
 
         let expected_sig_len = identity.signature_len()?;

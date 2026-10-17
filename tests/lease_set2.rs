@@ -88,6 +88,16 @@ mod tests {
         out
     }
 
+    /// Подписываемые байты LS2: `store_type || body`.
+    ///
+    /// Store type (`0x03`) лежит в I2NP `DatabaseStore`, а не в теле,
+    /// но подпись покрывает и его (Java I2P, i2pd).
+    fn signing_bytes(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![NETDB_STORE_TYPE_STANDARD_LEASESET2];
+        out.extend_from_slice(body);
+        out
+    }
+
     /// Пустой базовый LS2 для тестов.
     fn basic_ls2(leases: &[Lease]) -> Vec<u8> {
         build_ls2(
@@ -505,7 +515,7 @@ mod tests {
             &Lease::new(IdentHash::from_array([0x11; 32]), 42, 1_700_000_000_000).to_buffer_ls2(),
         );
 
-        let signature = signer.sign(&signing_data);
+        let signature = signer.sign(&signing_bytes(&signing_data));
         let mut full_bytes = signing_data;
         full_bytes.extend_from_slice(&signature);
 
@@ -532,7 +542,7 @@ mod tests {
             &Lease::new(IdentHash::from_array([0x11; 32]), 42, 1_700_000_000_000).to_buffer_ls2(),
         );
 
-        let signature = signer.sign(&signing_data);
+        let signature = signer.sign(&signing_bytes(&signing_data));
         let mut tampered = signing_data;
         let pub_offset = id_bytes.len();
         tampered[pub_offset] ^= 0xFF; // портим первый байт published
@@ -546,6 +556,29 @@ mod tests {
     // ---- from_keys ------------------------------------------------------
 
     use uu_i2p::private_keys::I2PPrivateKeys;
+
+    /// Подпись LS2 покрывает ведущий store type (`0x03`), а не только
+    /// тело: иначе i2pd/Java I2P отвергнут LS2
+    /// (`LeaseSet.cpp:969`, `LeaseSet2.sign`: «sigs cover the type byte»).
+    #[test]
+    fn signature_covers_store_type() {
+        let keys = I2PPrivateKeys::generate_default().unwrap();
+        let ls = LeaseSet2::from_keys(&keys, 100, 60, vec![lease(1)]).unwrap();
+        let body = ls.to_buffer().unwrap();
+        ls.verify(&body).expect("valid signature");
+
+        // Подпись только над телом (как было бы «по LS1») не должна
+        // приниматься.
+        let sig_len = ls.identity().signature_len().unwrap();
+        let unsigned = &body[..body.len() - sig_len];
+        let wrong_sig = keys.sign(unsigned).unwrap();
+        let mut wrong = unsigned.to_vec();
+        wrong.extend_from_slice(&wrong_sig);
+        assert!(
+            ls.verify(&wrong).is_err(),
+            "signature over body without store type must be rejected"
+        );
+    }
 
     #[test]
     fn from_keys_roundtrip_and_verify() {
