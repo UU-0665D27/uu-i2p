@@ -58,6 +58,13 @@ pub const SSU2_PACKET_OVERHEAD: usize = 32;
 pub const SSU2_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Таймаут ожидания Termination после его отправки.
 pub const SSU2_TERMINATION_TIMEOUT: Duration = Duration::from_secs(165);
+
+/// Период общей уборки сессий (i2pd `SSU2_CLEANUP_INTERVAL`, `SSU2.h:31`).
+///
+/// У нас из `SSU2Session::CleanUp` (`SSU2Session.cpp:3440`) воспроизведён один
+/// пункт — «висящий» `Path Challenge` закрывает сессию (см.
+/// `notes/i2pd-bugs.md`, п. 9).
+pub const SSU2_CLEANUP_INTERVAL: Duration = Duration::from_secs(72);
 /// Допустимое расхождение часов (иначе — Terminate в некоторых фазах).
 pub const SSU2_CLOCK_SKEW: Duration = Duration::from_secs(60);
 /// Порог коррекции часов (если больше — корректируем).

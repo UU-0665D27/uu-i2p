@@ -33,8 +33,6 @@
 //! - **Relay / Hole Punch / Peer Test** (`Introduce`, `WaitForIntroduction`,
 //!   `PeerTest`): блоки отдаются наружу через
 //!   [`crate::ssu2_engine::PendingBlock`], сессии этих типов не создаются.
-//! - **Смена пути** (`Path Challenge` при смене адреса собеседника,
-//!   i2pd `ProcessData`, `SSU2Session.cpp:1752`).
 //! - **Проверки `RouterInfo`** целиком (подпись, версия, `isOlder`, профиль):
 //!   здесь — только то, без чего не работает data phase (наличие
 //!   SSU2-адреса нужного семейства, совпадение `s=` со статическим ключом из
@@ -43,6 +41,10 @@
 //!   `IsInReservedRange`, бан-лист).
 //! - **Ожидание подтверждения при закрытии**: [`Ssu2Pool::close`] забывает
 //!   сессию сразу, а не ждёт `Closing`/`ClosingConfirmed`.
+//!
+//! Смена пути собеседника (`Path Challenge`/`Path Response`, i2pd
+//! `ProcessData`, `SSU2Session.cpp:1752`) — реализована; из уборки i2pd
+//! (`SSU2Session::CleanUp`) взят только пункт про неподтверждённый челлендж.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -75,7 +77,7 @@ use crate::ssu2_handshake::{HandshakeConfig, InitiatorHandshake, ResponderHandsh
 use crate::ssu2_header::{ConnectionId, SSU2_MIN_PACKET_SIZE, SSU2_VERSION, Ssu2MessageType};
 use crate::ssu2_lifecycle::Ssu2SessionState;
 use crate::ssu2_policy::{
-    DateTimeAction, I2pdCongestionPolicy, I2pdPolicy, SSU2_MAX_PACKET_SIZE,
+    DateTimeAction, I2pdCongestionPolicy, I2pdPolicy, SSU2_CLEANUP_INTERVAL, SSU2_MAX_PACKET_SIZE,
     SSU2_TERMINATION_TIMEOUT, SSU2_TOKEN_EXPIRATION_THRESHOLD, SSU2_TOKEN_EXPIRATION_TIMEOUT,
     Ssu2Policy,
 };
@@ -566,6 +568,13 @@ struct Session {
     established: bool,
     /// Мы инициатор (`IsOutgoing`).
     outgoing: bool,
+    /// Отправленный `Path Challenge` и адрес, на который он ушёл, — ждём
+    /// `Path Response` (i2pd `m_PathChallenge` = `(challenge, endpoint)`).
+    ///
+    /// Само значение челленджа живёт в движке
+    /// ([`Ssu2DataSession::path_challenge_sent`]); пул помнит адрес и время
+    /// отправки, чтобы обновить `remote` и закрыть сессию, если ответа нет.
+    path_challenge: Option<(SocketAddr, Duration)>,
     /// I2NP-сообщения, ждущие установления (i2pd `m_IntermediateQueue`).
     queue: VecDeque<I2npMessage>,
 }
@@ -716,6 +725,24 @@ impl PoolState {
         if !session.established {
             return;
         }
+
+        // i2pd `CleanUp` (`SSU2Session.cpp:3506`, зовётся раз в
+        // `SSU2_CLEANUP_INTERVAL` = 72 с): `Path Challenge` так и не
+        // подтвердили — закрываем сессию. У i2pd это не проверка срока, а
+        // «попали в тик уборки с висящим челленджем», из-за чего свежий
+        // челлендж может убить сессию почти сразу (см. `notes/i2pd-bugs.md`,
+        // п. 9); у нас челлендж закрывает сессию ровно через 72 с.
+        let stale_challenge = session
+            .path_challenge
+            .is_some_and(|(_, sent_at)| now.saturating_sub(sent_at) >= SSU2_CLEANUP_INTERVAL);
+        if stale_challenge {
+            warn!(conn_id = ?key, "tick_session: path challenge not answered; terminating");
+            self.request_termination(key, Ssu2TerminationReason::NormalClose);
+            self.send_termination(key, out);
+            self.remove_session(key);
+            return;
+        }
+
         let mut terminate = false;
         let mut close = false;
         {
@@ -777,6 +804,132 @@ impl PoolState {
         }
     }
 
+    /// i2pd `ProcessData` (`SSU2Session.cpp:1752`): data-пакет пришёл с
+    /// адреса, отличного от текущего, и `Path Challenge` на этот адрес ещё не
+    /// отправляли — значит, собеседник «переехал» (NAT rebinding) либо адрес
+    /// подменён. Челлендж уходит **на новый** адрес, а `remote` до совпавшего
+    /// `Path Response` не меняется (это делает
+    /// [`PoolState::apply_data_report`]).
+    ///
+    /// Как и i2pd, повторно на тот же адрес челлендж не отправляется
+    /// (`!m_PathChallenge || from != m_PathChallenge->second`).
+    ///
+    /// i2pd здесь ещё проверяет `transports.IsInReservedRange` — это часть
+    /// опции `reservedrange`; наш пул reserved-адреса не фильтрует (ни здесь,
+    /// ни при приёме новых сессий).
+    fn maybe_send_path_challenge(
+        &mut self,
+        key: ConnectionId,
+        packet: &[u8],
+        from: SocketAddr,
+        out: &mut OutQueue,
+    ) {
+        let Some(session) = self.sessions.get(&key) else {
+            return;
+        };
+        if from == session.remote {
+            return;
+        }
+        // Только настоящий data-пакет: i2pd зовёт `ProcessData` лишь для
+        // состояний `Established`/`SessionConfirmedSent` (то есть когда
+        // data-слой уже есть), а повторный handshake-пакет обрабатывает там же
+        // (`ResendHandshakePacket`/`SendQuickAck`).
+        let Some(data) = session.conn.data() else {
+            return;
+        };
+        if data.peek_message_type(packet) != Some(Ssu2MessageType::Data) {
+            return;
+        }
+        // Челлендж на этот адрес уже висит — второго не шлём.
+        if session
+            .path_challenge
+            .is_some_and(|(endpoint, _)| endpoint == from)
+        {
+            return;
+        }
+        debug!(
+            %from,
+            remote = %session.remote,
+            conn_id = ?key,
+            "path: remote endpoint changed; sending Path Challenge"
+        );
+        self.send_path_challenge(key, from, out);
+    }
+
+    /// `SendPathChallenge` на новый адрес собеседника
+    /// (`SSU2Session.cpp:3405`): `DateTime` + Address + `Path Challenge` + Ack +
+    /// Padding.
+    ///
+    /// i2pd здесь же навсегда урезает себе `m_MaxPayloadSize` до
+    /// `SSU2_MIN_PACKET_SIZE` и окно до `SSU2_MIN_WINDOW_SIZE`; мы этого не
+    /// делаем — челлендж уходит обычным пакетом (см. `notes/i2pd-bugs.md`,
+    /// п. 9).
+    fn send_path_challenge(&mut self, key: ConnectionId, to: SocketAddr, out: &mut OutQueue) {
+        let now = now();
+        let (now_ms, _) = unix_now();
+        let now_micros = micros(now);
+        let policy = self.policy;
+        let mut rng = rand::rng();
+        // i2pd: `RAND_bytes(&challenge, 8)` — у нас два броска по 32 бита.
+        let challenge = (u64::from(rng.roll()) << 32) | u64::from(rng.roll());
+        let address = address_block(to);
+        let result = {
+            let Some(session) = self.sessions.get_mut(&key) else {
+                return;
+            };
+            let Some(data) = session.conn.data_mut() else {
+                return;
+            };
+            let mut ctx = SendContext {
+                now,
+                now_ms,
+                now_micros,
+                rng: &mut rng,
+            };
+            data.send_path_challenge(&policy, &mut ctx, &address, challenge)
+        };
+        match result {
+            Ok(packet) => {
+                if let Some(session) = self.sessions.get_mut(&key) {
+                    session.path_challenge = Some((to, now));
+                }
+                out.push((to, packet));
+            }
+            Err(error) => warn!(%error, conn_id = ?key, "send_path_challenge: failed"),
+        }
+    }
+
+    /// `SendPathResponse` на принятый `Path Challenge` (`:3375`): `DateTime` +
+    /// Address + `Path Response` + Ack + Padding.
+    ///
+    /// Адресный блок и адрес отправки — текущий `remote`, как и в i2pd
+    /// (`SendData` внутри `SendPathResponse` шлёт на `m_RemoteEndpoint`).
+    fn send_path_response(&mut self, key: ConnectionId, data: &[u8], out: &mut OutQueue) {
+        let now = now();
+        let (now_ms, _) = unix_now();
+        let now_micros = micros(now);
+        let policy = self.policy;
+        let mut rng = rand::rng();
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        let remote = session.remote;
+        let address = address_block(remote);
+        let Some(data_session) = session.conn.data_mut() else {
+            return;
+        };
+        let mut ctx = SendContext {
+            now,
+            now_ms,
+            now_micros,
+            rng: &mut rng,
+        };
+        match data_session.send_path_response(&policy, &mut ctx, &address, data) {
+            Ok(packet) => out.push((remote, packet)),
+            Err(error) => warn!(%error, conn_id = ?key, "send_path_response: failed"),
+        }
+    }
+
     /// Обрабатывает пакет для известного соединения.
     fn deliver(
         &mut self,
@@ -804,9 +957,13 @@ impl PoolState {
             }
         }
 
-        // TODO(suu2-pool-path): смена адреса собеседника — `Path Challenge`
-        // (i2pd `ProcessData`, `SSU2Session.cpp:1752`); пока принимаем пакет с
-        // любого адреса и не обновляем `remote`.
+        // i2pd `ProcessData` (`SSU2Session.cpp:1752`): data-пакет пришёл с
+        // адреса, отличного от текущего, — значит собеседник «переехал»
+        // (NAT rebinding) либо адрес подменён. Адрес собеседника при этом
+        // сразу **не** меняется: сначала туда уходит `Path Challenge`, и
+        // только совпавший `Path Response` разрешает переезд
+        // (`apply_data_report`).
+        self.maybe_send_path_challenge(key, packet, from, out);
 
         let now = now();
         let now_micros = micros(now);
@@ -964,6 +1121,7 @@ impl PoolState {
                 established: false,
                 outgoing: false,
                 queue: VecDeque::new(),
+                path_challenge: None,
             },
         );
         self.deliver(source_conn_id, packet, from, out);
@@ -1065,6 +1223,7 @@ impl PoolState {
                 established: false,
                 outgoing: true,
                 queue: VecDeque::new(),
+                path_challenge: None,
             },
         );
         self.by_endpoint.insert(remote, source_conn_id);
@@ -1403,6 +1562,30 @@ impl PoolState {
         }
         if let Some(address) = report.external_address {
             debug!(?address, "apply_data_report: our external address");
+        }
+
+        // `Path Challenge` от собеседника — отвечаем `Path Response` (i2pd
+        // `HandlePayload` → `SendPathResponse`); ответ уходит на текущий
+        // `remote`.
+        if let Some(challenge) = report.path_challenge {
+            debug!(ident = %ident.to_base64(), "apply_data_report: Path Challenge received");
+            self.send_path_response(key, &challenge, out);
+        }
+
+        // Наш `Path Challenge` подтверждён — только теперь меняем адрес
+        // собеседника (i2pd: `m_RemoteEndpoint = m_PathChallenge->second`).
+        if report.path_response_accepted
+            && let Some(session) = self.sessions.get_mut(&key)
+            && let Some((endpoint, sent_at)) = session.path_challenge.take()
+        {
+            debug!(
+                from = %session.remote,
+                to = %endpoint,
+                elapsed_ms = now().saturating_sub(sent_at).as_millis(),
+                conn_id = ?key,
+                "apply_data_report: remote endpoint updated"
+            );
+            session.remote = endpoint;
         }
 
         match report.termination {

@@ -6,14 +6,17 @@
 
 use rand::Rng;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use uu_i2p::{
-    I2PTag,
+    I2PTag, IdentHash,
     config::{DEFAULT_NET_ID, DEFAULT_VERSION},
     crypto::I2PX25519Keys,
     i2np::{I2npHeader, I2npMessageType},
@@ -526,4 +529,249 @@ async fn pending_endpoint_blocks_duplicate_connect_until_session_dies() {
         .await
         .expect("second connect_to");
     assert_eq!(ident2, *peer2.pool.ident());
+}
+
+// --- смена адреса собеседника (`Path Challenge`) -------------------------
+
+/// Наблюдение прокси: с какого из своих адресов пришёл пакет от Alice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// Старый адрес собеседника (`proxy.front`).
+    Front,
+    /// Новый адрес (`proxy.new`) — с него Bob'овы пакеты уходят после
+    /// «переезда», и туда же Alice шлёт `Path Challenge`.
+    New,
+}
+
+/// Прокси между двумя пулами: Alice думает, что Bob живёт на `front`, а Bob
+/// видит `back` — то есть адрес собеседника меняется только у Alice, как при
+/// NAT rebinding.
+///
+/// Пакеты Bob → Alice уходят с `front` (до переключения) или с `new` (после);
+/// всё, что Alice шлёт на `new` (челлендж, а затем обычный трафик), уходит
+/// Bob'у с `back`.
+struct Proxy {
+    /// Адрес, по которому Alice знает Bob'а.
+    front: SocketAddr,
+    /// «Новый» адрес собеседника.
+    new: SocketAddr,
+    /// Начать отправлять Bob'овы пакеты Alice с `new`.
+    switched: Arc<AtomicBool>,
+    /// Не доставлять Bob'у то, что приходит на `new` (потерянный челлендж).
+    drop_new: Arc<AtomicBool>,
+    /// С какого адреса пришёл очередной пакет от Alice.
+    seen: mpsc::UnboundedReceiver<Seen>,
+}
+
+impl Proxy {
+    /// Дожидается следующего пакета от Alice.
+    async fn next_seen(&mut self) -> Seen {
+        timeout(Duration::from_secs(5), self.seen.recv())
+            .await
+            .expect("timeout waiting for a packet from alice")
+            .expect("proxy channel closed")
+    }
+
+    /// Забывает накопленные наблюдения (перед переключением).
+    fn drain(&mut self) {
+        while self.seen.try_recv().is_ok() {}
+    }
+}
+
+/// Поднимает прокси к настоящему сокету `bob`.
+async fn start_proxy(bob: SocketAddr) -> Proxy {
+    let front = UdpSocket::bind("127.0.0.1:0").await.expect("bind front");
+    let new = UdpSocket::bind("127.0.0.1:0").await.expect("bind new");
+    let back = UdpSocket::bind("127.0.0.1:0").await.expect("bind back");
+    let front_addr = front.local_addr().expect("front addr");
+    let new_addr = new.local_addr().expect("new addr");
+    let switched = Arc::new(AtomicBool::new(false));
+    let drop_new = Arc::new(AtomicBool::new(false));
+    let (tx, seen) = mpsc::unbounded_channel();
+    let switch_flag = Arc::clone(&switched);
+    let drop_flag = Arc::clone(&drop_new);
+    tokio::spawn(async move {
+        let mut alice: Option<SocketAddr> = None;
+        let mut from_front = [0u8; 2048];
+        let mut from_new = [0u8; 2048];
+        let mut from_bob = [0u8; 2048];
+        loop {
+            tokio::select! {
+                received = front.recv_from(&mut from_front) => {
+                    let (n, addr) = received.expect("front recv");
+                    alice = Some(addr);
+                    let _ = tx.send(Seen::Front);
+                    let _ = back.send_to(&from_front[..n], bob).await;
+                }
+                received = new.recv_from(&mut from_new) => {
+                    let (n, _) = received.expect("new recv");
+                    let _ = tx.send(Seen::New);
+                    if !drop_flag.load(Ordering::Relaxed) {
+                        let _ = back.send_to(&from_new[..n], bob).await;
+                    }
+                }
+                received = back.recv_from(&mut from_bob) => {
+                    let (n, _) = received.expect("back recv");
+                    let source = if switch_flag.load(Ordering::Relaxed) { &new } else { &front };
+                    if let Some(addr) = alice {
+                        let _ = source.send_to(&from_bob[..n], addr).await;
+                    }
+                }
+            }
+        }
+    });
+    Proxy {
+        front: front_addr,
+        new: new_addr,
+        switched,
+        drop_new,
+        seen,
+    }
+}
+
+/// Поднимает пару через прокси и доводит рукопожатие с обменом `RouterInfo` до
+/// конца — переключать адрес раньше нельзя, иначе развалится рукопожатие.
+async fn proxy_pair() -> (Node, Node, Proxy, IdentHash, IdentHash) {
+    let bob = make_node().await;
+    let proxy = start_proxy(bob.addr).await;
+    let alice = make_node().await;
+    let alice_ident = *alice.pool.ident();
+    let bob_ident = *bob.pool.ident();
+    info!(
+        front = %proxy.front,
+        new = %proxy.new,
+        "proxy ready: Alice знает Bob'а по адресу `front`, `new` — адрес после переезда"
+    );
+
+    assert_eq!(
+        alice
+            .pool
+            .connect_to(&bob.ri, proxy.front)
+            .await
+            .expect("connect through proxy"),
+        bob_ident,
+        "Alice подключается к адресу прокси"
+    );
+
+    let mut alice_events = Vec::new();
+    let mut bob_events = Vec::new();
+    let _ = wait_event(&alice.pool, &mut alice_events, "alice Established", |e| {
+        matches!(e, Ssu2Event::Established { .. })
+    })
+    .await;
+    let _ = wait_event(&bob.pool, &mut bob_events, "bob Established", |e| {
+        matches!(e, Ssu2Event::Established { .. })
+    })
+    .await;
+    let _ = wait_event(&bob.pool, &mut bob_events, "bob RouterInfo", |e| {
+        matches!(e, Ssu2Event::RouterInfo { .. })
+    })
+    .await;
+    let _ = wait_event(&alice.pool, &mut alice_events, "alice RouterInfo", |e| {
+        matches!(e, Ssu2Event::RouterInfo { .. })
+    })
+    .await;
+    (alice, bob, proxy, alice_ident, bob_ident)
+}
+
+/// Смена адреса собеседника: на первый же пакет с нового адреса Alice шлёт
+/// `Path Challenge` туда, а адрес (`remote`) меняет только после совпавшего
+/// `Path Response` (i2pd `ProcessData`, `SSU2Session.cpp:1752`).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn path_response_updates_remote_endpoint() {
+    init_tracing();
+    let (alice, bob, mut proxy, _alice_ident, bob_ident) = proxy_pair().await;
+    let mut bob_events = Vec::new();
+
+    proxy.drain();
+    proxy.switched.store(true, Ordering::Relaxed);
+
+    // Пока путь не подтверждён, трафик идёт на старый адрес.
+    alice
+        .pool
+        .send_to(&bob_ident, message(0x1111_0001, b"via front"))
+        .await
+        .expect("send");
+    assert_eq!(
+        proxy.next_seen().await,
+        Seen::Front,
+        "пакет от Alice идёт на старый адрес"
+    );
+    let _ = wait_event(&bob.pool, &mut bob_events, "bob message", |e| {
+        matches!(e, Ssu2Event::Message { .. })
+    })
+    .await;
+
+    // Ответ Bob'а приходит от нового адреса: Alice шлёт туда `Path Challenge`,
+    // Bob отвечает `Path Response`, и только потом путь переключается.
+    // Дожидаемся **двух** пакетов на новом адресе: челленджа и трафика после
+    // подтверждения.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut on_new = 0u32;
+    let mut probes = 0u32;
+    while on_new < 2 && Instant::now() < deadline {
+        alice
+            .pool
+            .send_to(&bob_ident, message(0x1111_0100 + probes, b"probe"))
+            .await
+            .expect("send probe");
+        probes += 1;
+        if proxy.next_seen().await == Seen::New {
+            on_new += 1;
+        }
+    }
+    assert!(
+        on_new >= 2,
+        "после `Path Response` пакеты идут на новый адрес (пакетов на новом адресе: {on_new})"
+    );
+}
+
+/// Без `Path Response` адрес собеседника не меняется: `Path Challenge` уходит,
+/// но трафик продолжает идти на прежний адрес, и повторно челлендж не шлётся
+/// (i2pd: `from != m_PathChallenge->second`).
+#[tokio::test]
+async fn path_challenge_without_response_keeps_endpoint() {
+    init_tracing();
+    let (alice, bob, mut proxy, _alice_ident, bob_ident) = proxy_pair().await;
+    let mut bob_events = Vec::new();
+
+    proxy.drain();
+    proxy.switched.store(true, Ordering::Relaxed);
+    // Челлендж «теряется» на пути к Bob'у — `Path Response` не придёт.
+    proxy.drop_new.store(true, Ordering::Relaxed);
+
+    alice
+        .pool
+        .send_to(&bob_ident, message(0x2222_0001, b"via front"))
+        .await
+        .expect("send");
+    assert_eq!(
+        proxy.next_seen().await,
+        Seen::Front,
+        "пакет от Alice идёт на старый адрес"
+    );
+    let _ = wait_event(&bob.pool, &mut bob_events, "bob message", |e| {
+        matches!(e, Ssu2Event::Message { .. })
+    })
+    .await;
+    assert_eq!(
+        proxy.next_seen().await,
+        Seen::New,
+        "на пакет с нового адреса Alice отвечает `Path Challenge`"
+    );
+
+    // Челлендж не подтверждён — путь не меняется, и второго челленджа нет.
+    for probe in 0..5u32 {
+        alice
+            .pool
+            .send_to(&bob_ident, message(0x2222_0100 + probe, b"probe"))
+            .await
+            .expect("send probe");
+        assert_eq!(
+            proxy.next_seen().await,
+            Seen::Front,
+            "без `Path Response` трафик идёт на старый адрес (проба {probe})"
+        );
+    }
 }
