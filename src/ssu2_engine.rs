@@ -1,0 +1,701 @@
+//! SSU2 — движок сессии, приём data-пакетов.
+//!
+//! Связывает примитивы в одну сессию: заголовок и деобфускация
+//! ([`crate::ssu2_data::decode_data_packet`]), диспетчер блоков
+//! ([`crate::ssu2_recv::process_data`] / [`PayloadSink`]), дедуп и истечение
+//! I2NP ([`crate::ssu2_recv::ReceivedMsgIds`]), сборку фрагментов
+//! ([`crate::ssu2_fragments::IncompleteMessages`]), учёт подтверждений
+//! ([`crate::ssu2_session::SendState`]) и состояние сессии
+//! ([`crate::ssu2_lifecycle::SessionLifecycle`]).
+//!
+//! Зеркалит `SSU2Session::ProcessData` (`SSU2Session.cpp:1737`) и `HandlePayload`
+//! (`:1780`) в части приёма; решения, зависящие от политики (`HandleAck`,
+//! `HandleDateTime`), принимает [`Ssu2Policy`]/[`Ssu2CongestionPolicy`].
+//!
+//! ## Что делает вызывающий
+//!
+//! Всё, что в i2pd завязано на роутер, отдаётся наружу — их нужно обработать
+//! самим (пока не реализовано):
+//!
+//! - [`PendingBlock`] — `RouterInfo` (netdb), relay-блоки и peer test;
+//! - [`RecvReport::external_address`] — `HandleAddress` (обновление своего
+//!   внешнего адреса и детект NAT);
+//! - [`RecvReport::new_token`] — `NewToken` (обновление токена у сервера);
+//! - [`RecvReport::datetime`] — решение `HandleDateTime` (коррекция часов или
+//!   завершение), применяет вызывающий;
+//! - [`RecvReport::path_challenge`] — данные, на которые надо ответить
+//!   `PathResponse` (`SendPathResponse`);
+//! - [`RecvReport::termination`] — что делать с `Termination` (ответить своим
+//!   `Termination` или завершать сразу).
+//!
+//! TODO(ssu2-engine-send): отправка (SendData/SendQueue/SendQuickAck/
+//! SendTermination/SendPathResponse) и таймеры ([`crate::ssu2_timers`]).
+//! TODO(ssu2-engine-handshake): handshake — `Ack` в состоянии
+//! `SessionConfirmedSent` переводит сессию в `Established` (`SSU2Session.cpp:2037`).
+
+use std::time::Duration;
+
+use tracing::{debug, trace, warn};
+
+use crate::i2np_message::I2npMessage;
+use crate::ssu2_ack::Ssu2AckBlock;
+use crate::ssu2_block::{
+    AddressBlock, FirstFragmentBlock, FollowOnFragmentBlock, NewTokenBlock, PathChallengeBlock,
+    PathResponseBlock, RelayTagBlock, Ssu2Block, Ssu2TerminationReason, TerminationBlock,
+};
+use crate::ssu2_crypto::{DataPhaseKey, DataPhaseKeys};
+use crate::ssu2_data::decode_data_packet;
+use crate::ssu2_fragments::IncompleteMessages;
+use crate::ssu2_header::ConnectionId;
+use crate::ssu2_lifecycle::{SessionLifecycle, Ssu2SessionState};
+use crate::ssu2_policy::{
+    DateTimeAction, DateTimeSession, HandshakePhase, Ssu2CongestionPolicy, Ssu2Policy,
+};
+use crate::ssu2_recv::{self, PayloadSink, ReceivedI2np, ReceivedMsgIds};
+use crate::ssu2_session::{ReceiveState, SendState};
+
+/// Роль стороны в data phase (определяет направление ключей).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSessionRole {
+    /// Alice (инициатор): отправляет ключом `ab`, принимает `ba`.
+    Initiator,
+    /// Bob (ответчик): наоборот.
+    Responder,
+}
+
+/// Параметры установленной data-сессии (результат handshake).
+#[derive(Debug, Clone, Copy)]
+pub struct DataSessionParams {
+    /// Роль стороны.
+    pub role: DataSessionRole,
+    /// Наш идентификатор соединения (id отправителя).
+    pub source_conn_id: ConnectionId,
+    /// Идентификатор собеседника (id получателя).
+    pub dest_conn_id: ConnectionId,
+    /// Ключи data phase обоих направлений.
+    pub data_keys: DataPhaseKeys,
+    /// Наш intro-ключ (деобфускация входящих заголовков).
+    pub local_intro_key: [u8; 32],
+    /// Intro-ключ собеседника (обфускация исходящих заголовков).
+    pub remote_intro_key: [u8; 32],
+    /// Максимальный размер payload'а пакета (`m_MaxPayloadSize`).
+    pub max_payload: usize,
+    /// Роутер в тестовом режиме (для `HandleDateTime`).
+    pub testing: bool,
+    /// `m_Server.IsSyncClockFromPeers()`.
+    pub sync_clock_from_peers: bool,
+}
+
+/// Итог обработки блока `Termination` (ветки `SSU2Session.cpp:1855`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationAction {
+    /// Ответить своим `Termination` (i2pd `RequestTermination`).
+    ReplyAndClose,
+    /// Завершить сразу (i2pd `Done`); при состоянии `Closing` и коде
+    /// `TerminationReceived` — предварительно `ClosingConfirmed`.
+    CloseNow,
+    /// Сессия уже завершена — запомнить причину (i2pd `m_TerminationReason`).
+    RecordReason(Ssu2TerminationReason),
+}
+
+/// Блок, который обрабатывает вызывающий (в i2pd — уровень роутера).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingBlock {
+    /// `RouterInfo` (netdb, `HandleRouterInfo`).
+    RouterInfo(Vec<u8>),
+    /// Relay request (`HandleRelayRequest`).
+    RelayRequest(Vec<u8>),
+    /// Relay response (`HandleRelayResponse`).
+    RelayResponse(Vec<u8>),
+    /// Relay intro (`HandleRelayIntro`).
+    RelayIntro(Vec<u8>),
+    /// Peer test (`HandlePeerTest`).
+    PeerTest(Vec<u8>),
+}
+
+/// Итог [`Ssu2DataSession::recv`].
+#[derive(Debug, Default)]
+pub struct RecvReport {
+    /// Принятые I2NP-сообщения (после дедупа и сборки фрагментов).
+    pub i2np: Vec<I2npMessage>,
+    /// i2pd `m_IsDataReceived`.
+    pub data_received: bool,
+    /// i2pd `m_IsInvalidMessage`.
+    pub invalid_message: bool,
+    /// Решение по блоку `DateTime` (последнему в пакете).
+    pub datetime: Option<DateTimeAction>,
+    /// Что делать с блоком `Termination`.
+    pub termination: Option<TerminationAction>,
+    /// Данные `Path Challenge`, на которые нужно ответить.
+    pub path_challenge: Option<Vec<u8>>,
+    /// Наш `Path Challenge` подтверждён (i2pd обновляет endpoint).
+    pub path_response_accepted: bool,
+    /// `NewToken`: `(expires, token)` — обновить исходящий токен на сервере.
+    pub new_token: Option<(u32, u64)>,
+    /// `Address`: наш внешний адрес, каким его видит собеседник.
+    pub external_address: Option<AddressBlock>,
+    /// Блоки, которые должен обработать вызывающий (см. [`PendingBlock`]).
+    pub pending: Vec<PendingBlock>,
+}
+
+/// Событие одного блока payload'а, собранное [`Collector`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockEvent {
+    I2np(Vec<u8>),
+    FirstFragment(Vec<u8>),
+    FollowOnFragment(Vec<u8>),
+    Ack(Vec<u8>),
+    Termination(Vec<u8>),
+    DateTime(Vec<u8>),
+    PathChallenge(Vec<u8>),
+    PathResponse(Vec<u8>),
+    RelayTag(Vec<u8>),
+    RelayTagRequest,
+    NewToken(Vec<u8>),
+    Address(Vec<u8>),
+    RouterInfo(Vec<u8>),
+    RelayRequest(Vec<u8>),
+    RelayResponse(Vec<u8>),
+    RelayIntro(Vec<u8>),
+    PeerTest(Vec<u8>),
+}
+
+/// Простой [`PayloadSink`], складывающий блоки в список событий.
+///
+/// Так обработка блоков не конфликтует с заимствованием состояния сессии:
+/// сперва диспетчер собирает события, затем сессия их применяет.
+#[derive(Debug, Default)]
+struct Collector {
+    events: Vec<BlockEvent>,
+}
+
+impl Collector {
+    fn push(&mut self, event: BlockEvent) {
+        self.events.push(event);
+    }
+}
+
+impl PayloadSink for Collector {
+    fn on_datetime(&mut self, body: &[u8]) {
+        self.push(BlockEvent::DateTime(body.to_vec()));
+    }
+
+    fn on_router_info(&mut self, body: &[u8]) {
+        self.push(BlockEvent::RouterInfo(body.to_vec()));
+    }
+
+    fn on_i2np_message(&mut self, body: &[u8]) {
+        self.push(BlockEvent::I2np(body.to_vec()));
+    }
+
+    fn on_first_fragment(&mut self, body: &[u8]) {
+        self.push(BlockEvent::FirstFragment(body.to_vec()));
+    }
+
+    fn on_follow_on_fragment(&mut self, body: &[u8]) {
+        self.push(BlockEvent::FollowOnFragment(body.to_vec()));
+    }
+
+    fn on_termination(&mut self, body: &[u8]) {
+        self.push(BlockEvent::Termination(body.to_vec()));
+    }
+
+    fn on_relay_request(&mut self, body: &[u8]) {
+        self.push(BlockEvent::RelayRequest(body.to_vec()));
+    }
+
+    fn on_relay_response(&mut self, body: &[u8]) {
+        self.push(BlockEvent::RelayResponse(body.to_vec()));
+    }
+
+    fn on_relay_intro(&mut self, body: &[u8]) {
+        self.push(BlockEvent::RelayIntro(body.to_vec()));
+    }
+
+    fn on_peer_test(&mut self, body: &[u8]) {
+        self.push(BlockEvent::PeerTest(body.to_vec()));
+    }
+
+    fn on_ack(&mut self, body: &[u8]) {
+        self.push(BlockEvent::Ack(body.to_vec()));
+    }
+
+    fn on_address(&mut self, body: &[u8]) {
+        self.push(BlockEvent::Address(body.to_vec()));
+    }
+
+    fn on_relay_tag_request(&mut self) {
+        self.push(BlockEvent::RelayTagRequest);
+    }
+
+    fn on_relay_tag(&mut self, body: &[u8]) {
+        self.push(BlockEvent::RelayTag(body.to_vec()));
+    }
+
+    fn on_new_token(&mut self, body: &[u8]) {
+        self.push(BlockEvent::NewToken(body.to_vec()));
+    }
+
+    fn on_path_challenge(&mut self, body: &[u8]) {
+        self.push(BlockEvent::PathChallenge(body.to_vec()));
+    }
+
+    fn on_path_response(&mut self, body: &[u8]) {
+        self.push(BlockEvent::PathResponse(body.to_vec()));
+    }
+}
+
+/// Состояние одной SSU2-сессии (пока — только приём data-пакетов).
+#[derive(Debug, Clone)]
+pub struct Ssu2DataSession {
+    lifecycle: SessionLifecycle,
+    receive: ReceiveState,
+    send: SendState,
+    received_msg_ids: ReceivedMsgIds,
+    incomplete: IncompleteMessages,
+    params: DataSessionParams,
+    send_key: DataPhaseKey,
+    recv_key: DataPhaseKey,
+    last_activity: Duration,
+    relay_tag: Option<u32>,
+    relay_tag_requested: bool,
+    external_address: Option<AddressBlock>,
+    remote_termination: Option<Ssu2TerminationReason>,
+    path_challenge_sent: Option<u64>,
+    path_validated: bool,
+}
+
+impl Ssu2DataSession {
+    /// Создаёт сессию в состоянии [`Ssu2SessionState::Unknown`].
+    ///
+    /// `congestion` нужна [`SendState`] для начальных окна и RTO.
+    #[must_use]
+    pub fn new<C: Ssu2CongestionPolicy>(params: DataSessionParams, congestion: &C) -> Self {
+        let (send_key, recv_key) = match params.role {
+            DataSessionRole::Initiator => (params.data_keys.ab, params.data_keys.ba),
+            DataSessionRole::Responder => (params.data_keys.ba, params.data_keys.ab),
+        };
+        Self {
+            lifecycle: SessionLifecycle::new(),
+            receive: ReceiveState::new(),
+            send: SendState::new(congestion),
+            received_msg_ids: ReceivedMsgIds::new(),
+            incomplete: IncompleteMessages::new(),
+            params,
+            send_key,
+            recv_key,
+            last_activity: Duration::ZERO,
+            relay_tag: None,
+            relay_tag_requested: false,
+            external_address: None,
+            remote_termination: None,
+            path_challenge_sent: None,
+            path_validated: false,
+        }
+    }
+
+    /// Состояние сессии.
+    #[must_use]
+    pub const fn state(&self) -> Ssu2SessionState {
+        self.lifecycle.state()
+    }
+
+    /// Сессия установлена?
+    #[must_use]
+    pub const fn is_established(&self) -> bool {
+        self.lifecycle.is_established()
+    }
+
+    /// Переход в `Established` (i2pd `Established`; таймеры и очередь — TODO).
+    pub const fn establish(&mut self) -> bool {
+        self.lifecycle.establish()
+    }
+
+    /// Регистрирует отправленный пакет в окне (для `SendData`/повторов).
+    pub fn register_sent(&mut self, packet_num: u32, now: Duration) {
+        self.send.register_sent(packet_num, now);
+    }
+
+    /// Начинает завершение (i2pd `RequestTermination`): в `Established`/
+    /// `Closing` — запомнить причину и перейти в `Closing`, иначе — сразу
+    /// `Terminate`.
+    pub const fn request_termination(
+        &mut self,
+        reason: Ssu2TerminationReason,
+    ) -> crate::ssu2_lifecycle::TerminationPlan {
+        self.lifecycle.request_termination(reason)
+    }
+
+    /// Немедленное завершение (i2pd `Terminate`); идемпотентно.
+    pub const fn terminate(&mut self) -> bool {
+        self.lifecycle.terminate()
+    }
+
+    /// Причина завершения (`m_TerminationReason`).
+    #[must_use]
+    pub const fn termination_reason(&self) -> Ssu2TerminationReason {
+        self.lifecycle.termination_reason()
+    }
+
+    /// Время последней активности (`m_LastActivityTimestamp`).
+    #[must_use]
+    pub const fn last_activity(&self) -> Duration {
+        self.last_activity
+    }
+
+    /// Приёмное состояние (номера пакетов, ACK).
+    #[must_use]
+    pub const fn receive(&self) -> &ReceiveState {
+        &self.receive
+    }
+
+    /// Отправное состояние (окно, RTT/RTO, неподтверждённые пакеты).
+    #[must_use]
+    pub const fn send(&self) -> &SendState {
+        &self.send
+    }
+
+    /// Наш relay-тег, если прислан блоком `Relay Tag`.
+    #[must_use]
+    pub const fn relay_tag(&self) -> Option<u32> {
+        self.relay_tag
+    }
+
+    /// Просили ли relay-тег (пришёл блок `Relay Tag Request`).
+    #[must_use]
+    pub const fn relay_tag_requested(&self) -> bool {
+        self.relay_tag_requested
+    }
+
+    /// Внешний адрес, каким его видит собеседник (блок `Address`).
+    #[must_use]
+    pub const fn external_address(&self) -> Option<&AddressBlock> {
+        self.external_address.as_ref()
+    }
+
+    /// Причина завершения, присланная собеседником после терминации.
+    #[must_use]
+    pub const fn remote_termination(&self) -> Option<Ssu2TerminationReason> {
+        self.remote_termination
+    }
+
+    /// Подтверждён ли наш `Path Challenge` (новый endpoint валиден).
+    #[must_use]
+    pub const fn path_validated(&self) -> bool {
+        self.path_validated
+    }
+
+    /// Ключ отправки data-пакетов (TODO(ssu2-engine-send): `SendData`).
+    #[must_use]
+    pub const fn send_key(&self) -> &DataPhaseKey {
+        &self.send_key
+    }
+
+    /// Запоминает отправленный `Path Challenge` (i2pd `m_PathChallenge`).
+    pub const fn set_path_challenge_sent(&mut self, challenge: u64) {
+        self.path_challenge_sent = Some(challenge);
+    }
+
+    /// Принимает один data-пакет: деобфусцирует, расшифровывает, разбирает
+    /// блоки и применяет их.
+    ///
+    /// `packet` деобфусцируется **на месте** (как и в i2pd). `now` — монотонное
+    /// время (для фрагментов и RTT), `now_secs` — Unix-время в секундах (для
+    /// `DateTime`).
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки разбора/расшифровки из
+    /// [`crate::ssu2_data::decode_data_packet`].
+    ///
+    /// # Panics
+    ///
+    /// Не паникует: размер scratch-буфера выведен из длины пакета.
+    pub fn recv<P: Ssu2Policy, C: Ssu2CongestionPolicy>(
+        &mut self,
+        packet: &mut [u8],
+        policy: &P,
+        congestion: &C,
+        now: Duration,
+        now_secs: u64,
+    ) -> crate::Result<RecvReport> {
+        let mut plain = vec![0u8; packet.len()];
+        let (header, payload) = decode_data_packet(
+            packet,
+            &self.params.local_intro_key,
+            &self.recv_key,
+            &mut plain,
+        )?;
+        trace!(
+            packet_num = header.packet_num,
+            flags = header.flags[0],
+            payload_len = payload.len(),
+            state = ?self.lifecycle.state(),
+            "recv: decoded data packet"
+        );
+        // i2pd обновляет m_LastActivityTimestamp при активной работе с
+        // пакетом (base TransportSession::UpdateNumReceivedBytes).
+        self.last_activity = now;
+
+        let mut collector = Collector::default();
+        let result = ssu2_recv::process_data(
+            header.flags[0],
+            header.packet_num,
+            payload,
+            &mut self.receive,
+            &mut collector,
+        );
+
+        let mut report = RecvReport {
+            data_received: result.data_received,
+            invalid_message: result.invalid_message,
+            ..RecvReport::default()
+        };
+        if result.invalid_message {
+            warn!(
+                packet_num = header.packet_num,
+                "recv: invalid message in payload"
+            );
+        }
+        for event in collector.events {
+            self.apply_event(event, policy, congestion, now, now_secs, &mut report);
+        }
+        trace!(
+            packet_num = header.packet_num,
+            i2np = report.i2np.len(),
+            data_received = report.data_received,
+            "recv: applied payload blocks"
+        );
+        Ok(report)
+    }
+
+    /// Применяет одно событие блока к состоянию сессии.
+    fn apply_event<P: Ssu2Policy, C: Ssu2CongestionPolicy>(
+        &mut self,
+        event: BlockEvent,
+        policy: &P,
+        congestion: &C,
+        now: Duration,
+        now_secs: u64,
+        report: &mut RecvReport,
+    ) {
+        trace!(block = ?event_kind(&event), "apply_event: dispatching block");
+        match event {
+            BlockEvent::I2np(body) => self.accept_i2np_body(&body, report),
+            BlockEvent::FirstFragment(body) => {
+                if let Ok(block) = FirstFragmentBlock::parse(&body)
+                    && let Some(msg) = self.incomplete.handle_first_fragment(&block, now)
+                {
+                    self.accept_i2np(msg, report);
+                }
+            }
+            BlockEvent::FollowOnFragment(body) => {
+                if let Ok(block) = FollowOnFragmentBlock::parse(&body)
+                    && let Some(msg) = self.incomplete.handle_follow_on_fragment(
+                        &block,
+                        now,
+                        policy.max_num_fragments(),
+                    )
+                {
+                    self.accept_i2np(msg, report);
+                }
+            }
+            BlockEvent::Ack(body) => self.apply_ack(&body, congestion, now),
+            BlockEvent::Termination(body) => self.apply_termination(&body, report),
+            BlockEvent::DateTime(body) => {
+                let session = DateTimeSession {
+                    phase: handshake_phase(self.lifecycle.state()),
+                    testing: self.params.testing,
+                    sync_clock_from_peers: self.params.sync_clock_from_peers,
+                };
+                let action = ssu2_recv::handle_datetime(policy, &body, now_secs, &session);
+                debug!(action = ?action, "apply_event: datetime decision");
+                report.datetime = Some(action);
+            }
+            BlockEvent::PathChallenge(body) => {
+                if let Ok(block) = PathChallengeBlock::parse(&body) {
+                    debug!(
+                        challenge_len = block.data.len(),
+                        "apply_event: path challenge received; response required"
+                    );
+                    report.path_challenge = Some(block.data.to_vec());
+                }
+            }
+            BlockEvent::PathResponse(body) => {
+                if let Ok(block) = PathResponseBlock::parse(&body)
+                    && let Some(sent) = self.path_challenge_sent
+                    && let Some(head) = block.data.first_chunk::<8>()
+                    && u64::from_be_bytes(*head) == sent
+                {
+                    debug!("apply_event: path challenge validated");
+                    self.path_validated = true;
+                    self.path_challenge_sent = None;
+                    report.path_response_accepted = true;
+                }
+            }
+            BlockEvent::RelayTag(body) => {
+                if let Ok(block) = RelayTagBlock::parse(&body) {
+                    debug!(relay_tag = block.relay_tag, "apply_event: relay tag");
+                    self.relay_tag = Some(block.relay_tag);
+                }
+            }
+            BlockEvent::RelayTagRequest => {
+                debug!("apply_event: relay tag requested");
+                self.relay_tag_requested = true;
+            }
+            BlockEvent::NewToken(body) => {
+                if let Ok(block) = NewTokenBlock::parse(&body) {
+                    trace!(
+                        expires = block.expires,
+                        "apply_event: new token for outgoing requests"
+                    );
+                    report.new_token = Some((block.expires, block.token));
+                }
+            }
+            BlockEvent::Address(body) => {
+                if let Ok(address) = AddressBlock::parse(&body) {
+                    debug!(?address, "apply_event: external address from peer");
+                    self.external_address = Some(address);
+                    report.external_address = Some(address);
+                }
+            }
+            BlockEvent::RouterInfo(body) => report.pending.push(PendingBlock::RouterInfo(body)),
+            BlockEvent::RelayRequest(body) => report.pending.push(PendingBlock::RelayRequest(body)),
+            BlockEvent::RelayResponse(body) => {
+                report.pending.push(PendingBlock::RelayResponse(body));
+            }
+            BlockEvent::RelayIntro(body) => report.pending.push(PendingBlock::RelayIntro(body)),
+            BlockEvent::PeerTest(body) => report.pending.push(PendingBlock::PeerTest(body)),
+        }
+    }
+
+    /// Разбирает тело блока `I2NP` и, если сообщение новое и не истекло,
+    /// отдаёт его в [`RecvReport::i2np`].
+    fn accept_i2np_body(&mut self, body: &[u8], report: &mut RecvReport) {
+        match I2npMessage::from_ntcp2_bytes(body) {
+            Ok(msg) => self.accept_i2np(msg, report),
+            Err(error) => {
+                warn!(%error, "accept_i2np_body: malformed I2NP message");
+            }
+        }
+    }
+
+    /// Дедуп + проверка истечения по времени последней активности
+    /// (`HandleI2NPMsg`), иначе — в отчёт.
+    fn accept_i2np(&mut self, msg: I2npMessage, report: &mut RecvReport) {
+        match self
+            .received_msg_ids
+            .handle_i2np_msg(&msg, self.last_activity)
+        {
+            ReceivedI2np::Accept => {
+                debug!(
+                    msg_id = msg.header().msg_id,
+                    msg_type = ?msg.header().message_type,
+                    "accept_i2np: accepted"
+                );
+                report.i2np.push(msg);
+            }
+            ReceivedI2np::Duplicate => {
+                trace!(
+                    msg_id = msg.header().msg_id,
+                    "accept_i2np: duplicate; dropped"
+                );
+            }
+            ReceivedI2np::Expired => {
+                debug!(
+                    msg_id = msg.header().msg_id,
+                    "accept_i2np: expired; dropped"
+                );
+            }
+        }
+    }
+
+    /// `HandleAck`: применяет подтверждённые диапазоны к [`SendState`].
+    ///
+    /// Разбор диапазонов и замер RTT по первому (`acnt`-)диапазону — внутри
+    /// [`SendState::handle_ack`].
+    fn apply_ack<C: Ssu2CongestionPolicy>(&mut self, body: &[u8], congestion: &C, now: Duration) {
+        if self.send.in_flight() == 0 {
+            trace!("apply_ack: nothing sent; ignored");
+            return; // i2pd: m_SentPackets.empty ()
+        }
+        let Ok(ack) = Ssu2AckBlock::parse(body) else {
+            trace!("apply_ack: ack block too short; ignored");
+            return; // i2pd: len < 5
+        };
+        let acked = self.send.handle_ack(&ack, now, congestion);
+        debug!(
+            acked = ?acked,
+            in_flight = self.send.in_flight(),
+            "apply_ack: ack applied"
+        );
+    }
+
+    /// Блок `Termination` (`SSU2Session.cpp:1855`).
+    fn apply_termination(&mut self, body: &[u8], report: &mut RecvReport) {
+        let Ok(block) = TerminationBlock::parse(body) else {
+            warn!("apply_termination: malformed termination block");
+            return;
+        };
+        let reason = block
+            .reason_kind()
+            .unwrap_or(Ssu2TerminationReason::NormalClose);
+        if self.lifecycle.is_established() && reason != Ssu2TerminationReason::TerminationReceived {
+            debug!(?reason, "apply_termination: answering with termination");
+            let _ = self
+                .lifecycle
+                .request_termination(Ssu2TerminationReason::TerminationReceived);
+            report.termination = Some(TerminationAction::ReplyAndClose);
+        } else if !self.lifecycle.is_terminated() {
+            debug!(?reason, "apply_termination: closing session now");
+            if self.lifecycle.state() == Ssu2SessionState::Closing
+                && reason == Ssu2TerminationReason::TerminationReceived
+            {
+                self.lifecycle.set_state(Ssu2SessionState::ClosingConfirmed);
+            }
+            report.termination = Some(TerminationAction::CloseNow);
+        } else {
+            debug!(
+                ?reason,
+                "apply_termination: already terminated; reason recorded"
+            );
+            self.remote_termination = Some(reason);
+            report.termination = Some(TerminationAction::RecordReason(reason));
+        }
+    }
+}
+
+/// Имя варианта [`BlockEvent`] для `tracing`.
+const fn event_kind(event: &BlockEvent) -> &'static str {
+    match event {
+        BlockEvent::I2np(_) => "I2np",
+        BlockEvent::FirstFragment(_) => "FirstFragment",
+        BlockEvent::FollowOnFragment(_) => "FollowOnFragment",
+        BlockEvent::Ack(_) => "Ack",
+        BlockEvent::Termination(_) => "Termination",
+        BlockEvent::DateTime(_) => "DateTime",
+        BlockEvent::PathChallenge(_) => "PathChallenge",
+        BlockEvent::PathResponse(_) => "PathResponse",
+        BlockEvent::RelayTag(_) => "RelayTag",
+        BlockEvent::RelayTagRequest => "RelayTagRequest",
+        BlockEvent::NewToken(_) => "NewToken",
+        BlockEvent::Address(_) => "Address",
+        BlockEvent::RouterInfo(_) => "RouterInfo",
+        BlockEvent::RelayRequest(_) => "RelayRequest",
+        BlockEvent::RelayResponse(_) => "RelayResponse",
+        BlockEvent::RelayIntro(_) => "RelayIntro",
+        BlockEvent::PeerTest(_) => "PeerTest",
+    }
+}
+
+/// Фаза сессии для [`Ssu2Policy::datetime_action`] (i2pd `m_State`).
+const fn handshake_phase(state: Ssu2SessionState) -> HandshakePhase {
+    match state {
+        Ssu2SessionState::SessionRequestReceived => HandshakePhase::SessionRequestReceived,
+        Ssu2SessionState::TokenRequestReceived => HandshakePhase::TokenRequestReceived,
+        Ssu2SessionState::SessionCreatedReceived => HandshakePhase::SessionCreatedReceived,
+        Ssu2SessionState::TokenReceived => HandshakePhase::TokenReceived,
+        Ssu2SessionState::Established => HandshakePhase::Established,
+        _ => HandshakePhase::Other,
+    }
+}
