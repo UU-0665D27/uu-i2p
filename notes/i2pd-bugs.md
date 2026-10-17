@@ -23,6 +23,10 @@
   пустом ключе свежесозданного `DHRatchet`.
 - Последствие: детерминированный remote-crash роутера/дестинейшена.
 - Фикс: `e5621949` — «chech ratchets payload size and key».
+- Подтверждено живым POC (2026-10-17): `examples/uu-i2p-poc-i2pd-dest-nextkey.rs`
+  доводит destination i2pd (httpproxy) до строки фикса
+  `Garlic: Forward next key received, but key is not set` — до фикса здесь был
+  null-deref. Разбор и полный лог: `notes/ecies-nextkey-vuln.md` §7.
 - Разбор: `notes/ecies-nextkey-vuln.md`.
 
 ## 2. ECIES-X25519: OOB-чтение в `HandlePayload` (усечённый заголовок блока)
