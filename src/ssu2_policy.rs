@@ -89,6 +89,12 @@ pub const SSU2_RECEIVED_I2NP_MSGIDS_CLEANUP_TIMEOUT: Duration = Duration::from_s
 /// Период затухания набора принятых `msgID`: если сессия неактивна дольше,
 /// набор чистится целиком (`SSU2_DECAY_INTERVAL`).
 pub const SSU2_DECAY_INTERVAL: Duration = Duration::from_secs(20);
+/// Интервал плановой переотправки своего `RouterInfo`
+/// (`SSU2_ROUTERINFO_RESEND_INTERVAL`).
+pub const SSU2_ROUTERINFO_RESEND_INTERVAL: Duration = Duration::from_mins(20);
+/// Разброс интервала переотправки `RouterInfo`
+/// (`SSU2_ROUTERINFO_RESEND_INTERVAL_VARIANCE`).
+pub const SSU2_ROUTERINFO_RESEND_INTERVAL_VARIANCE: Duration = Duration::from_mins(30);
 /// Маска случайного байта для выбора размера padding'а (`0..=31`).
 pub const SSU2_PADDING_ROLL_MASK: u8 = 0x1F;
 
@@ -256,6 +262,30 @@ pub trait Ssu2Policy: Send + Sync {
     /// Минимальный интервал между попытками повтора.
     fn resend_attempt_min_interval(&self) -> Duration {
         SSU2_RESEND_ATTEMPT_MIN_INTERVAL
+    }
+
+    /// Можно ли сейчас начать попытку переотправки?
+    ///
+    /// Зеркалит первую строку `SSU2Session::Resend` (`SSU2Session.cpp:616`).
+    /// В i2pd там задумывался троттлинг «не чаще чем раз в
+    /// [`Self::resend_attempt_min_interval`]», но условие написано наоборот
+    /// (`ts + MIN < last_attempt`), поэтому фактически троттлинга нет —
+    /// дефолт воспроизводит именно фактическое поведение i2pd (см.
+    /// `notes/i2pd-bugs.md`, п. 3). Исправленный троттлинг подставляется своей
+    /// реализацией трейта.
+    fn can_attempt_resend(&self, last_attempt: Option<Duration>, now: Duration) -> bool {
+        last_attempt
+            .is_none_or(|last| now.saturating_add(self.resend_attempt_min_interval()) >= last)
+    }
+
+    /// Интервал плановой переотправки своего `RouterInfo`.
+    fn router_info_resend_interval(&self) -> Duration {
+        SSU2_ROUTERINFO_RESEND_INTERVAL
+    }
+
+    /// Разброс интервала переотправки `RouterInfo` (jitter — `rng % variance`).
+    fn router_info_resend_variance(&self) -> Duration {
+        SSU2_ROUTERINFO_RESEND_INTERVAL_VARIANCE
     }
 
     // --- токены ---

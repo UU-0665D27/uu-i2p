@@ -9,7 +9,8 @@ use uu_i2p::{
         SSU2_MAX_NUM_FRAGMENTS, SSU2_MAX_NUM_RESENDS, SSU2_MAX_PACKET_SIZE, SSU2_MAX_RTO,
         SSU2_MAX_WINDOW_SIZE, SSU2_MIN_PACKET_SIZE, SSU2_MIN_RTO, SSU2_MIN_WINDOW_SIZE,
         SSU2_NEXT_TOKEN_EXPIRATION_TIMEOUT, SSU2_PACKET_OVERHEAD, SSU2_PADDING_ROLL_MASK,
-        SSU2_RESEND_ATTEMPT_MIN_INTERVAL, SSU2_RTO_KAPPA, SSU2_RTT_EWMA_ALPHA,
+        SSU2_RESEND_ATTEMPT_MIN_INTERVAL, SSU2_ROUTERINFO_RESEND_INTERVAL,
+        SSU2_ROUTERINFO_RESEND_INTERVAL_VARIANCE, SSU2_RTO_KAPPA, SSU2_RTT_EWMA_ALPHA,
         SSU2_SEND_DATETIME_NUM_PACKETS, SSU2_TOKEN_EXPIRATION_THRESHOLD,
         SSU2_TOKEN_EXPIRATION_TIMEOUT, SSU2_UDP_HEADER_SIZE, Ssu2CloseReason, Ssu2CongestionPolicy,
         Ssu2Policy,
@@ -31,6 +32,14 @@ fn i2pd_defaults_match_constants() {
         p.resend_attempt_min_interval(),
         SSU2_RESEND_ATTEMPT_MIN_INTERVAL
     );
+    assert_eq!(
+        p.router_info_resend_interval(),
+        SSU2_ROUTERINFO_RESEND_INTERVAL
+    );
+    assert_eq!(
+        p.router_info_resend_variance(),
+        SSU2_ROUTERINFO_RESEND_INTERVAL_VARIANCE
+    );
     assert_eq!(p.retry_token_lifetime(), SSU2_TOKEN_EXPIRATION_TIMEOUT);
     assert_eq!(p.next_token_lifetime(), SSU2_NEXT_TOKEN_EXPIRATION_TIMEOUT);
     assert_eq!(
@@ -43,6 +52,19 @@ fn i2pd_defaults_match_constants() {
     assert_eq!(p.send_datetime_every(), SSU2_SEND_DATETIME_NUM_PACKETS);
     assert_eq!(p.max_num_fragments(), SSU2_MAX_NUM_FRAGMENTS);
     assert_eq!(p.ack_limits(), AckLimits::default());
+}
+
+#[test]
+fn i2pd_can_attempt_resend_matches_buggy_condition() {
+    let p = I2pdPolicy;
+    assert!(p.can_attempt_resend(None, Duration::ZERO));
+    // i2pd блокирует только если last_attempt «из будущего» на MIN_INTERVAL:
+    // `now + MIN < last`. Так как i2pd всегда пишет туда текущее время,
+    // условие практически недостижимо (см. notes/i2pd-bugs.md, п. 3).
+    let now = Duration::from_secs(1000);
+    assert!(p.can_attempt_resend(Some(now), now));
+    assert!(p.can_attempt_resend(Some(Duration::from_secs(995)), now));
+    assert!(!p.can_attempt_resend(Some(now + Duration::from_secs(5)), now));
 }
 
 #[test]
