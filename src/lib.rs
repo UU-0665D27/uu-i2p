@@ -42,6 +42,7 @@ pub mod signature;
 pub mod siphash;
 pub mod ssu2_ack;
 pub mod ssu2_block;
+pub mod ssu2_conn;
 pub mod ssu2_crypto;
 pub mod ssu2_data;
 pub mod ssu2_engine;

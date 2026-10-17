@@ -41,19 +41,21 @@
 //! TODO(ssu2-engine-timers): таймеры — подключить [`crate::ssu2_timers`]
 //! (resend-tick, connect-таймер, RouterInfo-перепланирование; i2pd
 //! `HandleResendTimer`, `SSU2.cpp:1228`).
-//! TODO(ssu2-engine-handshake): handshake — `Ack` в состоянии
-//! `SessionConfirmedSent` переводит сессию в `Established` (`SSU2Session.cpp:2037`).
+//! Драйвер рукопожатия (состояния `SessionRequestSent`/`SessionConfirmedSent`
+//! и переход в `Established` по `Ack`) — в [`crate::ssu2_conn`].
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use tracing::{debug, trace, warn};
 
+use crate::error::I2PError;
 use crate::i2np_message::I2npMessage;
 use crate::ssu2_ack::Ssu2AckBlock;
 use crate::ssu2_block::{
     AddressBlock, FirstFragmentBlock, FollowOnFragmentBlock, NewTokenBlock, PathChallengeBlock,
-    PathResponseBlock, RelayTagBlock, Ssu2Block, Ssu2TerminationReason, TerminationBlock,
+    PathResponseBlock, RelayTagBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType,
+    Ssu2TerminationReason, TerminationBlock, write_block,
 };
 use crate::ssu2_crypto::{DataPhaseKey, DataPhaseKeys};
 use crate::ssu2_data::{SSU2_DATA_OVERHEAD, decode_data_packet, encode_data_packet};
@@ -130,6 +132,7 @@ pub enum PendingBlock {
 
 /// Итог [`Ssu2DataSession::recv`].
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RecvReport {
     /// Принятые I2NP-сообщения (после дедупа и сборки фрагментов).
     pub i2np: Vec<I2npMessage>,
@@ -137,6 +140,9 @@ pub struct RecvReport {
     pub data_received: bool,
     /// i2pd `m_IsInvalidMessage`.
     pub invalid_message: bool,
+    /// Пакет содержал блок `Ack` (нужно инициатору в `SessionConfirmedSent`:
+    /// i2pd `HandleAck` сразу переводит сессию в `Established`, `:2037`).
+    pub ack_received: bool,
     /// Решение по блоку `DateTime` (последнему в пакете).
     pub datetime: Option<DateTimeAction>,
     /// Что делать с блоком `Termination`.
@@ -471,6 +477,30 @@ impl Ssu2DataSession {
         self.path_challenge_sent = Some(challenge);
     }
 
+    /// Синхронизирует состояние с драйвером рукопожатия
+    /// ([`crate::ssu2_conn::Ssu2Connection`]): сессия создаётся до `Established`
+    /// (у инициатора — в `SessionConfirmedSent`), и от состояния зависят
+    /// решения по `DateTime`.
+    pub const fn set_state(&mut self, state: Ssu2SessionState) {
+        self.lifecycle.set_state(state);
+    }
+
+    /// Начальный номер отправляемого data-пакета.
+    ///
+    /// Нужен из-за асимметрии i2pd: `SendSessionConfirmed` делает
+    /// `m_SendPacketNum++`, поэтому первый data-пакет инициатора имеет
+    /// номер `1` (у ответчика — `0`). Номер `0` i2pd не учитывает в
+    /// `UpdateReceivePacketNum`, так что данные под ним подтверждены не будут.
+    pub const fn set_send_packet_num(&mut self, packet_num: u32) {
+        self.send_packet_num = packet_num;
+    }
+
+    /// Задаёт intro-ключ собеседника: у ответчика он становится известен лишь
+    /// из `RouterInfo` инициатора, уже после обработки `SessionConfirmed`.
+    pub const fn set_remote_intro_key(&mut self, intro_key: [u8; 32]) {
+        self.params.remote_intro_key = intro_key;
+    }
+
     /// Принимает один data-пакет: деобфусцирует, расшифровывает, разбирает
     /// блоки и применяет их.
     ///
@@ -575,7 +605,10 @@ impl Ssu2DataSession {
                     self.accept_i2np(msg, report);
                 }
             }
-            BlockEvent::Ack(body) => self.apply_ack(&body, congestion, now),
+            BlockEvent::Ack(body) => {
+                report.ack_received = true;
+                self.apply_ack(&body, congestion, now);
+            }
             BlockEvent::Termination(body) => self.apply_termination(&body, report),
             BlockEvent::DateTime(body) => {
                 let session = DateTimeSession {
@@ -930,6 +963,50 @@ impl Ssu2DataSession {
             policy,
         )?;
         self.send_data(&payload.payload, payload.flags, ctx.now, false)
+    }
+
+    /// Отправляет свой `RouterInfo` одним data-пакетом
+    /// (i2pd `SendLocalRouterInfo`, `SSU2Session.cpp:362`).
+    ///
+    /// Payload — блок `RouterInfo` плюс `Padding` до `max_payload`; ни
+    /// `DateTime`, ни Ack не добавляются. Пакет регистрируется для повторов
+    /// (то есть `SendData(..., register = true)`).
+    ///
+    /// # Errors
+    ///
+    /// [`I2PError::Malformed`], если `RouterInfo` не влезает в
+    /// `max_payload - 32` (i2pd в этом случае шлёт `DatabaseStore` фрагментами).
+    pub fn send_router_info<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+        router_info: &[u8],
+    ) -> crate::Result<Vec<u8>> {
+        let max = self.params.max_payload.saturating_sub(32);
+        let mut payload = Vec::new();
+        RouterInfoBlock {
+            flags: 0,
+            frag: 1,
+            router_info,
+        }
+        .write(&mut payload)?;
+        if payload.len() > max {
+            return Err(I2PError::Malformed(
+                "ssu2: RouterInfo does not fit into a single packet",
+            ));
+        }
+        let roll = padding_roll(ctx.rng, policy);
+        let remaining = self.params.max_payload.saturating_sub(payload.len());
+        if let Some(size) = policy.padding_size(roll, remaining, 0) {
+            let zeros = vec![0u8; size];
+            write_block(&mut payload, Ssu2BlockType::Padding, &zeros)?;
+        }
+        debug!(
+            router_info_len = router_info.len(),
+            payload_len = payload.len(),
+            "send_router_info: local RouterInfo"
+        );
+        self.send_data(&payload, 0, ctx.now, true)
     }
 
     /// Повторяет data-пакеты по RTO (i2pd `Resend`, часть с `m_SentPackets`).

@@ -340,6 +340,22 @@ impl InitiatorHandshake {
         }
     }
 
+    /// Перезапускает Noise-состояние перед повторным `SessionRequest`
+    /// (i2pd `ProcessRetry`, `SSU2Session.cpp:1652`: заново
+    /// `InitNoiseXKState1`).
+    ///
+    /// Эфемерный ключ, эфемерный ключ Bob'а и ключи data phase сбрасываются —
+    /// [`build_session_request`](Self::build_session_request) сгенерирует
+    /// новый эфемерный ключ.
+    pub fn restart(&mut self) {
+        let mut noise = NoiseSymmetricState::new(&[0u8; 32], &[0u8; 32], &[0u8; 32]);
+        init_noise_ssu2_state(&mut noise, &self.remote_static_pub);
+        self.noise = noise;
+        self.ephemeral = None;
+        self.remote_ephemeral_pub = None;
+        self.data_keys = None;
+    }
+
     /// Ключи data phase (доступны после `SessionCreated`/`SessionConfirmed`).
     #[must_use]
     pub const fn data_keys(&self) -> Option<&DataPhaseKeys> {
@@ -430,6 +446,17 @@ impl InitiatorHandshake {
 
         self.ephemeral = Some(ephemeral);
         Ok(packet)
+    }
+
+    /// Ключ `k_header_2` входящего `SessionCreated`: `HKDF(chainKey, "",
+    /// "SessCreateHeader")` (i2pd `ProcessSessionCreated`, `SSU2Session.cpp:1068`).
+    ///
+    /// Драйверу соединения нужен, чтобы отличить `SessionCreated` от `Retry`
+    /// в состоянии `SessionRequestSent`, **не трогая** Noise-состояние (i2pd
+    /// делает так же: проверяет тип до `MixHash`).
+    #[must_use]
+    pub fn session_created_header_key(&self) -> [u8; 32] {
+        sess_create_header_key(&self.noise.ck)
     }
 
     /// Разбирает `SessionCreated`, проходит шаги Noise XK и возвращает payload.
