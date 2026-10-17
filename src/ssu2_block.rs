@@ -29,10 +29,15 @@
 //!
 //! ## Что не внутри (следующие итерации)
 //!
-//! - `Ack` (12) — кодирование диапазонов, отдельный модуль;
-//! - `RelayRequest` / `RelayResponse` / `RelayIntro` (7-9) и `PeerTest` (10)
-//!   — несут подписи, ближе к протокольной логике;
-//! - `Congestion` (21) и `NextNonce` (11) — не специфицированы.
+//! - `Ack` (12) — реализован в [`crate::ssu2_ack`];
+//! - TODO(ssu2-blocks): `RelayRequest` / `RelayResponse` / `RelayIntro`
+//!   (7-9) и `PeerTest` (10) — несут подписи, ближе к протокольной логике;
+//! - TODO(ssu2-blocks): `Congestion` (21) и `NextNonce` (11) — не
+//!   специфицированы.
+//!
+//! Типы уже присутствуют в [`Ssu2BlockType`], но без типизированных
+//! обёрток — до реализации они читаются/пишутся через [`RawBlock`] /
+//! [`write_block`].
 
 use crate::{
     endian::{read_u16_be, read_u32_be, read_u64_be, write_u32_be, write_u64_be},

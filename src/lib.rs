@@ -43,6 +43,7 @@ pub mod siphash;
 pub mod ssu2_ack;
 pub mod ssu2_block;
 pub mod ssu2_crypto;
+pub mod ssu2_handshake;
 pub mod ssu2_header;
 pub mod ssu2_policy;
 pub mod tag;

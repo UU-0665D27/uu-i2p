@@ -20,11 +20,12 @@
 //!
 //! ## Что НЕ здесь
 //!
-//! - выбор [`crate::ssu2_block::Ssu2TerminationReason`] под конкретный сбой
+//! - TODO(ssu2-policy-termination): выбор
+//!   [`crate::ssu2_block::Ssu2TerminationReason`] под конкретный сбой
 //!   handshake — появится вместе с логикой handshake (там известны точные
 //!   места сбоя);
-//! - политика перегрузки/окна (RTO, окно) — отдельный трейт при реализации
-//!   data phase.
+//! - TODO(ssu2-congestion): политика перегрузки/окна (RTO, окно) —
+//!   отдельный трейт при реализации data phase.
 
 use std::time::Duration;
 
