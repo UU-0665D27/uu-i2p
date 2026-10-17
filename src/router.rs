@@ -1133,7 +1133,7 @@ impl Router {
                 self.handle_database_search_reply(from, &message)?;
             }
             I2npMessageType::Garlic => self.handle_garlic(kind, from, &message).await?,
-            // `// TODO(step-3a-4): DeliveryStatus — подтверждение
+            // `// TODO(step-3a-6): DeliveryStatus — подтверждение
             // публикации: сверять msgID с токеном публикации и
             // перепланировать публикацию (i2pd
             // `RouterContext::PostDeliveryStatusMessage`).`

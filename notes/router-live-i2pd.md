@@ -1,13 +1,16 @@
-# Живой прогон объединённого роутера против i2pd (SSU2)
+# Живой прогон объединённого роутера против i2pd (SSU2 + NTCP2)
 
 Первый прогон собранного роутера: `src/router.rs` (состояние +
 транспорт + цикл событий), пример `examples/uu-i2p-router-i2pd.rs`.
 До него «в сети» умели только POC'и, дёргавшие `Ssu2Pool` руками.
+Позже к SSU2 добавилось NTCP2-плечо — раздел «Исходящая сессия по NTCP2».
 
 ## Как запускается
 
 ```bash
-# тестовый i2pd (чистый netDb, reservedrange=false, httpproxy на 4445)
+# тестовый i2pd (чистый netDb, reservedrange=false, httpproxy на 4445;
+# в ssu2.conf также [ntcp2] enabled=true, port=12346, version=2 — для
+# раздела про NTCP2 ниже)
 ~/.local/opt/i2pd-uu/run-ssu2.sh
 
 RUST_LOG=uu_i2p=debug cargo run --example uu-i2p-router-i2pd -- \
@@ -96,6 +99,81 @@ NetDb: DatabaseLookup for ... received                    # его lookup'ы к 
 баг, а цена того, что i2pd не чистит netDb: перед серией прогонов лучше
 перезапустить тестовый i2pd (`run-ssu2.sh` чистит `datadir/netDb`).
 
+## Исходящая сессия по NTCP2 (`--ntcp2`)
+
+Тот же роутер, но соединение — TCP: `Ntcp2Transport` (обёртка над
+`Ntcp2Pool`) с владеющим `Ntcp2Local` (ключи/IV/`netId` из `RouterConfig`,
+свой RI — из `RouterContext`).
+
+```bash
+RUST_LOG=uu_i2p=debug cargo run --example uu-i2p-router-i2pd -- \
+    ~/.local/opt/i2pd-uu/datadir/router.info 127.0.0.1:12345 --ntcp2 --secs 40
+```
+
+Наш вывод:
+
+```
+ntcp2 pool: сессия установлена (Alice) peer=dM7B... addr=127.0.0.1:12346
+demo: dial transport=NTCP2
+demo: соединение установлено transport=NTCP2 nth=1
+demo: RouterInfo добавлен в netDb          # его RI пришёл блоком RouterInfo
+=== Итог ===
+Пир в карте сессий: Some(Ntcp2)
+```
+
+i2pd (`/tmp/opencode/i2pd-ssu2.log`):
+
+```
+NTCP2: Connected from 127.0.0.1:38988
+NTCP2: SessionRequest received 64
+NTCP2: SessionCreated sent
+NTCP2: SessionConfirmed received
+NTCP2: SessionConfirmed from 127.0.0.1:38988 (MXXA)
+NetDb: RouterInfo added: MXXANd51Ca7-~Ra9T4kt5kh4hreA08bF6MEb91-qBoY=
+Router: Publishing our RouterInfo to MXXA. reply token=2856562295
+NTCP2: Sent length 764 | 983               # его garlic и DatabaseStore
+```
+
+Handshake (Noise XK) прошёл целиком, наш RI ушёл в `SessionConfirmed` и
+i2pd его принял, дальше I2NP идёт по NTCP2 в обе стороны: он шлёт нам
+garlic (`DatabaseLookup` за RI и `LeaseSet`, `DatabaseStore`), мы
+отвечаем. Сессия прожила весь прогон (40 с) без переподключений.
+
+Чего потребовал именно NTCP2:
+
+- **NTCP2-адрес в своём RI.** i2pd в `EstablishSessionAfterSessionConfirmed`
+  (`NTCP2.cpp:1053`) берёт `GetNTCP2V4Address()` из нашего RI и сверяет
+  его `s` со статическим ключом handshake; нет адреса — «Address not
+  found in SessionConfirmed» + термин, не тот `s` — «Wrong static key»,
+  host не совпал с источником — `eNTCP2Banned`. Поэтому пример
+  публикует `listen_published(ntcp2_addr, 127.0.0.1)`.
+- **Свежий RI.** i2pd рвёт сессию на RI старше 90 минут и на RI «из
+  будущего» (2 минуты). Наш timestamp — `now_ms()`, ок.
+- Порт наш listener только держит: accept-loop нет (шаг 3a-5).
+
+Закрытие: `Router::close` на NTCP2-сессии — это
+`Termination(NormalClose)`, и i2pd его разбирает:
+
+```
+NTCP2: Received length 28
+NTCP2: Termination. reason=0
+NTCP2: Session with 127.0.0.1:33176 (hu3m) terminated
+```
+
+Дальше он, как и в SSU2-прогоне, звонит сам. Тут же видна цена
+опубликованного NTCP2-адреса без accept-loop:
+
+```
+NTCP2: Connecting to 127.0.0.1:42341 (hu3m)
+NTCP2: Connected to 127.0.0.1:42341 (hu3m)   # TCP в backlog, приложение молчит
+NTCP2: No activity for 50 seconds
+NTCP2: Session with 127.0.0.1:42341 (hu3m) terminated
+```
+
+В том же прогоне с `--accept` входящую сессию он поднял по SSU2
+(`nth=2`), как и раньше: транспорт для звонка i2pd выбирает случайно
+(`Transports::SetPriority`, SSU2/NTCP2 — 1/2).
+
 ## Почему i2pd ругался на окно отправки (и что сделано)
 
 В первых прогонах сразу после нашего закрытия сессии i2pd писал:
@@ -167,6 +245,9 @@ SSU2: Packet was not Acked after 6 attempts. Terminate session
    разрешён в RI.
 4. **«Доигрывание» закрытой сессии** — `Session::drain_until`: см.
    выше, «Почему i2pd ругался на окно отправки».
+5. **Исходящий NTCP2** — `Ntcp2Local`/`Ntcp2Transport`, события
+   `Established`/`Disconnected` и `Termination` при закрытии:
+   см. выше, «Исходящая сессия по NTCP2».
 
 ## Что в логе шумит и почему
 
