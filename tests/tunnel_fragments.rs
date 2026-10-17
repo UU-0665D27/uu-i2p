@@ -237,7 +237,7 @@ mod tests {
                     is_last: last
                 }
             );
-            assert!(f[0].data.is_empty());
+            assert_eq!(f[0].data, [] as [u8; 0]);
         }
     }
 
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn empty_payload_has_no_fragments() {
-        assert!(parse_ok(&[]).is_empty());
+        assert_eq!(parse_ok(&[]), [] as [uu_i2p::tunnel_fragments::Fragment; 0]);
     }
 
     // ---- разбор: ошибки ----------------------------------------------------------

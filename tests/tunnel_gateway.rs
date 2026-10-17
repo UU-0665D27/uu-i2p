@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn empty_flush_returns_nothing() {
         let mut buf = TunnelGatewayBuffer::new();
-        assert!(flush(&mut buf, 1).is_empty());
+        assert_eq!(flush(&mut buf, 1), [] as [uu_i2p::TunnelDataBody; 0]);
     }
 
     // ---- упаковка нескольких сообщений ---------------------------------------------
