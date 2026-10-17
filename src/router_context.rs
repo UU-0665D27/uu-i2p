@@ -33,13 +33,14 @@
 use crate::{
     EciesDelivery, EciesGarlicClove, IdentHash,
     config::RouterConfig,
-    crypto::I2PX25519Keys,
+    crypto::{I2PX25519Keys, NoiseSymmetricState, init_noise_n_state},
     database_lookup::{DatabaseLookup, LookupType},
     database_search_reply::DatabaseSearchReply,
     database_store::{DatabaseStore, StoreType},
     delivery_status::DeliveryStatus,
     ecies_destination::EciesGarlicDestination,
     error::{I2PError, Result},
+    garlic_block::{GarlicBlock, parse_blocks},
     garlic_body::GarlicBody,
     i2np::I2npMessageType,
     i2np_message::{I2npBody, I2npMessage},
@@ -218,6 +219,99 @@ impl RouterContext {
         }
     }
 
+    /// Разбирает **роутерный** garlic: одноразовый `Noise_N`
+    /// (`i2pd::garlic::WrapECIESX25519MessageForRouter`) на наш
+    /// identity-ключ.
+    ///
+    /// ## Зачем отдельно от [`Self::handle_garlic`]
+    ///
+    /// У i2pd два разных способа доставить роутеру garlic:
+    ///
+    /// - **destination-сессия** ([`EciesGarlicDestination`]): session-tag
+    ///   в начале, NS/NSR, ratchet — это [`Self::handle_garlic`];
+    /// - **роутерный `Noise_N`** (`Garlic.cpp:752`,
+    ///   `WrapECIESX25519MessageForRouter`): `aepk(32) || AEAD(blocks)`,
+    ///   зашифровано на статический ключ получателя, без состояния и
+    ///   без тега. Так i2pd посылает `DatabaseLookup` флудфиллу
+    ///   (`NetDbRequests.cpp:304`), публикует свой RI
+    ///   (`RouterContext.cpp:1541`) и `LeaseSet` (`Destination.cpp:711`).
+    ///
+    /// В i2pd обе ветки сводит `RouterContext::PostGarlicMessage`:
+    /// сначала теги (`HandleECIESx25519TagMessage`), затем
+    /// `Noise_N`-расшифровка. У нас ветки разделены, потому что вторая
+    /// возвращает внутренние I2NP-сообщения наружу: ответить на
+    /// `DatabaseLookup` можно только зная транспорт, а транспорт знает
+    /// слой [`crate::router::Router`].
+    ///
+    /// ## Что возвращает
+    ///
+    /// I2NP-сообщения из cloves с delivery `Local` — **необработанными**
+    /// (как i2pd `HandleCloveI2NPMessage`: он лишь пересобирает
+    /// `I2NPMessage` и отдаёт глобальному диспетчеру).
+    ///
+    /// Если payload не расшифровывается (это не наш роутерный garlic,
+    /// например чужая destination-сессия) — возвращается пустой список:
+    /// это не ошибка, а «не нам».
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] — payload не является `GarlicBody`;
+    /// ошибки разбора garlic-blocks ([`parse_blocks`]).
+    pub fn handle_router_garlic(&self, i2np_payload: &[u8]) -> Result<Vec<I2npMessage>> {
+        let body = GarlicBody::from_buffer(i2np_payload)?;
+        let Some(plain) = self.unwrap_router_garlic(&body.payload) else {
+            trace!("handle_router_garlic: не Noise_N на наш ключ");
+            return Ok(Vec::new());
+        };
+
+        let mut messages = Vec::new();
+        for block in parse_blocks(&plain)? {
+            let GarlicBlock::EciesGarlicClove(clove) = block else {
+                continue;
+            };
+            match clove.delivery {
+                EciesDelivery::Local => messages.push(clove.to_i2np_message()),
+                ref other => debug!(
+                    msg_type = %clove.message_type,
+                    delivery = ?other,
+                    "handle_router_garlic: не Local; пропускаем"
+                ),
+            }
+        }
+        debug!(count = messages.len(), "handle_router_garlic: разобран");
+        Ok(messages)
+    }
+
+    /// Одноразовая `Noise_N`-расшифровка роутерного garlic.
+    ///
+    /// `None` — шифртекст не наш (AEAD не сходится). У i2pd это
+    /// `m_ECIESSession->HandleNextMessage` на свежей сессии: результат
+    /// нигде не сохраняется, ключи одноразовые.
+    fn unwrap_router_garlic(&self, wire: &[u8]) -> Option<Vec<u8>> {
+        /// `aepk(32)` + минимум 16 байт тега Poly1305.
+        const MIN_LEN: usize = 32 + 16;
+        if wire.len() < MIN_LEN {
+            debug!(len = wire.len(), "unwrap_router_garlic: слишком коротко");
+            return None;
+        }
+        let keys = Self::ecies_static(&self.config).ok()?;
+        let mut aepk = [0u8; 32];
+        aepk.copy_from_slice(&wire[..32]);
+
+        // Первый `new` — заглушка: `init_noise_n_state` целиком
+        // перезаписывает состояние (так же, как в `tunnel_build_crypto`).
+        let mut noise = NoiseSymmetricState::new(&[0u8; 32], &[0u8; 32], keys.public_key());
+        init_noise_n_state(&mut noise, keys.public_key());
+        noise.mix_hash(&aepk);
+        let shared = keys.agree(&aepk)?;
+        noise.mix_key(&shared);
+
+        let mut plain = vec![0u8; wire.len() - MIN_LEN];
+        let len = noise.decrypt(&wire[32..], &mut plain).ok()?;
+        plain.truncate(len);
+        Some(plain)
+    }
+
     /// Диспетчер одного [`EciesGarlicClove`] по его `delivery`.
     ///
     /// Соответствует части `GarlicDestination::HandleECIESx25519GarlicClove`
@@ -362,10 +456,31 @@ impl RouterContext {
     /// - [`Error::Unsupported`], если `crypto_key_type()` не ECIES-X25519.
     pub fn new(config: RouterConfig) -> Result<Self> {
         let own_ri = config.build_router_info(now_ms())?;
+        let ecies = EciesGarlicDestination::new(Self::ecies_static(&config)?);
 
-        // ECIES garlic destination использует **router encryption key** —
-        // тот же ключ, что опубликован в RI. Это ключ, по которому
-        // другие роутеры будут шифровать нам garlic-clove.
+        Ok(Self {
+            config,
+            netdb_requests: NetDbRequests::new(),
+            own_ri,
+            netdb: NetDb::new(),
+            ecies,
+        })
+    }
+
+    /// X25519-пара из **router encryption key** — того же ключа, что
+    /// опубликован в RI.
+    ///
+    /// По нему другие роутеры шифруют нам свой garlic: и как
+    /// destination-сессию ([`EciesGarlicDestination`]), и как
+    /// одноразовый `Noise_N` (см. [`Self::handle_router_garlic`]).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidLength`], если приватный или публичный
+    ///   crypto-ключ короче 32 байт (для `EdDSA` + ECIES-X25519 не
+    ///   должно случаться, но проверяем);
+    /// - [`Error::Unsupported`], если `crypto_key_type()` не ECIES-X25519.
+    fn ecies_static(config: &RouterConfig) -> Result<I2PX25519Keys> {
         let crypto_priv = config.keys().crypto_private();
         let crypto_pub = config.keys().public().encryption_public_key()?;
         if crypto_priv.len() < 32 || crypto_pub.len() < 32 {
@@ -378,16 +493,7 @@ impl RouterContext {
         priv_arr.copy_from_slice(&crypto_priv[..32]);
         let mut pub_arr = [0u8; 32];
         pub_arr.copy_from_slice(&crypto_pub[..32]);
-        let ecies_static = I2PX25519Keys::from_private(&priv_arr, Some(&pub_arr));
-        let ecies = EciesGarlicDestination::new(ecies_static);
-
-        Ok(Self {
-            config,
-            netdb_requests: NetDbRequests::new(),
-            own_ri,
-            netdb: NetDb::new(),
-            ecies,
-        })
+        Ok(I2PX25519Keys::from_private(&priv_arr, Some(&pub_arr)))
     }
     /// Пул активных поисков RI. Для тестов и диагностики.
     #[must_use]

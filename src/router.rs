@@ -795,7 +795,11 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Первая ошибка обработки события/тика.
+    /// Только инфраструктурные: цикл уже запущен, канал событий закрыт.
+    /// Ошибки обработки **отдельных** сообщений роняют не роутер, а
+    /// само сообщение: логируем и живём дальше (в i2pd исключение в
+    /// `HandleI2NPMessage` тоже не валит процесс). Иначе одно кривое
+    /// garlic-сообщение убивает сессию со всем netDb.
     pub async fn run_until<F>(&mut self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()> + Send,
@@ -817,7 +821,7 @@ impl Router {
                 }
                 _ = timer.tick() => {
                     if let Err(error) = self.tick().await {
-                        break Err(error);
+                        warn!(%error, "router: ошибка тика");
                     }
                 }
                 event = events.recv() => {
@@ -826,7 +830,7 @@ impl Router {
                         break Ok(());
                     };
                     if let Err(error) = self.handle_router_event(event).await {
-                        break Err(error);
+                        warn!(%error, "router: ошибка обработки события");
                     }
                     if self.all_transports_closed() {
                         info!("router: все транспорты остановлены");
@@ -1164,18 +1168,45 @@ impl Router {
             .is_none_or(|ri| ri.body().timestamp.saturating_add(MAX_RI_AGE_MS) < now_ms)
     }
 
-    /// `Garlic`: обработка в [`RouterContext`] и ответ тому же пиру.
+    /// `Garlic`: garlic самой разной природы — разбираем оба случая.
+    ///
+    /// У i2pd роутеру garlic приходит двумя путями (см.
+    /// [`RouterContext::handle_router_garlic`]):
+    ///
+    /// 1. **destination-сессия** — тег/NS. Обрабатывается в
+    ///    [`RouterContext::handle_garlic`], cloves разбираются там же;
+    ///    если сессия требует ответа (NSR на NS) — отправляем его.
+    /// 2. **роутерный `Noise_N`** — одноразовый, без состояния. Даёт
+    ///    внутренние I2NP-сообщения, которые прогоняются через **этот
+    ///    же** диспетчер (`Self::handle_message`), как в i2pd
+    ///    `HandleCloveI2NPMessage` → `HandleI2NPMessage`: только так
+    ///    ответ на `DatabaseLookup` (флудфилл) уходит по транспорту.
     async fn handle_garlic(
         &mut self,
         kind: TransportKind,
         from: &IdentHash,
         message: &I2npMessage,
     ) -> Result<()> {
-        if let Some(GarlicReply { message: reply }) =
-            self.context.handle_garlic(message.payload())?
-        {
-            debug!(transport = %kind, peer = %from.to_base64(), len = reply.total_len(), "router: ответ garlic");
-            self.send_via(kind, from, reply).await?;
+        match self.context.handle_garlic(message.payload()) {
+            Ok(Some(GarlicReply { message: reply })) => {
+                debug!(transport = %kind, peer = %from.to_base64(), len = reply.total_len(), "router: ответ garlic");
+                self.send_via(kind, from, reply).await?;
+            }
+            Ok(None) => {}
+            // Не наша destination-сессия — это не ошибка, а повод
+            // попробовать роутерный garlic ниже (i2pd
+            // `PostGarlicMessage`: теги, затем `Noise_N`).
+            Err(error) => {
+                trace!(error = %error, peer = %from.to_base64(), "router: garlic не для destination-сессии");
+            }
+        }
+
+        let inner = self.context.handle_router_garlic(message.payload())?;
+        for nested in inner {
+            // Рекурсия обязана быть косвенной (`Box::pin`): вложенный
+            // garlic — легальный случай, а `async fn` сам себя по
+            // значению не соберёт.
+            Box::pin(self.handle_message(kind, from, nested)).await?;
         }
         Ok(())
     }

@@ -190,7 +190,8 @@ impl ListenEndpoint {
 /// - `keys.public().crypto_key_type() == EciesX25519Aead`;
 /// - `listen` непуст;
 /// - в каждом публикуемом endpoint'е `advertise` не multicast,
-///   не unspecified, порт ≠ 0.
+///   не unspecified, порт ≠ 0; loopback запрещён, если не включён
+///   [`RouterConfigBuilder::allow_reserved_advertise`].
 ///
 /// ## Не `Clone`
 ///
@@ -207,6 +208,7 @@ pub struct RouterConfig {
     listen: Vec<ListenEndpoint>,
     caps: RouterInfoCaps,
     is_floodfill: bool,
+    allow_reserved_advertise: bool,
 }
 
 impl RouterConfig {
@@ -272,6 +274,15 @@ impl RouterConfig {
     #[must_use]
     pub const fn is_floodfill(&self) -> bool {
         self.is_floodfill
+    }
+
+    /// Разрешено ли публиковать адрес из reserved-диапазона.
+    ///
+    /// См. [`RouterConfigBuilder::allow_reserved_advertise`]: в обычной
+    /// конфигурации — `false`, включается только для локальных проверок.
+    #[must_use]
+    pub const fn allow_reserved_advertise(&self) -> bool {
+        self.allow_reserved_advertise
     }
 
     /// Собирает и подписывает собственный `RouterInfo`.
@@ -348,6 +359,7 @@ impl std::fmt::Debug for RouterConfig {
             .field("listen", &self.listen)
             .field("caps", &self.caps)
             .field("is_floodfill", &self.is_floodfill)
+            .field("allow_reserved_advertise", &self.allow_reserved_advertise)
             .finish_non_exhaustive()
     }
 }
@@ -376,6 +388,7 @@ pub struct RouterConfigBuilder {
     listen: Vec<ListenEndpoint>,
     caps: Option<RouterInfoCaps>,
     is_floodfill: bool,
+    allow_reserved_advertise: bool,
 }
 
 impl std::fmt::Debug for RouterConfigBuilder {
@@ -400,6 +413,7 @@ impl std::fmt::Debug for RouterConfigBuilder {
             .field("listen", &self.listen)
             .field("caps", &self.caps)
             .field("is_floodfill", &self.is_floodfill)
+            .field("allow_reserved_advertise", &self.allow_reserved_advertise)
             .finish()
     }
 }
@@ -508,6 +522,18 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Разрешить публиковать адрес из reserved-диапазона (loopback и т.п.).
+    ///
+    /// По умолчанию запрещено: в настоящей сети такой `advertise`
+    /// бесполезен, а loopback в RI — признак ошибки. Нужно только для
+    /// локальных interop-проверок (`127.0.0.1`), где повторяет смысл
+    /// i2pd `reservedrange = false`.
+    #[must_use]
+    pub const fn allow_reserved_advertise(mut self, allow: bool) -> Self {
+        self.allow_reserved_advertise = allow;
+        self
+    }
+
     /// Валидирует и собирает [`RouterConfig`].
     ///
     /// # Errors
@@ -516,7 +542,8 @@ impl RouterConfigBuilder {
     ///   (`keys`, `ntcp2_keys`), `listen` пуст;
     /// - [`Error::Unsupported`] — ключи не `EdDSA` + ECIES-X25519;
     /// - [`Error::Malformed`] — публикуемый `advertise`-адрес
-    ///   unspecified, multicast или loopback; порт 0;
+    ///   unspecified, multicast или loopback (loopback — если не включён
+    ///   [`RouterConfigBuilder::allow_reserved_advertise`]); порт 0;
     /// - [`Error::Malformed`] — есть SSU2-endpoint, но не задан
     ///   `ssu2_intro_key`;
     /// - [`Error::Malformed`] — два endpoint'а одного транспорта на одном
@@ -561,7 +588,7 @@ impl RouterConfigBuilder {
                 if ip.is_multicast() {
                     return Err(I2PError::Malformed("config: advertise IP is multicast"));
                 }
-                if ip.is_loopback() {
+                if ip.is_loopback() && !self.allow_reserved_advertise {
                     return Err(I2PError::Malformed("config: advertise IP is loopback"));
                 }
                 if ep.bind.port() == 0 {
@@ -599,6 +626,7 @@ impl RouterConfigBuilder {
             listen: self.listen,
             caps: self.caps.unwrap_or_else(|| RouterInfoCaps::parse(b"L")),
             is_floodfill: self.is_floodfill,
+            allow_reserved_advertise: self.allow_reserved_advertise,
         })
     }
 }

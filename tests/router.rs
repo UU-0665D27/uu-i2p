@@ -341,6 +341,43 @@ fn search_reply_message(key: IdentHash, peers: Vec<IdentHash>, from: IdentHash) 
     I2npMessage::from_body(I2npBody::DatabaseSearchReply(reply)).expect("message")
 }
 
+fn array32(bytes: &[u8]) -> [u8; 32] {
+    bytes.try_into().expect("expected 32 bytes")
+}
+
+/// Оборачивает I2NP-сообщение в роутерный garlic (`Noise_N`), как i2pd
+/// `WrapECIESX25519MessageForRouter`.
+fn wrap_router_garlic(router_static_public: &[u8; 32], message: &I2npMessage) -> I2npMessage {
+    use uu_i2p::{
+        crypto::{NoiseSymmetricState, init_noise_n_state},
+        garlic_block::{EciesGarlicClove, GarlicBlock, serialize_blocks},
+    };
+
+    let blocks = serialize_blocks(
+        &[GarlicBlock::EciesGarlicClove(EciesGarlicClove::wrap_local(
+            message,
+        ))],
+    )
+    .expect("serialize blocks");
+
+    let ephemeral = I2PX25519Keys::generate();
+    let mut noise = NoiseSymmetricState::new(&[0u8; 32], &[0u8; 32], router_static_public);
+    init_noise_n_state(&mut noise, router_static_public);
+    noise.mix_hash(ephemeral.public_key());
+    let shared = ephemeral.agree(router_static_public).expect("x25519 agree");
+    noise.mix_key(&shared);
+
+    let mut ciphertext = vec![0u8; blocks.len() + 16];
+    noise
+        .encrypt(&blocks, &mut ciphertext)
+        .expect("noise encrypt");
+
+    let mut wire = ephemeral.public_key().to_vec();
+    wire.extend_from_slice(&ciphertext);
+    I2npMessage::from_body(I2npBody::Garlic(uu_i2p::garlic_body::GarlicBody::new(wire)))
+        .expect("garlic message")
+}
+
 // --- RouterInfo попадает в netDb -------------------------------------------
 
 #[tokio::test]
@@ -658,6 +695,100 @@ async fn send_uses_session_transport() {
 
     assert_eq!(fake.sent().len(), 1);
     assert_eq!(fake.sent()[0].0, ident);
+}
+
+// --- роутерный garlic ------------------------------------------------------
+
+#[tokio::test]
+async fn router_garlic_dispatches_inner_message() {
+    let clock = FakeClock::new(NOW_MS);
+    let ctx = context(false);
+    let router_pub = array32(
+        ctx.config()
+            .keys()
+            .public()
+            .encryption_public_key()
+            .expect("router encryption key"),
+    );
+    let (mut router, observer) = new_router(ctx, &clock, TestPolicy::answering());
+    attach_fake(&mut router, Transport::Ssu2);
+    let (from, _) = foreign_ri(false);
+    let (ident, ri_bytes) = foreign_ri(false);
+
+    // i2pd так публикует свой RI флудфиллу и так шлёт ему
+    // `DatabaseLookup`. Внутреннее сообщение должно попасть в тот же
+    // диспетчер, что и обычное: для `DatabaseStore` это netDb.
+    let garlic = wrap_router_garlic(&router_pub, &store_message(ident, &ri_bytes));
+    router
+        .handle_message(Transport::Ssu2, &from, garlic)
+        .await
+        .expect("garlic");
+
+    assert!(router.context().netdb().contains(&ident));
+    assert_eq!(*observer.stored.lock().unwrap(), vec![ident]);
+}
+
+#[tokio::test]
+async fn router_garlic_answers_inner_database_lookup() {
+    let clock = FakeClock::new(NOW_MS);
+    let mut ctx = context(false);
+    let target = add_foreign_ri(&mut ctx, false);
+    let router_pub = array32(
+        ctx.config()
+            .keys()
+            .public()
+            .encryption_public_key()
+            .expect("router encryption key"),
+    );
+    let (mut router, _observer) = new_router(ctx, &clock, TestPolicy::answering());
+    let fake = attach_fake(&mut router, Transport::Ssu2);
+    let (asker, _) = foreign_ri(false);
+
+    let garlic = wrap_router_garlic(&router_pub, &lookup_message(target, asker));
+    router
+        .handle_message(Transport::Ssu2, &asker, garlic)
+        .await
+        .expect("garlic");
+
+    let sent = fake.sent();
+    assert_eq!(sent.len(), 1, "ответ на вложенный DatabaseLookup");
+    assert_eq!(sent[0].0, asker);
+    assert_eq!(sent[0].1.message_type(), I2npMessageType::DatabaseStore);
+}
+
+#[tokio::test]
+async fn garbage_garlic_does_not_stop_the_loop() {
+    let clock = FakeClock::new(NOW_MS);
+    let (mut router, _observer) = new_router(context(false), &clock, TestPolicy::answering());
+    let fake = attach_fake(&mut router, Transport::Ssu2);
+    let (from, _) = foreign_ri(false);
+
+    // Никому не адресованный garlic: раньше ошибка расшифровки
+    // вылетала из цикла и убивала роутер.
+    let garbage = I2npMessage::from_body(I2npBody::Garlic(uu_i2p::garlic_body::GarlicBody::new(
+        vec![0xab; 200],
+    )))
+    .expect("garlic");
+    fake.enqueue(TransportEvent::Message {
+        from,
+        message: garbage,
+    });
+
+    // Цикл должен дождаться остановки, а не выйти сам с ошибкой.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        router.run_until(async {
+            // Ждём, пока мусорный garlic не будет обработан, затем
+            // останавливаемся: событие уже в очереди.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }),
+    )
+    .await
+    .expect("цикл не должен висеть");
+    assert!(
+        result.is_ok(),
+        "мусорный garlic — не ошибка роутера: {result:?}"
+    );
 }
 
 // --- необрабатываемые сообщения -------------------------------------------

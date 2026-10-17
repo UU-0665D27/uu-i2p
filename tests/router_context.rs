@@ -913,3 +913,106 @@ fn now_ms_plus(delta_ms: u64) -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .saturating_add(delta_ms)
 }
+
+// ---- роутерный garlic (Noise_N) -------------------------------------------
+
+/// `[u8; 32]` из среза.
+fn array32(bytes: &[u8]) -> [u8; 32] {
+    bytes.try_into().expect("expected 32 bytes")
+}
+
+/// Оборачивает I2NP-сообщение в роутерный garlic — ровно так, как это
+/// делает i2pd `WrapECIESX25519MessageForRouter`
+/// (`ECIESX25519AEADRatchetSession.cpp:1520`):
+/// `aepk(32) || AEAD(blocks)`, `Noise_N`, ключ — статический ключ
+/// шифрования получателя.
+fn wrap_router_garlic(router_static_public: &[u8; 32], msg: &I2npMessage) -> I2npMessage {
+    use uu_i2p::{
+        crypto::{NoiseSymmetricState, init_noise_n_state},
+        garlic_block::{GarlicBlock, serialize_blocks},
+    };
+
+    let blocks = serialize_blocks(&[GarlicBlock::EciesGarlicClove(
+        uu_i2p::garlic_block::EciesGarlicClove::wrap_local(msg),
+    )])
+    .expect("serialize blocks");
+
+    let ephemeral = I2PX25519Keys::generate();
+    let mut noise = NoiseSymmetricState::new(&[0u8; 32], &[0u8; 32], router_static_public);
+    init_noise_n_state(&mut noise, router_static_public);
+    noise.mix_hash(ephemeral.public_key());
+    let shared = ephemeral.agree(router_static_public).expect("x25519 agree");
+    noise.mix_key(&shared);
+
+    let mut ciphertext = vec![0u8; blocks.len() + 16];
+    noise
+        .encrypt(&blocks, &mut ciphertext)
+        .expect("noise encrypt");
+
+    let mut wire = ephemeral.public_key().to_vec();
+    wire.extend_from_slice(&ciphertext);
+    I2npMessage::from_body(I2npBody::Garlic(GarlicBody::new(wire))).expect("garlic message")
+}
+
+#[test]
+fn router_garlic_yields_inner_i2np() {
+    let ctx = minimal_ctx();
+    let router_pub = array32(
+        ctx.config()
+            .keys()
+            .public()
+            .encryption_public_key()
+            .expect("router encryption key"),
+    );
+    let inner = I2npMessage::from_body(I2npBody::DatabaseLookup(DatabaseLookup::new_router_info(
+        ident(0x55),
+        ident(0x66),
+        None,
+        Vec::new(),
+    )))
+    .expect("lookup message");
+
+    let garlic = wrap_router_garlic(&router_pub, &inner);
+    let messages = ctx
+        .handle_router_garlic(garlic.payload())
+        .expect("router garlic");
+
+    assert_eq!(messages.len(), 1, "в garlic один clove");
+    assert_eq!(messages[0].message_type(), I2npMessageType::DatabaseLookup);
+    assert_eq!(messages[0].payload(), inner.payload());
+}
+
+#[test]
+fn router_garlic_for_other_key_yields_nothing() {
+    let ctx = minimal_ctx();
+    // Ключ «другого» роутера: наш identity его не расшифрует — это не
+    // ошибка, а «не нам».
+    let other_pub = *I2PX25519Keys::generate().public_key();
+    let inner = I2npMessage::from_body(I2npBody::DatabaseLookup(DatabaseLookup::new_router_info(
+        ident(0x55),
+        ident(0x66),
+        None,
+        Vec::new(),
+    )))
+    .expect("lookup message");
+
+    let garlic = wrap_router_garlic(&other_pub, &inner);
+    let messages = ctx
+        .handle_router_garlic(garlic.payload())
+        .expect("не ошибка");
+
+    assert_eq!(messages.len(), 0, "чужой garlic — не нам");
+}
+
+#[test]
+fn router_garlic_garbage_is_empty_not_error() {
+    let ctx = minimal_ctx();
+    let garlic =
+        I2npMessage::from_body(I2npBody::Garlic(GarlicBody::new(vec![0xab; 200]))).expect("garlic");
+
+    let messages = ctx
+        .handle_router_garlic(garlic.payload())
+        .expect("не ошибка");
+
+    assert_eq!(messages.len(), 0, "мусор — не ошибка и не сообщения");
+}

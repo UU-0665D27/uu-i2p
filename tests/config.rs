@@ -84,6 +84,28 @@ mod tests {
     }
 
     #[test]
+    fn advertise_loopback_allowed_when_reserved_advertise_enabled() {
+        // Локальный interop (i2pd `reservedrange = false`): loopback в RI
+        // допустим, но только по явному флагу.
+        let (static_key, iv) = ntcp2();
+        let cfg = RouterConfig::builder()
+            .keys(keys())
+            .ntcp2_keys(static_key, iv)
+            .listen_published(
+                "127.0.0.1:2827".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .allow_reserved_advertise(true)
+            .build()
+            .expect("loopback разрешён флагом");
+
+        let ri = cfg.build_router_info(1_700_000_000_000).expect("ri");
+        let addr = &ri.body().addresses[0];
+        assert!(addr.published);
+        assert_eq!(addr.host, "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
     fn advertise_multicast_fails() {
         let (static_key, iv) = ntcp2();
         let r = RouterConfig::builder()
