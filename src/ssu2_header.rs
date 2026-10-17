@@ -16,7 +16,8 @@
 //! ## Что не внутри
 //!
 //! - Noise handshake, KDF'ы и AEAD — в [`crate::ssu2_crypto`];
-//! - блоки payload'а — отдельный модуль (следующая итерация).
+//! - блоки payload'а — в [`crate::ssu2_block`];
+//! - пакет data phase — в [`crate::ssu2_data`].
 //!
 //! ## Замечания по спецификации
 //!
