@@ -80,6 +80,15 @@ pub const SSU2_SEND_DATETIME_NUM_PACKETS: u32 = 256;
 pub const SSU2_MAX_NUM_FRAGMENTS: u8 = 64;
 /// Через сколько секунд удаляется недособранное I2NP-сообщение (`CleanUp`).
 pub const SSU2_INCOMPLETE_MESSAGES_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Сколько `msgID` принятых I2NP-сообщений помним для дедупа
+/// (`SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS`).
+pub const SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS: usize = 5000;
+/// Через сколько секунд забывается `msgID` принятого I2NP-сообщения
+/// (`CleanUp`, `SSU2_RECEIVED_I2NP_MSGIDS_CLEANUP_TIMEOUT`).
+pub const SSU2_RECEIVED_I2NP_MSGIDS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Период затухания набора принятых `msgID`: если сессия неактивна дольше,
+/// набор чистится целиком (`SSU2_DECAY_INTERVAL`).
+pub const SSU2_DECAY_INTERVAL: Duration = Duration::from_secs(20);
 /// Маска случайного байта для выбора размера padding'а (`0..=31`).
 pub const SSU2_PADDING_ROLL_MASK: u8 = 0x1F;
 

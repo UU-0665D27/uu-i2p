@@ -23,6 +23,10 @@
 //! [`PayloadSink`], как и обработчики в i2pd; для `DateTime` обвязка уже есть —
 //! [`handle_datetime`].
 //!
+//! Дедупликация и истечение принятых I2NP-сообщений (`HandleI2NPMsg`) — это
+//! состояние сессии, а не диспетчер: [`ReceivedMsgIds`] (вместе с относящейся к
+//! ним частью `CleanUp`).
+//!
 //! ## Отличия от i2pd
 //!
 //! - `HandlePayload` не строит `I2NPMessage` сам: `on_i2np_message` получает
@@ -33,10 +37,17 @@
 //!   незарегистрированных).
 
 use crate::i2np::{I2NP_MAX_MESSAGE_SIZE, I2NP_MAX_SHORT_MESSAGE_SIZE, I2npMessageType};
+use crate::i2np_message::I2npMessage;
 use crate::ssu2_block::Ssu2BlockType;
 use crate::ssu2_header::SSU2_FLAG_IMMEDIATE_ACK_REQUESTED;
-use crate::ssu2_policy::{DateTimeAction, DateTimeSession, Ssu2Policy};
+use crate::ssu2_policy::{
+    DateTimeAction, DateTimeSession, SSU2_DECAY_INTERVAL, SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS,
+    SSU2_RECEIVED_I2NP_MSGIDS_CLEANUP_TIMEOUT, Ssu2Policy,
+};
 use crate::ssu2_session::ReceiveState;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::time::Duration;
 
 /// Итог [`handle_payload`]/[`process_data`] — флаги i2pd `m_IsDataReceived`
 /// и `m_IsInvalidMessage`.
@@ -289,4 +300,98 @@ pub fn process_data<S: PayloadSink>(
         result.invalid_message |= inner.invalid_message;
     }
     result
+}
+
+/// Что делать с принятым I2NP-сообщением (итог [`ReceivedMsgIds::handle_i2np_msg`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceivedI2np {
+    /// Не истекло и не дубликат — отдать наверх (i2pd: `PutNextMessage`).
+    Accept,
+    /// Такой `msgID` уже принимали (i2pd: `emplace(...).second == false`).
+    Duplicate,
+    /// Сообщение истекло на момент последней активности сессии (i2pd:
+    /// `IsExpired (GetLastActivityTimestamp ()*1000)`).
+    Expired,
+}
+
+/// Принятые `msgID` I2NP-сообщений (зеркало `m_ReceivedI2NPMsgIDs`).
+///
+/// SSU2 может доставить одно и то же I2NP-сообщение повторно (ретраи,
+/// несколько путей), а наверх его отдавать дважды нельзя. Ключ — `msgID`,
+/// значение — время последней активности сессии в секундах since epoch (в i2pd
+/// хранится `(uint32_t)GetLastActivityTimestamp ()`).
+#[derive(Debug, Clone, Default)]
+pub struct ReceivedMsgIds {
+    received: BTreeMap<u32, Duration>,
+}
+
+impl ReceivedMsgIds {
+    /// Пустой набор.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Число помнимых `msgID`.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.received.len()
+    }
+
+    /// Нет ли помнимых `msgID`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.received.is_empty()
+    }
+
+    /// Принимали ли уже `msg_id`.
+    #[must_use]
+    pub fn contains(&self, msg_id: u32) -> bool {
+        self.received.contains_key(&msg_id)
+    }
+
+    /// `HandleI2NPMsg` (`SSU2Session.cpp:2806`).
+    ///
+    /// `last_activity` — `m_LastActivityTimestamp` (время последней активности
+    /// сессии; в i2pd обновляется в `ProcessData` *до* вызова). Истечение
+    /// проверяется не по текущим часам, а именно по нему — как в i2pd:
+    /// `msg->IsExpired (GetLastActivityTimestamp ()*1000)`.
+    ///
+    /// Дубликат **не** обновляет сохранённое время (i2pd `emplace` не
+    /// перезаписывает существующую запись).
+    pub fn handle_i2np_msg(&mut self, msg: &I2npMessage, last_activity: Duration) -> ReceivedI2np {
+        if msg.is_expired(ms_since_epoch(last_activity)) {
+            return ReceivedI2np::Expired;
+        }
+        match self.received.entry(msg.msg_id()) {
+            Entry::Vacant(slot) => {
+                slot.insert(last_activity);
+                ReceivedI2np::Accept
+            }
+            Entry::Occupied(_) => ReceivedI2np::Duplicate,
+        }
+    }
+
+    /// Часть `CleanUp` (`SSU2Session.cpp:3452`) для `m_ReceivedI2NPMsgIDs`.
+    ///
+    /// `now` — текущее время, `last_activity` — `m_LastActivityTimestamp`
+    /// (`GetLastActivityTimestamp ()`). Если набор разросся сверх
+    /// [`SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS`] или сессия неактивна дольше
+    /// [`SSU2_DECAY_INTERVAL`], набор чистится целиком (i2pd: «decay»); иначе
+    /// удаляются записи старше [`SSU2_RECEIVED_I2NP_MSGIDS_CLEANUP_TIMEOUT`].
+    pub fn cleanup(&mut self, now: Duration, last_activity: Duration) {
+        if self.received.len() > SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS
+            || now > last_activity + SSU2_DECAY_INTERVAL
+        {
+            self.received.clear();
+        } else {
+            self.received
+                .retain(|_, t| now <= *t + SSU2_RECEIVED_I2NP_MSGIDS_CLEANUP_TIMEOUT);
+        }
+    }
+}
+
+/// Время в миллисекундах since epoch (насыщение на `u64::MAX`).
+fn ms_since_epoch(t: Duration) -> u64 {
+    u64::try_from(t.as_millis()).unwrap_or(u64::MAX)
 }

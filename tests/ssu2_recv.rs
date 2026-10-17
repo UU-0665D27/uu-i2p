@@ -1,8 +1,14 @@
+use std::time::Duration;
 use uu_i2p::{
+    i2np::{I2npHeader, I2npMessageType},
+    i2np_message::I2npMessage,
     ssu2_block::Ssu2BlockType,
     ssu2_header::SSU2_FLAG_IMMEDIATE_ACK_REQUESTED,
-    ssu2_policy::{DateTimeAction, DateTimeSession, HandshakePhase, I2pdPolicy},
-    ssu2_recv::{self, PayloadSink},
+    ssu2_policy::{
+        DateTimeAction, DateTimeSession, HandshakePhase, I2pdPolicy,
+        SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS,
+    },
+    ssu2_recv::{self, PayloadSink, ReceivedI2np, ReceivedMsgIds},
     ssu2_session::ReceiveState,
 };
 
@@ -365,4 +371,133 @@ fn handle_datetime_computes_offset_from_now() {
         ssu2_recv::handle_datetime(&I2pdPolicy, &1610u32.to_be_bytes(), 1000, &session),
         DateTimeAction::Terminate
     );
+}
+
+// ---- ReceivedMsgIds (HandleI2NPMsg / CleanUp) ---------------------------
+
+/// I2NP-сообщение с заданными `msg_id` и `expiration_ms` (payload пуст).
+fn i2np(msg_id: u32, expiration_ms: u64) -> I2npMessage {
+    let header = I2npHeader {
+        message_type: I2npMessageType::Data,
+        msg_id,
+        expiration_ms,
+        size: 0,
+        checksum: None,
+    };
+    I2npMessage::with_header(header, Vec::new())
+}
+
+/// `expiration_ms` для времени в секундах since epoch.
+const fn exp_secs(s: u64) -> u64 {
+    s * 1000
+}
+
+#[test]
+fn received_msg_ids_accepts_then_dedups() {
+    let mut seen = ReceivedMsgIds::new();
+    let t = Duration::from_secs(1000);
+    let m = i2np(7, exp_secs(1000));
+    assert!(seen.is_empty());
+    assert_eq!(seen.handle_i2np_msg(&m, t), ReceivedI2np::Accept);
+    assert!(seen.contains(7));
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen.handle_i2np_msg(&m, t), ReceivedI2np::Duplicate);
+    assert_eq!(seen.len(), 1);
+    assert!(!seen.contains(8));
+}
+
+#[test]
+fn received_msg_ids_rejects_expired() {
+    let mut seen = ReceivedMsgIds::new();
+    let t = Duration::from_secs(1000);
+    let now_ms = exp_secs(1000);
+    // now > exp + 60s -> истекло.
+    assert_eq!(
+        seen.handle_i2np_msg(&i2np(1, now_ms - 61_000), t),
+        ReceivedI2np::Expired
+    );
+    // ровно граница допуска (exp + 60s == now) -> ещё валидно.
+    assert_eq!(
+        seen.handle_i2np_msg(&i2np(2, now_ms - 60_000), t),
+        ReceivedI2np::Accept
+    );
+    // слишком далеко в будущем (now < exp - 180s).
+    assert_eq!(
+        seen.handle_i2np_msg(&i2np(3, now_ms + 180_001), t),
+        ReceivedI2np::Expired
+    );
+    assert!(!seen.contains(1));
+    assert!(!seen.contains(3));
+    assert!(seen.contains(2));
+    assert_eq!(seen.len(), 1);
+}
+
+#[test]
+fn received_msg_ids_duplicate_keeps_original_time() {
+    let mut seen = ReceivedMsgIds::new();
+    let t0 = Duration::from_secs(1000);
+    let t1 = Duration::from_secs(1005);
+    let m = i2np(9, exp_secs(1000));
+    assert_eq!(seen.handle_i2np_msg(&m, t0), ReceivedI2np::Accept);
+    assert_eq!(seen.handle_i2np_msg(&m, t1), ReceivedI2np::Duplicate);
+    // Запомнено время t0, а не t1: на t0+10 запись ещё жива...
+    let mut fresh = seen.clone();
+    fresh.cleanup(Duration::from_secs(1010), Duration::from_secs(1010));
+    assert!(fresh.contains(9));
+    // ...а на t0+11 — уже нет (если бы помнили t1, жила бы до t1+10).
+    let mut stale = seen.clone();
+    stale.cleanup(Duration::from_secs(1011), Duration::from_secs(1011));
+    assert!(stale.is_empty());
+}
+
+#[test]
+fn received_msg_ids_cleanup_drops_stale_only() {
+    let mut seen = ReceivedMsgIds::new();
+    assert_eq!(
+        seen.handle_i2np_msg(&i2np(1, exp_secs(1000)), Duration::from_secs(1000)),
+        ReceivedI2np::Accept
+    );
+    assert_eq!(
+        seen.handle_i2np_msg(&i2np(2, exp_secs(1010)), Duration::from_secs(1010)),
+        ReceivedI2np::Accept
+    );
+    seen.cleanup(Duration::from_secs(1011), Duration::from_secs(1010));
+    assert!(!seen.contains(1));
+    assert!(seen.contains(2));
+    assert_eq!(seen.len(), 1);
+}
+
+#[test]
+fn received_msg_ids_cleanup_decays_when_inactive() {
+    let mut seen = ReceivedMsgIds::new();
+    assert_eq!(
+        seen.handle_i2np_msg(&i2np(1, exp_secs(1000)), Duration::from_secs(1000)),
+        ReceivedI2np::Accept
+    );
+    // now > last_activity + 20s -> набор чистится целиком.
+    seen.cleanup(Duration::from_secs(1021), Duration::from_secs(1000));
+    assert!(seen.is_empty());
+}
+
+#[test]
+fn received_msg_ids_decays_over_limit() {
+    let mut seen = ReceivedMsgIds::new();
+    let t = Duration::from_secs(1000);
+    let limit = u32::try_from(SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS).unwrap();
+    for id in 0..limit {
+        assert_eq!(
+            seen.handle_i2np_msg(&i2np(id, exp_secs(1000)), t),
+            ReceivedI2np::Accept
+        );
+    }
+    // Ровно предел: чистится только по времени, всё свежее -> набор цел.
+    seen.cleanup(t, t);
+    assert_eq!(seen.len(), SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS);
+    // На одно больше -> decay, набор пуст.
+    assert_eq!(
+        seen.handle_i2np_msg(&i2np(limit, exp_secs(1000)), t),
+        ReceivedI2np::Accept
+    );
+    seen.cleanup(t, t);
+    assert!(seen.is_empty());
 }
