@@ -149,7 +149,6 @@ garlic (`DatabaseLookup` за RI и `LeaseSet`, `DatabaseStore`), мы
   публикует `listen_published(ntcp2_addr, 127.0.0.1)`.
 - **Свежий RI.** i2pd рвёт сессию на RI старше 90 минут и на RI «из
   будущего» (2 минуты). Наш timestamp — `now_ms()`, ок.
-- Порт наш listener только держит: accept-loop нет (шаг 3a-5).
 
 Закрытие: `Router::close` на NTCP2-сессии — это
 `Termination(NormalClose)`, и i2pd его разбирает:
@@ -160,19 +159,46 @@ NTCP2: Termination. reason=0
 NTCP2: Session with 127.0.0.1:33176 (hu3m) terminated
 ```
 
-Дальше он, как и в SSU2-прогоне, звонит сам. Тут же видна цена
-опубликованного NTCP2-адреса без accept-loop:
+### Входящая сессия по NTCP2 (`--ntcp2 --accept`)
+
+Пул NTCP2 теперь и принимает: `Ntcp2Pool::listen` (accept-loop, зеркало
+`NTCP2Server::HandleAccept` — проверка `IsInReservedRange`, одна
+«ожидающая» сессия на IP, таймаут `NTCP2_ESTABLISH_TIMEOUT`), сессия
+живёт в своей задаче, а общий таймер (`run_maintenance`) следит за idle
+(`NTCP2_TERMINATION_TIMEOUT` ± разброс) и раз в
+`NTCP2_ROUTERINFO_RESEND_INTERVAL` повторяет наш RI
+(`SendLocalRouterInfo(update = true)`).
+
+```bash
+RUST_LOG=uu_i2p=debug cargo run --example uu-i2p-router-i2pd -- \
+    ~/.local/opt/i2pd-uu/datadir/router.info 127.0.0.1:12345 --ntcp2 --accept --secs 30
+```
+
+После нашего `Termination` i2pd звонит сам; транспорт выбирается
+случайно (`Transports::SetPriority`, SSU2/NTCP2 — 1/2), так что
+входящий NTCP2 ловится со второго-третьего прогона. Когда монетка
+выпала на NTCP2, у нас:
 
 ```
-NTCP2: Connecting to 127.0.0.1:42341 (hu3m)
-NTCP2: Connected to 127.0.0.1:42341 (hu3m)   # TCP в backlog, приложение молчит
-NTCP2: No activity for 50 seconds
-NTCP2: Session with 127.0.0.1:42341 (hu3m) terminated
+ntcp2 pool: входящая сессия установлена (Bob) peer=127.0.0.1:53919
+demo: соединение установлено transport=NTCP2 nth=2
 ```
 
-В том же прогоне с `--accept` входящую сессию он поднял по SSU2
-(`nth=2`), как и раньше: транспорт для звонка i2pd выбирает случайно
-(`Transports::SetPriority`, SSU2/NTCP2 — 1/2).
+а у i2pd:
+
+```
+NTCP2: Connecting to 127.0.0.1:37363 (ZmcK)
+NTCP2: Connected to 127.0.0.1:37363 (ZmcK)
+NTCP2: SessionCreated received 64           # наш SessionCreated (мы Bob)
+NTCP2: SessionConfirmed sent
+NTCP2: Received length 826
+NTCP2: Block type 2 of size 800
+NTCP2: RouterInfo flag=0                    # наш RI, отправленный пулом после установки
+```
+
+То есть входящий путь NTCP2 (accept-loop → Noise XK в роли Bob →
+`SendLocalRouterInfo`) отработал против настоящего i2pd; раньше i2pd в
+этом же месте получал «No activity for 50 seconds» и рвал сессию.
 
 ## Почему i2pd ругался на окно отправки (и что сделано)
 
@@ -248,6 +274,10 @@ SSU2: Packet was not Acked after 6 attempts. Terminate session
 5. **Исходящий NTCP2** — `Ntcp2Local`/`Ntcp2Transport`, события
    `Established`/`Disconnected` и `Termination` при закрытии:
    см. выше, «Исходящая сессия по NTCP2».
+6. **Входящий NTCP2 (accept-loop)** — `Ntcp2Pool::listen`, владение
+   `Ntcp2Local`/`local_ri` в пуле, задача таймеров (idle + повтор RI) и
+   `Ntcp2SessionWrite::send_router_info`: см. выше, «Входящая сессия по
+   NTCP2».
 
 ## Что в логе шумит и почему
 
