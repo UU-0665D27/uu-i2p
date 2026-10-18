@@ -298,6 +298,64 @@ impl DatabaseStore {
         }
     }
 
+    /// Создаёт `DatabaseStore` для `LeaseSet` любого типа
+    /// (`LeaseSet`, `LeaseSet2`, `EncryptedLeaseSet2`, `MetaLeaseSet2`).
+    ///
+    /// `ls_bytes` — payload как есть, без байта типа: для `LeaseSet2`
+    /// он начинается с identity (так же, как в i2pd
+    /// `NetDb::HandleDatabaseStoreMsg` передаёт `buf + offset` в
+    /// `AddLeaseSet2`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`], если `store_type` — не LeaseSet-тип.
+    pub fn new_lease_set_typed(
+        key: IdentHash,
+        store_type: StoreType,
+        ls_bytes: Vec<u8>,
+    ) -> Result<Self> {
+        if !matches!(
+            store_type,
+            StoreType::LeaseSet
+                | StoreType::LeaseSet2
+                | StoreType::EncryptedLeaseSet2
+                | StoreType::MetaLeaseSet2
+        ) {
+            return Err(I2PError::Malformed(
+                "database_store: new_lease_set_typed с не-LeaseSet типом",
+            ));
+        }
+        Ok(Self {
+            key,
+            store_type,
+            reply_token: 0,
+            reply_instruction: None,
+            payload: ls_bytes,
+        })
+    }
+
+    /// Пересобирает `DatabaseStore` из уже проверенных частей.
+    ///
+    /// Нужен ровно для пересылки дальше (i2pd `NetDb::Flood`: «zero
+    /// reply token»): payload берётся как есть, без повторного
+    /// сжатия/разбора, `reply_token` обнуляется. Поэтому функция
+    /// `pub(crate)`: снаружи ею можно было бы собрать несогласованный
+    /// `DatabaseStore`.
+    #[must_use]
+    pub(crate) const fn from_parts(
+        key: IdentHash,
+        store_type: StoreType,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            key,
+            store_type,
+            reply_token: 0,
+            reply_instruction: None,
+            payload,
+        }
+    }
+
     /// Сырой payload (в wire-формате для данного `store_type`).
     #[must_use]
     pub fn payload_raw(&self) -> &[u8] {

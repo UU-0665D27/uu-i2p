@@ -15,11 +15,17 @@
 //!
 //! - **Туннели** (`TunnelData`, `TunnelGateway`, `ShortTunnelBuild`) —
 //!   шаг 3b;
-//! - **`LeaseSet`'ы destination'ов** (`DatabaseStore` типа `LeaseSet`) —
-//!   шаг 3c; сейчас такие сообщения просто отбрасываются;
-//! - **Floodfill-логика** — мы отвечаем только на запросы про
-//!   собственный RI; логику `GetClosestFloodfills` для сети не
-//!   реализуем, пока не появится реальная сеть и floodfill-роутеры.
+//! - **`EncryptedLeaseSet2`/`MetaLeaseSet2`** — тела не разбираем,
+//!   флудфилл отвечает [`StoreHandling::NotStorable`] (i2pd тип 7 тоже
+//!   отвергает, тип 5 — принимает);
+//! - **суточная выборка флудфиллов** (`andNextDay` в `NetDb::Flood`) —
+//!   пересылка идёт только трём ближайшим на текущий день;
+//! - **туннельная доставка** ответов и приём `DatabaseLookup` с
+//!   `reply_tunnel_id` — шаг 3b; сейчас всё уходит напрямую
+//!   отправителю.
+//!
+//! `LeaseSet`'ы типов 1/3 живут в [`crate::lsdb::Lsdb`] — вторая
+//! половина netDb флудфилла; RI — в [`crate::netdb::NetDb`].
 //!
 //! Пул NTCP2-сессий вместе с accept-loop живёт в
 //! [`crate::ntcp2_pool::Ntcp2Pool`], SSU2 — в
@@ -46,6 +52,7 @@ use crate::{
     garlic_body::GarlicBody,
     i2np::I2npMessageType,
     i2np_message::{I2npBody, I2npMessage},
+    lsdb::{Lsdb, LsdbOutcome},
     netdb::NetDb,
     netdb_requests::{NetDbRequests, SendAction},
     router_info::FullRouterInfo,
@@ -59,8 +66,8 @@ use tracing::{debug, info, trace, warn};
 /// Результат [`RouterContext::handle_database_store`].
 ///
 /// Позволяет caller'у различать «RI был новым / обновлён» и «RI уже
-/// есть более свежий», а также «это не RI» (`LeaseSet`, `EncryptedLeaseSet`
-/// — обрабатываются на уровне destination, не здесь).
+/// есть более свежий», а также «это `LeaseSet`» (типы 1/3) — они
+/// живут в [`crate::lsdb::Lsdb`] и только у флудфилла.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreHandling {
     /// RI был добавлен в netDb (не было раньше).
@@ -69,9 +76,20 @@ pub enum StoreHandling {
     Updated(IdentHash),
     /// RI уже был, и сохранённый timestamp не меньше нового.
     Stale(IdentHash),
-    /// Не `RouterInfo` — `store_type` другой. Caller решает,
-    /// обрабатывать ли (`LeaseSet` — на уровне destination).
-    NotRouterInfo(StoreType),
+    /// `LeaseSet` впервые сохранён в [`crate::lsdb::Lsdb`].
+    LeaseSetInserted(IdentHash),
+    /// `LeaseSet` заменён более свежей версией.
+    LeaseSetUpdated(IdentHash),
+    /// `LeaseSet` не новее имеющегося — ничего не делали.
+    LeaseSetStale(IdentHash),
+    /// `LeaseSet` валиден, но не хранится: `unpublished` или истёк.
+    LeaseSetRejected(IdentHash),
+    /// `LeaseSet` пришёл, но мы не флудфилл (i2pd: «Not Floodfill,
+    /// `LeaseSet` store request ignored»).
+    LeaseSetIgnored(IdentHash),
+    /// Такой `store_type` мы не храним (`EncryptedLeaseSet2`,
+    /// `MetaLeaseSet2`, неизвестный).
+    NotStorable(StoreType),
 }
 /// Что caller должен сделать после успешного [`RouterContext::handle_garlic`].
 ///
@@ -104,6 +122,7 @@ pub struct RouterContext {
     config: RouterConfig,
     own_ri: FullRouterInfo,
     netdb: NetDb,
+    lsdb: Lsdb,
     ecies: EciesGarlicDestination,
     netdb_requests: NetDbRequests,
 }
@@ -465,6 +484,7 @@ impl RouterContext {
             netdb_requests: NetDbRequests::new(),
             own_ri,
             netdb: NetDb::new(),
+            lsdb: Lsdb::new(),
             ecies,
         })
     }
@@ -529,6 +549,26 @@ impl RouterContext {
     /// `NetDb`, изменяемо.
     pub const fn netdb_mut(&mut self) -> &mut NetDb {
         &mut self.netdb
+    }
+
+    /// Хранилище `LeaseSet`'ов (вторая половина netDb флудфилла).
+    #[must_use]
+    pub const fn lsdb(&self) -> &Lsdb {
+        &self.lsdb
+    }
+
+    /// Сколько `LeaseSet`'ов лежит (для логов и тестов).
+    #[must_use]
+    pub fn lsdb_len(&self) -> usize {
+        self.lsdb.len()
+    }
+
+    /// Убирает просроченные `LeaseSet`'ы (i2pd `NetDb::ManageLeaseSets`).
+    ///
+    /// Возвращает число удалённых. Дёшево на пустом/небольшом
+    /// хранилище, поэтому зовётся с общего тика роутера.
+    pub fn expire_lease_sets(&mut self, now_ms: u64) -> usize {
+        self.lsdb.expire(now_ms)
     }
 
     /// ECIES garlic destination.
@@ -596,9 +636,16 @@ impl RouterContext {
     ///
     /// - `store_type == RouterInfo` → распаковывает gzip, парсит
     ///   [`FullRouterInfo`], кладёт в `netdb` (с учётом timestamp'а);
-    /// - остальные типы (`LeaseSet`, `EncryptedLeaseSet`, `MetaLeaseSet`)
-    ///   возвращает как [`StoreHandling::NotRouterInfo`] — caller сам
-    ///   решает (обычно destination-уровень).
+    /// - `LeaseSet` (тип 1) и `LeaseSet2` (тип 3) → если мы флудфилл,
+    ///   проверяет и кладёт в [`crate::lsdb::Lsdb`]; не флудфилл —
+    ///   [`StoreHandling::LeaseSetIgnored`], как i2pd («Not Floodfill,
+    ///   `LeaseSet` store request ignored»);
+    /// - `EncryptedLeaseSet2`/`MetaLeaseSet2` — [`StoreHandling::NotStorable`]:
+    ///   их тела мы не разбираем.
+    ///
+    /// Ответ `DeliveryStatus` на `reply_token` и пересылку дальше
+    /// (flood) делает [`crate::router::Router`]: контекст ничего не
+    /// отправляет.
     ///
     /// # Errors
     ///
@@ -607,11 +654,18 @@ impl RouterContext {
     ///   `FullRouterInfo` не парсится;
     /// - [`Error::Malformed`] — `store_type` `RouterInfo`, но key
     ///   в сообщении не совпадает с `ident_hash` разобранного RI
-    ///   (защита от подмены).
+    ///   (защита от подмены);
+    /// - ошибки [`crate::lsdb::Lsdb::insert`] — битый/невалидный
+    ///   `LeaseSet` (сигнатура, длина).
     pub fn handle_database_store(&mut self, payload: &[u8]) -> Result<StoreHandling> {
         let ds = DatabaseStore::from_buffer(payload)?;
+        if ds.key.is_zero() {
+            return Err(I2PError::Malformed(
+                "router_context: DatabaseStore с нулевым ключом",
+            ));
+        }
         if ds.store_type != StoreType::RouterInfo {
-            return Ok(StoreHandling::NotRouterInfo(ds.store_type));
+            return self.store_lease_set(&ds);
         }
         let ri_bytes = ds.payload_decoded()?;
         let ri = FullRouterInfo::from_buffer(&ri_bytes)?;
@@ -640,6 +694,36 @@ impl RouterContext {
         } else {
             Ok(StoreHandling::Stale(ident))
         }
+    }
+
+    /// Ветка `LeaseSet` из [`Self::handle_database_store`].
+    fn store_lease_set(&mut self, ds: &DatabaseStore) -> Result<StoreHandling> {
+        let key = ds.key;
+        if !matches!(ds.store_type, StoreType::LeaseSet | StoreType::LeaseSet2) {
+            debug!(
+                key = %key.to_base32(),
+                store_type = ?ds.store_type,
+                "handle_database_store: такой LeaseSet-тип не храним"
+            );
+            return Ok(StoreHandling::NotStorable(ds.store_type));
+        }
+        if !self.config.is_floodfill() {
+            debug!(
+                key = %key.to_base32(),
+                store_type = ?ds.store_type,
+                "handle_database_store: LeaseSet, но мы не флудфилл"
+            );
+            return Ok(StoreHandling::LeaseSetIgnored(key));
+        }
+
+        let bytes = ds.payload_decoded()?;
+        let outcome = self.lsdb.insert(key, ds.store_type, bytes, now_ms())?;
+        Ok(match outcome {
+            LsdbOutcome::Inserted => StoreHandling::LeaseSetInserted(key),
+            LsdbOutcome::Updated => StoreHandling::LeaseSetUpdated(key),
+            LsdbOutcome::Stale => StoreHandling::LeaseSetStale(key),
+            LsdbOutcome::Rejected => StoreHandling::LeaseSetRejected(key),
+        })
     }
 
     /// Начать поиск `RouterInfo` по `ident`.
@@ -758,7 +842,10 @@ impl RouterContext {
     /// состояния. Вызывающий сам решает, куда деть `I2npMessage`.
     ///
     /// Соответствует `NetDb::HandleDatabaseLookupMsg` в части
-    /// построения `replyMsg` (без части отправки).
+    /// построения `replyMsg` (без части отправки), включая «молча
+    /// игнорировать»: `None` — ответа не будет, ровно как i2pd
+    /// возвращается без `replyMsg` для `Exploratory`/`LeaseSet`
+    /// запросов к не-флудфиллу.
     ///
     /// # Errors
     ///
@@ -766,7 +853,7 @@ impl RouterContext {
     ///   `DatabaseStore` (RI больше 64 КБ, что для валидного RI
     ///   невозможно);
     /// - ошибки [`I2npMessage::from_body`].
-    pub fn build_lookup_reply(&self, lookup: &DatabaseLookup) -> Result<I2npMessage> {
+    pub fn build_lookup_reply(&self, lookup: &DatabaseLookup) -> Result<Option<I2npMessage>> {
         let our_hash = *self.own_ident_hash();
 
         // Исключаем: то, что пир сам попросил исключить, плюс себя —
@@ -775,14 +862,25 @@ impl RouterContext {
         excluded.insert(our_hash);
 
         // Exploratory: пир ищет любые роутеры для расширения netdb.
-        // Отдаём не-floodfill'ы, ближайшие к его ключу.
+        // Отдаём не-floodfill'ы, ближайшие к его ключу. Не-флудфиллу
+        // i2pd на такой запрос не отвечает вообще.
         if lookup.lookup_type == LookupType::Exploratory {
+            if !self.config.is_floodfill() {
+                debug!(
+                    key = %lookup.key.to_base32(),
+                    "build_lookup_reply: exploratory-запрос к не-флудфиллу, игнорируем"
+                );
+                return Ok(None);
+            }
             let hashes = self.exploratory_non_floodfills(&lookup.key, &excluded);
             let reply = DatabaseSearchReply::with_from(lookup.key, hashes, our_hash);
-            return I2npMessage::from_body(I2npBody::DatabaseSearchReply(reply));
+            return Ok(Some(I2npMessage::from_body(
+                I2npBody::DatabaseSearchReply(reply),
+            )?));
         }
 
-        // RI-ветка (для RouterInfo и Normal).
+        // RI-ветка (`RouterInfo` и `Normal`) — как i2pd: отвечаем
+        // и не-флудфилл.
         if matches!(
             lookup.lookup_type,
             LookupType::RouterInfo | LookupType::Normal
@@ -790,17 +888,66 @@ impl RouterContext {
         {
             let ri_bytes = ri.to_buffer()?;
             let ds = DatabaseStore::new_router_info(lookup.key, &ri_bytes, 0, None)?;
-            return I2npMessage::from_body(I2npBody::DatabaseStore(ds));
+            return Ok(Some(I2npMessage::from_body(I2npBody::DatabaseStore(ds))?));
         }
 
-        // LeaseSet-ветка: LS-хранилища в netdb у нас пока нет
-        // (отдельный шаг 3c). Падать не падаем — отдаём
-        // SearchReply, как i2pd, когда ничего не нашёл.
+        // LeaseSet-ветка (`LeaseSet` и `Normal`): только у флудфилла
+        // есть что отдать. Явный `LeaseSet`-запрос к не-флудфиллу
+        // i2pd молча дропает.
+        if matches!(
+            lookup.lookup_type,
+            LookupType::LeaseSet | LookupType::Normal
+        ) {
+            if self.config.is_floodfill() {
+                if let Some(entry) = self.lsdb.get(&lookup.key, now_ms()) {
+                    let ds = DatabaseStore::new_lease_set_typed(
+                        lookup.key,
+                        entry.store_type(),
+                        entry.bytes().to_vec(),
+                    )?;
+                    return Ok(Some(I2npMessage::from_body(I2npBody::DatabaseStore(ds))?));
+                }
+                debug!(
+                    key = %lookup.key.to_base32(),
+                    "build_lookup_reply: LeaseSet не найден, отдаём SearchReply"
+                );
+            } else if lookup.lookup_type == LookupType::LeaseSet {
+                debug!(
+                    key = %lookup.key.to_base32(),
+                    "build_lookup_reply: LeaseSet-запрос к не-флудфиллу, игнорируем"
+                );
+                return Ok(None);
+            }
+        }
 
         // Ничего не нашли — ближайшие floodfill'ы.
         let hashes = self.closest_floodfills_for(&lookup.key, &excluded);
         let reply = DatabaseSearchReply::with_from(lookup.key, hashes, our_hash);
-        I2npMessage::from_body(I2npBody::DatabaseSearchReply(reply))
+        Ok(Some(I2npMessage::from_body(
+            I2npBody::DatabaseSearchReply(reply),
+        )?))
+    }
+
+    /// Кому переслать обновление объекта `key` (i2pd `NetDb::Flood`).
+    ///
+    /// Возвращает до [`Self::LOOKUP_REPLY_PEER_COUNT`] ближайших
+    /// флудфиллов, кроме себя и самого `key`. Пустой список — сеть
+    /// из одного роутера (наш случай в локальном тесте).
+    ///
+    /// i2pd рядом с полуночью добавляет ещё двух флудфиллов «на
+    /// следующий день» (`andNextDay`, суточная выборка
+    /// `GetClosestFloodfill(..., true)`). Суточной выборки у нас нет,
+    /// см. `// TODO(floodfill): суточная выборка флудфиллов (next day).`
+    #[must_use]
+    pub fn database_store_flood_targets(&self, key: &IdentHash) -> Vec<IdentHash> {
+        let our_hash = *self.own_ident_hash();
+        self.netdb
+            .closest_floodfills(key, Self::LOOKUP_REPLY_PEER_COUNT + 2)
+            .into_iter()
+            .map(|ri| *ri.ident_hash())
+            .filter(|hash| *hash != our_hash && hash != key)
+            .take(Self::LOOKUP_REPLY_PEER_COUNT)
+            .collect()
     }
 
     /// Полный цикл обработки входящего `DatabaseLookup`.
@@ -818,8 +965,7 @@ impl RouterContext {
     /// - ошибки [`Self::build_lookup_reply`].
     pub fn process_database_lookup(&mut self, payload: &[u8]) -> Result<Option<I2npMessage>> {
         let lookup = self.handle_database_lookup(payload)?;
-        let reply = self.build_lookup_reply(&lookup)?;
-        Ok(Some(reply))
+        self.build_lookup_reply(&lookup)
     }
 
     // --- приватные хелперы -----------------------------------------------

@@ -1,7 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 use uu_i2p::{
     DatabaseLookup, DatabaseSearchReply, DatabaseStore, I2PError, I2PTag, I2PX25519Keys,
-    I2npMessage, IdentHash, RouterConfig, RouterContext, StoreHandling, StoreType,
+    I2npMessage, IdentHash, Lease, LeaseSet2, RouterConfig, RouterContext, StoreHandling,
+    StoreType,
     ecies_destination::EciesGarlicDestination,
     garlic_body::GarlicBody,
     i2np::I2npMessageType,
@@ -36,6 +37,50 @@ fn minimal_ctx() -> RouterContext {
 
     RouterContext::new(cfg).expect("ctx")
 }
+
+/// То же, но флудфилл (caps `f`): отвечает на `LeaseSet` и
+/// exploratory-запросы, хранит `LeaseSet`'ы.
+fn minimal_floodfill_ctx() -> RouterContext {
+    let keys = I2PPrivateKeys::generate_default().expect("keys");
+    let ntcp2 = I2PX25519Keys::generate();
+
+    let cfg = RouterConfig::builder()
+        .keys(keys)
+        .ntcp2_keys(ntcp2, [0u8; 16])
+        .listen_unpublished("127.0.0.1:0".parse().unwrap())
+        .floodfill(true)
+        .build()
+        .expect("config");
+
+    RouterContext::new(cfg).expect("ctx")
+}
+
+/// Подписанный `LeaseSet2`, истекающий через `expires_in` секунд.
+fn signed_lease_set2_store(expires_in: u16) -> (IdentHash, DatabaseStore) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let published = u32::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    )
+    .expect("seconds fit u32");
+    let keys = I2PPrivateKeys::generate_default().expect("keys");
+    let end_date = (u64::from(published) + u64::from(expires_in)) * 1000 - 10_000;
+    let ls = LeaseSet2::from_keys(
+        &keys,
+        published,
+        expires_in,
+        vec![Lease::new(IdentHash::from_array([0x5A; 32]), 7, end_date)],
+    )
+    .expect("ls2");
+    let key = *keys.public().ident_hash();
+    (
+        key,
+        DatabaseStore::new_lease_set2(key, ls.to_buffer().expect("ls2 bytes")),
+    )
+}
+
 /// Собирает и подписывает «чужой» RI, кладёт его в netdb,
 /// возвращает `IdentHash` вставленного роутера.
 ///
@@ -342,8 +387,9 @@ fn handle_database_store_reports_not_router_info() {
     let ds = DatabaseStore::new_lease_set(ident(0x77), vec![0xAA; 10]);
     let result = ctx.handle_database_store(&ds.to_buffer().unwrap()).unwrap();
     match result {
-        StoreHandling::NotRouterInfo(StoreType::LeaseSet) => {}
-        other => panic!("expected NotRouterInfo(LeaseSet), got {other:?}"),
+        // Не флудфилл — LeaseSet не храним, как i2pd.
+        StoreHandling::LeaseSetIgnored(key) => assert_eq!(key, ident(0x77)),
+        other => panic!("expected LeaseSetIgnored, got {other:?}"),
     }
     // netDb не изменился.
     assert!(ctx.netdb().is_empty());
@@ -420,7 +466,7 @@ fn lookup_router_info_present_returns_database_store() {
     let target = add_ri_to_netdb(&mut ctx, 0x11, false);
 
     let lookup = DatabaseLookup::new_router_info(target, *ctx.own_ident_hash(), None, Vec::new());
-    let reply = ctx.build_lookup_reply(&lookup).unwrap();
+    let reply = ctx.build_lookup_reply(&lookup).unwrap().expect("reply");
 
     assert_eq!(reply.message_type(), uu_i2p::I2npMessageType::DatabaseStore);
     let body = reply.parse_body().unwrap();
@@ -439,7 +485,7 @@ fn lookup_router_info_missing_returns_search_reply() {
     let unknown = IdentHash::from_array([0x77u8; 32]);
 
     let lookup = DatabaseLookup::new_router_info(unknown, *ctx.own_ident_hash(), None, Vec::new());
-    let reply = ctx.build_lookup_reply(&lookup).unwrap();
+    let reply = ctx.build_lookup_reply(&lookup).unwrap().expect("reply");
 
     assert_eq!(
         reply.message_type(),
@@ -467,7 +513,7 @@ fn lookup_router_info_missing_returns_closest_floodfills() {
 
     let unknown = IdentHash::from_array([0x77u8; 32]);
     let lookup = DatabaseLookup::new_router_info(unknown, *ctx.own_ident_hash(), None, Vec::new());
-    let reply = ctx.build_lookup_reply(&lookup).unwrap();
+    let reply = ctx.build_lookup_reply(&lookup).unwrap().expect("reply");
     let body = reply.parse_body().unwrap();
     match body {
         I2npBody::DatabaseSearchReply(sr) => {
@@ -488,14 +534,14 @@ fn lookup_router_info_missing_returns_closest_floodfills() {
 
 #[test]
 fn lookup_exploratory_returns_non_floodfills() {
-    let mut ctx = minimal_ctx();
+    let mut ctx = minimal_floodfill_ctx();
     let _f1 = add_ri_to_netdb(&mut ctx, 0x11, true);
     let n1 = add_ri_to_netdb(&mut ctx, 0x22, false);
     let n2 = add_ri_to_netdb(&mut ctx, 0x33, false);
 
     let target = IdentHash::from_array([0x77u8; 32]);
     let lookup = DatabaseLookup::new_exploratory(target, *ctx.own_ident_hash(), None, Vec::new());
-    let reply = ctx.build_lookup_reply(&lookup).unwrap();
+    let reply = ctx.build_lookup_reply(&lookup).unwrap().expect("reply");
     let body = reply.parse_body().unwrap();
     match body {
         I2npBody::DatabaseSearchReply(sr) => {
@@ -518,7 +564,7 @@ fn lookup_excluded_are_not_in_reply() {
 
     let target = IdentHash::from_array([0x77u8; 32]);
     let lookup = DatabaseLookup::new_router_info(target, *ctx.own_ident_hash(), None, vec![f1]);
-    let reply = ctx.build_lookup_reply(&lookup).unwrap();
+    let reply = ctx.build_lookup_reply(&lookup).unwrap().expect("reply");
     let body = reply.parse_body().unwrap();
     match body {
         I2npBody::DatabaseSearchReply(sr) => {
@@ -546,7 +592,7 @@ fn lookup_self_is_not_in_reply() {
 
     let target = IdentHash::from_array([0x77u8; 32]);
     let lookup = DatabaseLookup::new_router_info(target, *ctx.own_ident_hash(), None, Vec::new());
-    let reply = ctx.build_lookup_reply(&lookup).unwrap();
+    let reply = ctx.build_lookup_reply(&lookup).unwrap().expect("reply");
     let body = reply.parse_body().unwrap();
     match body {
         I2npBody::DatabaseSearchReply(sr) => {
@@ -1015,4 +1061,172 @@ fn router_garlic_garbage_is_empty_not_error() {
         .expect("не ошибка");
 
     assert_eq!(messages.len(), 0, "мусор — не ошибка и не сообщения");
+}
+
+// --- LeaseSet: хранение и ответы (флудфилл) ------------------------------
+
+#[test]
+fn floodfill_stores_lease_set2_and_answers_lookup() {
+    let mut ctx = minimal_floodfill_ctx();
+    let (key, store) = signed_lease_set2_store(600);
+    let expected_bytes = store.payload_raw().to_vec();
+
+    let handling = ctx
+        .handle_database_store(&store.to_buffer().unwrap())
+        .expect("store");
+    assert_eq!(handling, StoreHandling::LeaseSetInserted(key));
+    assert_eq!(ctx.lsdb_len(), 1);
+
+    let lookup = DatabaseLookup::new_lease_set(key, *ctx.own_ident_hash(), None, Vec::new());
+    let reply = ctx
+        .build_lookup_reply(&lookup)
+        .unwrap()
+        .expect("ответ на LeaseSet-запрос");
+    assert_eq!(reply.message_type(), I2npMessageType::DatabaseStore);
+
+    match reply.parse_body().unwrap() {
+        I2npBody::DatabaseStore(ds) => {
+            assert_eq!(ds.key, key);
+            assert_eq!(ds.store_type, StoreType::LeaseSet2);
+            assert_eq!(ds.payload_raw(), expected_bytes.as_slice());
+            assert_eq!(ds.reply_token, 0);
+        }
+        other => panic!("expected DatabaseStore, got {other:?}"),
+    }
+}
+
+#[test]
+fn floodfill_keeps_newer_lease_set2_and_reports_stale() {
+    let mut ctx = minimal_floodfill_ctx();
+    let (key, first) = signed_lease_set2_store(600);
+    assert_eq!(
+        ctx.handle_database_store(&first.to_buffer().unwrap())
+            .unwrap(),
+        StoreHandling::LeaseSetInserted(key)
+    );
+
+    // Тот же LS ещё раз: published тот же (секунда может совпасть) —
+    // ожидаем либо Stale, либо Updated, но запись одна.
+    let again = ctx
+        .handle_database_store(&first.to_buffer().unwrap())
+        .unwrap();
+    assert!(
+        matches!(
+            again,
+            StoreHandling::LeaseSetStale(k) | StoreHandling::LeaseSetUpdated(k) if k == key
+        ),
+        "got {again:?}"
+    );
+    assert_eq!(ctx.lsdb_len(), 1);
+}
+
+#[test]
+fn floodfill_rejects_tampered_lease_set2() {
+    let mut ctx = minimal_floodfill_ctx();
+    let (_, store) = signed_lease_set2_store(600);
+    let mut bytes = store.to_buffer().unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+
+    let r = ctx.handle_database_store(&bytes);
+    assert!(matches!(r, Err(I2PError::Malformed(_))), "{r:?}");
+    assert_eq!(ctx.lsdb_len(), 0);
+}
+
+#[test]
+fn floodfill_does_not_store_encrypted_lease_set2() {
+    let mut ctx = minimal_floodfill_ctx();
+    let key = ident(0x5A);
+    // Тело не важно: до разбора дело не дойдёт.
+    let store =
+        DatabaseStore::new_lease_set_typed(key, StoreType::EncryptedLeaseSet2, vec![0xAA; 32])
+            .unwrap();
+
+    assert_eq!(
+        ctx.handle_database_store(&store.to_buffer().unwrap())
+            .unwrap(),
+        StoreHandling::NotStorable(StoreType::EncryptedLeaseSet2)
+    );
+    assert_eq!(ctx.lsdb_len(), 0);
+}
+
+#[test]
+fn non_floodfill_does_not_store_lease_sets() {
+    let mut ctx = minimal_ctx();
+    let (key, store) = signed_lease_set2_store(600);
+
+    assert_eq!(
+        ctx.handle_database_store(&store.to_buffer().unwrap())
+            .unwrap(),
+        StoreHandling::LeaseSetIgnored(key)
+    );
+    assert_eq!(ctx.lsdb_len(), 0);
+}
+
+#[test]
+fn lookup_lease_set_missing_returns_search_reply() {
+    let ctx = minimal_floodfill_ctx();
+    let unknown = IdentHash::from_array([0x77u8; 32]);
+
+    let lookup = DatabaseLookup::new_lease_set(unknown, *ctx.own_ident_hash(), None, Vec::new());
+    let reply = ctx.build_lookup_reply(&lookup).unwrap().expect("reply");
+    assert_eq!(reply.message_type(), I2npMessageType::DatabaseSearchReply);
+}
+
+#[test]
+fn lookup_lease_set_to_non_floodfill_is_ignored() {
+    let ctx = minimal_ctx();
+    let lookup = DatabaseLookup::new_lease_set(
+        IdentHash::from_array([0x77u8; 32]),
+        *ctx.own_ident_hash(),
+        None,
+        Vec::new(),
+    );
+    assert!(
+        ctx.build_lookup_reply(&lookup).unwrap().is_none(),
+        "i2pd молча дропает LeaseSet-запрос к не-флудфиллу"
+    );
+}
+
+#[test]
+fn lookup_exploratory_to_non_floodfill_is_ignored() {
+    let ctx = minimal_ctx();
+    let lookup = DatabaseLookup::new_exploratory(
+        IdentHash::from_array([0x77u8; 32]),
+        *ctx.own_ident_hash(),
+        None,
+        Vec::new(),
+    );
+    assert!(
+        ctx.build_lookup_reply(&lookup).unwrap().is_none(),
+        "i2pd молча дропает exploratory-запрос к не-флудфиллу"
+    );
+}
+
+#[test]
+fn flood_targets_are_closest_floodfills() {
+    let mut ctx = minimal_floodfill_ctx();
+    let f1 = add_ri_to_netdb(&mut ctx, 0x11, true);
+    let f2 = add_ri_to_netdb(&mut ctx, 0x22, true);
+    let f3 = add_ri_to_netdb(&mut ctx, 0x33, true);
+    let _non_ff = add_ri_to_netdb(&mut ctx, 0x44, false);
+
+    let targets = ctx.database_store_flood_targets(&IdentHash::from_array([0x77u8; 32]));
+    assert!(targets.len() <= 3, "i2pd Flood шлёт не больше трём");
+    for target in &targets {
+        assert!(
+            *target == f1 || *target == f2 || *target == f3,
+            "пересылаем только флудфиллам"
+        );
+        assert_ne!(target, ctx.own_ident_hash(), "себе не пересылаем");
+    }
+}
+
+#[test]
+fn flood_targets_empty_without_floodfills() {
+    let ctx = minimal_floodfill_ctx();
+    assert_eq!(
+        ctx.database_store_flood_targets(&IdentHash::from_array([0x77u8; 32])),
+        Vec::<IdentHash>::new()
+    );
 }

@@ -329,6 +329,24 @@ impl DatabaseLookup {
         }
     }
 
+    /// Конструктор для запроса `LeaseSet`.
+    #[must_use]
+    pub const fn new_lease_set(
+        key: IdentHash,
+        from: IdentHash,
+        reply_tunnel_id: Option<u32>,
+        excluded: Vec<IdentHash>,
+    ) -> Self {
+        Self {
+            key,
+            from,
+            lookup_type: LookupType::LeaseSet,
+            reply_tunnel_id,
+            excluded,
+            encrypted_reply: None,
+        }
+    }
+
     /// Конструктор для exploratory lookup'а.
     #[must_use]
     pub const fn new_exploratory(

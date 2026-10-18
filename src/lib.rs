@@ -27,6 +27,7 @@ pub mod identity;
 pub mod lease;
 pub mod lease_set;
 pub mod lease_set2;
+pub mod lsdb;
 pub mod netdb;
 pub mod netdb_requests;
 pub mod ntcp2;
@@ -101,6 +102,9 @@ pub use lease_set2::{
     KeySection, LEASESET2_FLAG_OFFLINE_KEYS, LEASESET2_FLAG_PUBLISHED_ENCRYPTED,
     LEASESET2_FLAG_UNPUBLISHED_LEASESET, LeaseSet2, NETDB_STORE_TYPE_ENCRYPTED_LEASESET2,
     NETDB_STORE_TYPE_META_LEASESET2, NETDB_STORE_TYPE_STANDARD_LEASESET2, Properties, Property,
+};
+pub use lsdb::{
+    LEASE_ENDDATE_THRESHOLD_MS, Lsdb, LsdbEntry, LsdbOutcome, MAX_LS_BUFFER_SIZE, MAX_LSDB_BYTES,
 };
 pub use netdb::NetDb;
 pub use ntcp2::Ntcp2Local;

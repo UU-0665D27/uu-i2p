@@ -153,6 +153,8 @@ struct Counters {
     stores: AtomicUsize,
     /// RI, попавших в netDb (событием транспорта или `DatabaseStore`).
     inserted: AtomicUsize,
+    /// `LeaseSet`'ов сохранено в lsdb (мы флудфилл).
+    lease_sets: AtomicUsize,
     /// Прочих I2NP-сообщений.
     other: AtomicUsize,
     /// Сообщений, которые роутер не обработал (нет слоя туннелей).
@@ -166,11 +168,15 @@ impl Counters {
             self.established.load(Ordering::Relaxed)
         );
         println!(
-            "I2NP принято: DatabaseLookup={} DatabaseStore={} прочих={} | RI в netDb={} | необработано={}",
+            "I2NP принято: DatabaseLookup={} DatabaseStore={} прочих={} | RI в netDb={}",
             self.lookups.load(Ordering::Relaxed),
             self.stores.load(Ordering::Relaxed),
             self.other.load(Ordering::Relaxed),
             self.inserted.load(Ordering::Relaxed),
+        );
+        println!(
+            "Флудфилл: LeaseSet в lsdb={} | необработано={}",
+            self.lease_sets.load(Ordering::Relaxed),
             self.unhandled.load(Ordering::Relaxed),
         );
     }
@@ -220,9 +226,19 @@ impl RouterObserver for DemoObserver {
     }
 
     fn on_store(&mut self, handling: &uu_i2p::StoreHandling) {
-        if let uu_i2p::StoreHandling::Inserted(ident) = handling {
-            self.counters.inserted.fetch_add(1, Ordering::Relaxed);
-            info!(peer = %ident.to_base64(), "demo: RouterInfo добавлен в netDb");
+        match handling {
+            uu_i2p::StoreHandling::Inserted(ident) => {
+                self.counters.inserted.fetch_add(1, Ordering::Relaxed);
+                info!(peer = %ident.to_base64(), "demo: RouterInfo добавлен в netDb");
+            }
+            uu_i2p::StoreHandling::LeaseSetInserted(key) => {
+                self.counters.lease_sets.fetch_add(1, Ordering::Relaxed);
+                info!(key = %key.to_base32(), "demo: LeaseSet сохранён (флудфилл)");
+            }
+            uu_i2p::StoreHandling::LeaseSetUpdated(key) => {
+                info!(key = %key.to_base32(), "demo: LeaseSet обновлён");
+            }
+            _ => {}
         }
     }
 
@@ -600,6 +616,7 @@ fn print_summary(
     );
     println!("Пир в карте сессий: {:?}", router.session_transport(i2pd));
     println!("Записей в netDb:    {}", router.context().netdb().len());
+    println!("LeaseSet в lsdb:    {}", router.context().lsdb_len());
     counters.print();
     println!();
     println!(

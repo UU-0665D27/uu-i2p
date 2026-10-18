@@ -83,6 +83,7 @@ use crate::{
     IdentHash,
     config::Transport as TransportKind,
     database_store::DatabaseStore,
+    delivery_status::DeliveryStatus,
     error::{I2PError, Result},
     i2np::I2npMessageType,
     i2np_message::{I2npBody, I2npMessage},
@@ -931,6 +932,13 @@ impl Router {
     pub async fn tick(&mut self) -> Result<()> {
         let now_ms = self.clock.now_ms();
 
+        // i2pd `NetDb::ManageLeaseSets` — по тому же тику, что и
+        // публикация RI.
+        let expired = self.context.expire_lease_sets(now_ms);
+        if expired != 0 {
+            debug!(expired, "router: просроченные LeaseSet удалены");
+        }
+
         for action in self.context.tick_netdb_requests(now_ms) {
             let to = action.to;
             if let Err(error) = self.send(&action.to, action.message).await {
@@ -1077,10 +1085,23 @@ impl Router {
             StoreHandling::Stale(ident) => {
                 trace!(transport = %kind, peer = %ident.to_base64(), "router: RouterInfo устарел");
             }
-            StoreHandling::NotRouterInfo(store_type) => {
-                // `// TODO(step-3c): LeaseSet'ы в netDb роутера —
-                // сейчас они уезжают наблюдателю и теряются.`
-                debug!(transport = %kind, ?store_type, "router: DatabaseStore не RouterInfo");
+            StoreHandling::LeaseSetInserted(ident) => {
+                info!(transport = %kind, key = %ident.to_base32(), "router: LeaseSet сохранён (флудфилл)");
+            }
+            StoreHandling::LeaseSetUpdated(ident) => {
+                debug!(transport = %kind, key = %ident.to_base32(), "router: LeaseSet обновлён");
+            }
+            StoreHandling::LeaseSetStale(ident) => {
+                trace!(transport = %kind, key = %ident.to_base32(), "router: LeaseSet устарел");
+            }
+            StoreHandling::LeaseSetRejected(ident) => {
+                warn!(transport = %kind, key = %ident.to_base32(), "router: LeaseSet отвергнут (unpublished/истёк)");
+            }
+            StoreHandling::LeaseSetIgnored(ident) => {
+                debug!(transport = %kind, key = %ident.to_base32(), "router: LeaseSet, но мы не флудфилл");
+            }
+            StoreHandling::NotStorable(store_type) => {
+                debug!(transport = %kind, ?store_type, "router: DatabaseStore такого типа не храним");
             }
         }
         self.observer.on_store(handling);
@@ -1093,11 +1114,11 @@ impl Router {
     ///
     /// | Тип | Что делаем |
     /// |-----|------------|
-    /// | `DatabaseStore` | RI → netDb; `LeaseSet` → наблюдателю (шаг 3c) |
-    /// | `DatabaseLookup` | флудфилл → отвечаем из netDb, иначе TODO: переслать |
+    /// | `DatabaseStore` | RI → netDb, `LeaseSet` → [`crate::lsdb::Lsdb`]; `DeliveryStatus` на `reply_token`; пересылка дальше (флудфилл) |
+    /// | `DatabaseLookup` | флудфилл → отвечаем из netDb/lsdb, иначе молчим |
     /// | `DatabaseSearchReply` | записываем `excluded`, спрашиваем RI у новых |
     /// | `Garlic` | [`RouterContext::handle_garlic`] + ответ (NSR) тому же пиру |
-    /// | `DeliveryStatus` | TODO: подтверждение публикации своего RI |
+    /// | `DeliveryStatus` | TODO: сверка с токеном своей публикации |
     /// | `TunnelData`/`TunnelGateway`/`Data`/`TunnelBuild*` | TODO: шаг 3b |
     ///
     /// # Errors
@@ -1112,7 +1133,9 @@ impl Router {
         let msg_type = message.message_type();
         debug!(transport = %kind, peer = %from.to_base64(), msg_type = msg_type.name(), len = message.payload().len(), "router: принято I2NP");
         match msg_type {
-            I2npMessageType::DatabaseStore => self.handle_database_store(kind, &message)?,
+            I2npMessageType::DatabaseStore => {
+                self.handle_database_store(kind, from, &message).await?;
+            }
             I2npMessageType::DatabaseLookup => {
                 self.handle_database_lookup(kind, from, &message).await?;
             }
@@ -1146,14 +1169,123 @@ impl Router {
         Ok(())
     }
 
-    /// `DatabaseStore`: RI — в netDb, `LeaseSet` — наблюдателю.
-    fn handle_database_store(&mut self, kind: TransportKind, message: &I2npMessage) -> Result<()> {
+    /// `DatabaseStore`: RI → netDb, `LeaseSet` → [`crate::lsdb::Lsdb`],
+    /// плюс `DeliveryStatus` и пересылка дальше.
+    ///
+    /// Порядок — как i2pd `NetDb::HandleDatabaseStoreMsg`:
+    ///
+    /// 1. ответ на `reply_token` уходит **до** проверки содержимого;
+    /// 2. объект сохраняется;
+    /// 3. если мы флудфилл, объект новый/обновлённый и был
+    ///    `reply_token` — пересылаем его (с обнулённым токеном)
+    ///    ближайшим флудфиллам.
+    ///
+    /// # Errors
+    ///
+    /// См. [`RouterContext::handle_database_store`]. Неудачная отправка
+    /// `DeliveryStatus` или пересылка обработку не роняют — только
+    /// `warn!`.
+    async fn handle_database_store(
+        &mut self,
+        kind: TransportKind,
+        from: &IdentHash,
+        message: &I2npMessage,
+    ) -> Result<()> {
+        let store = DatabaseStore::from_buffer(message.payload())?;
+
+        if let Err(error) = self.ack_database_store(kind, from, &store).await {
+            warn!(peer = %from.to_base64(), %error, "router: DeliveryStatus на DatabaseStore не отправлен");
+        }
+
         let handling = self.context.handle_database_store(message.payload())?;
+        let stored = matches!(
+            handling,
+            StoreHandling::Inserted(_)
+                | StoreHandling::Updated(_)
+                | StoreHandling::LeaseSetInserted(_)
+                | StoreHandling::LeaseSetUpdated(_)
+        );
+        if stored
+            && store.reply_token != 0
+            && self.context.config().is_floodfill()
+            && let Err(error) = self.flood_database_store(kind, &store).await
+        {
+            warn!(key = %store.key.to_base32(), %error, "router: пересылка DatabaseStore не удалась");
+        }
         self.report_store(kind, &handling);
         Ok(())
     }
 
-    /// `DatabaseLookup`: отвечаем из netDb, если мы флудфилл.
+    /// Отвечает `DeliveryStatus` на `reply_token` (i2pd
+    /// `NetDb::HandleDatabaseStoreMsg`).
+    ///
+    /// Туннелей у нас нет, поэтому доставка только прямая: либо
+    /// `reply_instruction.tunnel_id == 0` (шлём `gateway`), либо
+    /// ответа нет — `// TODO(step-3b): TunnelGateway на IBGW.`
+    async fn ack_database_store(
+        &self,
+        kind: TransportKind,
+        from: &IdentHash,
+        store: &DatabaseStore,
+    ) -> Result<()> {
+        // `0xFFFFFFFF` — токен «пойман на границе туннеля»: на него
+        // i2pd не отвечает.
+        if store.reply_token == 0 || store.reply_token == u32::MAX {
+            return Ok(());
+        }
+        let target = match store.reply_instruction {
+            None => *from,
+            Some(reply) if reply.tunnel_id == 0 => reply.gateway,
+            Some(reply) => {
+                debug!(
+                    peer = %reply.gateway.to_base64(),
+                    tunnel_id = reply.tunnel_id,
+                    "router: DeliveryStatus через туннель — TODO(step-3b)"
+                );
+                return Ok(());
+            }
+        };
+        let status = I2npMessage::from_body(I2npBody::DeliveryStatus(DeliveryStatus::now(
+            store.reply_token,
+        )))?;
+        debug!(
+            peer = %target.to_base64(),
+            token = store.reply_token,
+            "router: DeliveryStatus на DatabaseStore"
+        );
+        self.send_via(kind, &target, status).await
+    }
+
+    /// Пересылает `DatabaseStore` ближайшим флудфиллам (i2pd
+    /// `NetDb::Flood`): токен обнуляется, payload — как есть.
+    ///
+    /// # Errors
+    ///
+    /// Ошибки сборки [`I2npMessage`]; ошибки отправки отдельным
+    /// адресатам — только `warn!`.
+    async fn flood_database_store(&self, kind: TransportKind, store: &DatabaseStore) -> Result<()> {
+        let targets = self.context.database_store_flood_targets(&store.key);
+        if targets.is_empty() {
+            debug!(key = %store.key.to_base32(), "router: пересылать DatabaseStore некому");
+            return Ok(());
+        }
+        let flood =
+            DatabaseStore::from_parts(store.key, store.store_type, store.payload_raw().to_vec());
+        let message = I2npMessage::from_body(I2npBody::DatabaseStore(flood))?;
+        for target in targets {
+            debug!(
+                peer = %target.to_base64(),
+                key = %store.key.to_base32(),
+                "router: пересылка DatabaseStore"
+            );
+            if let Err(error) = self.send_via(kind, &target, message.clone()).await {
+                warn!(peer = %target.to_base64(), %error, "router: пересылка DatabaseStore не удалась");
+            }
+        }
+        Ok(())
+    }
+
+    /// `DatabaseLookup`: отвечаем из netDb/lsdb, если мы флудфилл.
     async fn handle_database_lookup(
         &self,
         kind: TransportKind,
@@ -1173,7 +1305,10 @@ impl Router {
             lookup_type = ?lookup.lookup_type,
             "router: DatabaseLookup"
         );
-        let reply = self.context.build_lookup_reply(&lookup)?;
+        let Some(reply) = self.context.build_lookup_reply(&lookup)? else {
+            debug!(peer = %from.to_base64(), "router: DatabaseLookup — отвечать не нужно");
+            return Ok(());
+        };
         self.send_via(kind, from, reply).await?;
         Ok(())
     }
