@@ -1220,9 +1220,10 @@ impl Router {
     /// Отвечает `DeliveryStatus` на `reply_token` (i2pd
     /// `NetDb::HandleDatabaseStoreMsg`).
     ///
-    /// Туннелей у нас нет, поэтому доставка только прямая: либо
-    /// `reply_instruction.tunnel_id == 0` (шлём `gateway`), либо
-    /// ответа нет — `// TODO(step-3b): TunnelGateway на IBGW.`
+    /// Шлём gateway'ю ответного туннеля (`reply_instruction`), а если
+    /// `tunnel_id != 0` — оборачиваем в `TunnelGateway`, как i2pd
+    /// (`CreateTunnelGatewayMsg`). Так публикация LS флудфиллу получает
+    /// подтверждение.
     async fn ack_database_store(
         &self,
         kind: TransportKind,
