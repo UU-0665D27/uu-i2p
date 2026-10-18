@@ -13,8 +13,6 @@
 //!
 //! ## Что НЕ реализовано (отдельные шаги)
 //!
-//! - **Пул NTCP2-сессий** (`connect_to`, `send_to`) — шаг 3a-4;
-//! - **Accept-loop** на несколько listeners — шаг 3a-5;
 //! - **Туннели** (`TunnelData`, `TunnelGateway`, `ShortTunnelBuild`) —
 //!   шаг 3b;
 //! - **`LeaseSet`'ы destination'ов** (`DatabaseStore` типа `LeaseSet`) —
@@ -22,6 +20,10 @@
 //! - **Floodfill-логика** — мы отвечаем только на запросы про
 //!   собственный RI; логику `GetClosestFloodfills` для сети не
 //!   реализуем, пока не появится реальная сеть и floodfill-роутеры.
+//!
+//! Пул NTCP2-сессий вместе с accept-loop живёт в
+//! [`crate::ntcp2_pool::Ntcp2Pool`], SSU2 — в
+//! [`crate::ssu2_pool::Ssu2Pool`].
 //!
 //! ## Синхронность
 //!

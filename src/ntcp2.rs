@@ -2396,10 +2396,19 @@ pub struct Ntcp2Local {
     iv: [u8; 16],
     ri_bytes: Vec<u8>,
     net_id: u8,
+    /// Принимать входящие сессии с reserved-адресов (loopback и т.п.).
+    ///
+    /// Аналог i2pd `reservedrange = false`: по умолчанию i2pd отвергает
+    /// такие входящие (`NTCP2Server::HandleAccept` →
+    /// `Transports::IsInReservedRange`).
+    accept_reserved: bool,
 }
 
 impl Ntcp2Local {
     /// Собирает локальные данные из любых источников.
+    ///
+    /// `accept_reserved` по умолчанию `false`; включается
+    /// [`Self::with_accept_reserved`].
     #[must_use]
     pub const fn new(
         static_keys: I2PX25519Keys,
@@ -2414,7 +2423,34 @@ impl Ntcp2Local {
             iv,
             ri_bytes,
             net_id,
+            accept_reserved: false,
         }
+    }
+
+    /// Разрешать ли входящие с reserved-адресов.
+    #[must_use]
+    pub const fn accept_reserved(&self) -> bool {
+        self.accept_reserved
+    }
+
+    /// Включает/выключает приём с reserved-адресов (i2pd `reservedrange`).
+    #[must_use]
+    pub const fn with_accept_reserved(mut self, allow: bool) -> Self {
+        self.accept_reserved = allow;
+        self
+    }
+
+    /// Static X25519-ключ (`s=`) — нужен, чтобы собрать
+    /// [`Ntcp2LocalConfig`] без копии секрета.
+    #[must_use]
+    pub const fn static_keys(&self) -> &I2PX25519Keys {
+        &self.static_keys
+    }
+
+    /// `netId` из конфигурации.
+    #[must_use]
+    pub const fn net_id(&self) -> u8 {
+        self.net_id
     }
 
     /// Берёт ключи, IV и `netId` из конфигурации, RI — снаружи.
@@ -2439,6 +2475,7 @@ impl Ntcp2Local {
             iv: *config.ntcp2_iv(),
             ri_bytes,
             net_id: config.net_id(),
+            accept_reserved: config.allow_reserved_advertise(),
         })
     }
 
@@ -2486,6 +2523,7 @@ impl std::fmt::Debug for Ntcp2Local {
             .field("iv", &self.iv)
             .field("ri_len", &self.ri_bytes.len())
             .field("net_id", &self.net_id)
+            .field("accept_reserved", &self.accept_reserved)
             .finish_non_exhaustive()
     }
 }
@@ -2985,6 +3023,32 @@ impl Ntcp2SessionWrite {
             Ntcp2Block::DateTime { ts: now_secs_u32() },
             Ntcp2Block::I2npMessage(payload),
         ];
+        self.send_blocks(&blocks).await
+    }
+
+    /// Повторяет/обновляет свой `RouterInfo` в data phase.
+    ///
+    /// i2pd `NTCP2Session::SendLocalRouterInfo(update = true)`: плановый
+    /// повтор раз в `NTCP2_ROUTERINFO_RESEND_INTERVAL` или обновление
+    /// адресов/`timestamp`'а. У Alice первый RI ушёл в `SessionConfirmed`,
+    /// у Bob'а — первым data-фреймом, поэтому повтор не дублирует
+    /// «первый раз», а обновляет запись у peer'а.
+    ///
+    /// # Errors
+    ///
+    /// См. [`Self::send_blocks`].
+    pub async fn send_router_info(&mut self, ri_bytes: &[u8]) -> Result<()> {
+        let blocks = [
+            Ntcp2Block::DateTime { ts: now_secs_u32() },
+            Ntcp2Block::RouterInfo {
+                flag: 0,
+                ri_bytes: ri_bytes.to_vec(),
+            },
+        ];
+        debug!(
+            ri_len = ri_bytes.len(),
+            "Ntcp2SessionWrite::send_router_info"
+        );
         self.send_blocks(&blocks).await
     }
 

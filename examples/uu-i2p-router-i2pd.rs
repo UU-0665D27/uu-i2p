@@ -39,13 +39,14 @@
 //! ## `--ntcp2`: исходящая сессия по NTCP2
 //!
 //! Тот же роутер, но соединение идёт по TCP: `Ntcp2Transport` собирается
-//! с [`Ntcp2Local`] из `RouterContext` и звонит i2pd на его NTCP2-порт
-//! (`127.0.0.1:12346`). В RI при этом публикуется NTCP2-адрес: i2pd
-//! сверяет `s` из нашего RI в `SessionConfirmed` со статическим ключом
-//! handshake и рвёт сессию, если адреса нет
-//! (`NTCP2.cpp`, `EstablishSessionAfterSessionConfirmed`: «Address not
-//! found in `SessionConfirmed`»). Listener мы не обслуживаем — входящий
-//! NTCP2 появится вместе с accept-loop (шаг 3a-5).
+//! с [`Ntcp2Local`] из `RouterContext`, звонит i2pd на его NTCP2-порт
+//! (`127.0.0.1:12346`) **и принимает входящие** на своём listener'е
+//! (accept-loop, i2pd `NTCP2Server::HandleAccept`). В RI при этом
+//! публикуется NTCP2-адрес: i2pd сверяет `s` из нашего RI в
+//! `SessionConfirmed` со статическим ключом handshake и рвёт сессию,
+//! если адреса нет (`NTCP2.cpp`,
+//! `EstablishSessionAfterSessionConfirmed`: «Address not found in
+//! `SessionConfirmed`»).
 //!
 //! Признак успеха: `demo: соединение установлено` с
 //! `transport=NTCP2`, в логе i2pd — `SessionConfirmed from 127.0.0.1:<порт>`
@@ -81,8 +82,8 @@
 //!
 //! ## Ограничения
 //!
-//! - входящий NTCP2 не принимаем (нет accept-loop): NTCP2-адрес в RI
-//!   опубликован, но listener только держит порт;
+//! - post-quantum NTCP2 (v3/4/5) не поддерживаем: отвечаем `Unsupported`
+//!   на ML-KEM, как i2pd с `ntcp2.version = 2`;
 //! - туннелей нет (шаг 3b): `TunnelData`/`TunnelGateway` только
 //!   логируются, доставка I2NP — напрямую по сессии;
 //! - loopback в RI и caps `f` — обманка для локального теста: настоящим
@@ -384,10 +385,6 @@ struct LocalRouter {
     addr: SocketAddr,
     /// Наш опубликованный NTCP2-адрес (если `--ntcp2`).
     ntcp2_addr: Option<SocketAddr>,
-    /// Listener'ы, которые просто держат занятыми опубликованные порты.
-    /// NTCP2 accept-loop пока нет (шаг 3a-5), поэтому входящие NTCP2
-    /// соединения никто не обслуживает.
-    listeners: Vec<TcpListener>,
 }
 
 impl LocalRouter {
@@ -419,10 +416,6 @@ impl LocalRouter {
         let ntcp2_listen_addr = ntcp2_listener
             .as_ref()
             .map(|listener| listener.local_addr().expect("ntcp2 local_addr"));
-        let mut listeners = Vec::new();
-        if let Some(listener) = ntcp2_listener {
-            listeners.push(listener);
-        }
 
         let mut builder = RouterConfig::builder()
             .keys(router_keys)
@@ -446,7 +439,13 @@ impl LocalRouter {
         )];
         if ntcp2_listen_addr.is_some() {
             let ntcp2_local = Ntcp2Local::from_config(ctx.config(), own_ri).expect("Ntcp2Local");
-            pools.push(Arc::new(Ntcp2Transport::with_local(ntcp2_local)));
+            let transport = Arc::new(Ntcp2Transport::with_local(ntcp2_local));
+            // Пул сам принимает входящие (i2pd `NTCP2Server::HandleAccept`);
+            // published-адрес в RI и есть адрес listener'а.
+            if let Some(listener) = ntcp2_listener {
+                transport.listen(listener).expect("NTCP2 listen");
+            }
+            pools.push(transport);
         }
 
         let counters = Arc::new(Counters::default());
@@ -464,7 +463,6 @@ impl LocalRouter {
             own,
             addr,
             ntcp2_addr: ntcp2_listen_addr,
-            listeners,
         }
     }
 }
@@ -640,7 +638,7 @@ async fn main() {
     println!("Наш роутер:      {}", local.own.to_base64());
     println!("Наш SSU2:        {}", local.addr);
     if let Some(ntcp2_addr) = local.ntcp2_addr {
-        println!("Наш NTCP2:       {ntcp2_addr} (listener без accept-loop)");
+        println!("Наш NTCP2:       {ntcp2_addr} (принимаем входящие)");
     }
     println!();
 
@@ -652,7 +650,6 @@ async fn main() {
         own,
         addr: local_addr,
         ntcp2_addr: local_ntcp2,
-        listeners,
     } = local;
     let options = RunOptions::from_args(&args);
     let script = run_script(Arc::clone(&counters), options);
@@ -680,7 +677,4 @@ async fn main() {
         Ok(Err(error)) => eprintln!("Цикл роутера завершился с ошибкой: {error}"),
         Err(join) => eprintln!("Задача роутера упала: {join}"),
     }
-
-    // Держим опубликованные порты до конца прогона.
-    drop(listeners);
 }

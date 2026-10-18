@@ -104,7 +104,7 @@ pub use lease_set2::{
 };
 pub use netdb::NetDb;
 pub use ntcp2::Ntcp2Local;
-pub use ntcp2_pool::{Ntcp2Pool, PoolEvent};
+pub use ntcp2_pool::{Ntcp2Pool, Ntcp2Timers, PoolEvent};
 pub use private_keys::I2PPrivateKeys;
 pub use ratchet_tagset::{MAX_TAG_INDEX, RatchetTagSet};
 pub use router::{

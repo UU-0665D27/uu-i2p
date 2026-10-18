@@ -76,11 +76,7 @@ use std::{
     collections::HashMap, future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration,
 };
 
-use tokio::{
-    sync::{RwLock, mpsc},
-    task::JoinHandle,
-    time::MissedTickBehavior,
-};
+use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle, time::MissedTickBehavior};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -307,22 +303,18 @@ impl TransportPool for Ssu2Pool {
 ///
 /// # Почему обёртка, а не `impl TransportPool for Ntcp2Pool`
 ///
-/// `Ntcp2Pool::connect` требует [`Ntcp2LocalConfig`](crate::ntcp2::Ntcp2LocalConfig)
-/// (статические ключи, IV, свой `RouterInfo`) — те же данные, что i2pd
-/// держит в `RouterContext` (`m_NTCP2Keys`, `m_RouterInfo`). Обёртка
-/// хранит их владеющую версию — [`Ntcp2Local`] — и строит конфигурацию на
-/// каждое соединение. Без неё `connect` отвечает
-/// [`I2PError::Unsupported`] (так адаптер и жил до шага 3a-4).
+/// Пул NTCP2 владеет и локальной идентичностью ([`Ntcp2Local`]), и
+/// приёмом ([`Ntcp2Pool::listen`]) — это данные уровня роутера
+/// (`RouterContext` в i2pd: `m_NTCP2Keys` и слушающий сокет). Адаптер
+/// держит только пул и переводит [`PoolEvent`] в [`TransportEvent`],
+/// добавляя то, чего у пула нет.
 ///
-/// Свой `RouterInfo` в [`Ntcp2Local`] надо обновлять после
-/// [`RouterContext::rebuild_own_ri`] — для этого
-/// [`Self::set_router_info`]; i2pd шлёт свежий RI в `SessionConfirmed` и
-/// отвергает слишком старый (`NTCPSession.cpp`,
-/// `EstablishSessionAfterSessionConfirmed`).
+/// Свой `RouterInfo` в пуле надо обновлять после
+/// [`RouterContext::rebuild_own_ri`] — для этого [`Self::set_router_info`];
+/// i2pd шлёт свежий RI в `SessionConfirmed` и повторяет его раз в 25 минут
+/// (`NTCP2Session::SendLocalRouterInfo`).
 pub struct Ntcp2Transport {
     pool: Ntcp2Pool,
-    /// Локальные данные NTCP2 (см. [`Ntcp2Local`]).
-    local: RwLock<Option<Ntcp2Local>>,
 }
 
 impl Ntcp2Transport {
@@ -334,7 +326,6 @@ impl Ntcp2Transport {
     pub fn new() -> Self {
         Self {
             pool: Ntcp2Pool::new(),
-            local: RwLock::new(None),
         }
     }
 
@@ -342,29 +333,36 @@ impl Ntcp2Transport {
     /// разрешены.
     #[must_use]
     pub fn with_local(local: Ntcp2Local) -> Self {
-        Self {
-            pool: Ntcp2Pool::new(),
-            local: RwLock::new(Some(local)),
-        }
+        let transport = Self::new();
+        transport.pool.set_local(Arc::new(local));
+        transport
     }
 
     /// Задаёт (или заменяет) локальный конфиг.
-    pub async fn set_local(&self, local: Ntcp2Local) {
-        *self.local.write().await = Some(local);
+    pub fn set_local(&self, local: Ntcp2Local) {
+        self.pool.set_local(Arc::new(local));
     }
 
-    /// Обновляет свой `RouterInfo` в локальном конфиге.
+    /// Обновляет свой `RouterInfo` в пуле.
     ///
     /// `false` — локального конфига нет (адаптер создан через
     /// [`Self::new`]); обновлять нечего.
-    pub async fn set_router_info(&self, ri_bytes: Vec<u8>) -> bool {
-        let mut local = self.local.write().await;
-        let updated = local.as_mut().is_some_and(|local| {
-            local.set_router_info(ri_bytes);
-            true
-        });
-        drop(local);
-        updated
+    pub fn set_router_info(&self, ri_bytes: Vec<u8>) -> bool {
+        let known = self.pool.local().is_some();
+        if known {
+            self.pool.set_router_info(ri_bytes);
+        }
+        known
+    }
+
+    /// Поднимает приём входящих NTCP2-соединений на `listener`.
+    ///
+    /// # Errors
+    ///
+    /// См. [`Ntcp2Pool::listen`]: нет локального конфига или приём уже
+    /// поднят.
+    pub fn listen(&self, listener: TcpListener) -> Result<()> {
+        self.pool.listen(listener)
     }
 
     /// Доступ к пулу (например, для `connect_to` с явным адресом).
@@ -393,21 +391,10 @@ impl TransportPool for Ntcp2Transport {
         addr: Option<SocketAddr>,
     ) -> BoxFuture<'a, Result<IdentHash>> {
         Box::pin(async move {
-            let guard = self.local.read().await;
-            let Some(local) = guard.as_ref() else {
-                return Err(I2PError::Unsupported(
-                    "router: NTCP2-транспорт без локального конфига (Ntcp2Local)",
-                ));
-            };
-            let config = local.config();
-            let result = match addr {
-                Some(addr) => {
-                    Ntcp2Pool::connect_to(&self.pool, &config, remote_ri_bytes, addr).await
-                }
-                None => Ntcp2Pool::connect(&self.pool, &config, remote_ri_bytes).await,
-            };
-            drop(guard);
-            result
+            match addr {
+                Some(addr) => Ntcp2Pool::connect_to(&self.pool, remote_ri_bytes, addr).await,
+                None => Ntcp2Pool::connect(&self.pool, remote_ri_bytes).await,
+            }
         })
     }
 
