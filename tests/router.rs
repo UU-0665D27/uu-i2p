@@ -25,13 +25,14 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use uu_i2p::{
     Clock, DatabaseLookup, DatabaseSearchReply, DatabaseStore, I2PError, I2PTag, I2PX25519Keys,
-    I2npBody, I2npMessage, I2npMessageType, IdentHash, Result, Router, RouterConfig, RouterContext,
-    RouterObserver, RouterPolicy, StoreHandling, TransportEvent, TransportPool,
+    I2npBody, I2npMessage, I2npMessageType, IdentHash, ReplyInstruction, Result, Router,
+    RouterConfig, RouterContext, RouterObserver, RouterPolicy, StoreHandling, TransportEvent,
+    TransportPool,
     config::Transport,
     private_keys::I2PPrivateKeys,
     router_info::{FullRouterInfo, RouterInfo, RouterInfoCaps},
     router_info_address::I2PAddress,
-    tunnel_messages::TunnelDataBody,
+    tunnel_messages::{TunnelDataBody, TunnelGatewayBody},
 };
 
 /// Начальное время тестов: не ноль, чтобы «время не задано» (`0` в
@@ -454,6 +455,61 @@ async fn database_store_message_fills_netdb() {
     assert_eq!(*observer.stored.lock().unwrap(), vec![ident]);
 }
 
+#[tokio::test]
+async fn database_store_ack_goes_through_reply_tunnel() {
+    // i2pd `HandleDatabaseStoreMsg`: `replyToken != 0` + `reply.tunnelID != 0`
+    // — `DeliveryStatus` шлётся `TunnelGateway` на `reply.gateway`
+    // (`libi2pd/NetDb.cpp`, рядом `CreateTunnelGatewayMsg`). Так i2pd
+    // публикует `LeaseSet` флудфиллу (`Destination.cpp:Publish`).
+    const TOKEN: u32 = 0x0DF0_1234;
+    const TUNNEL_ID: u32 = 0x1729_ABCD;
+
+    let clock = FakeClock::new(NOW_MS);
+    let (mut router, _observer) = new_router(context(false), &clock, TestPolicy::answering());
+    let fake = attach_fake(&mut router, Transport::Ssu2);
+    let (from, ri_bytes) = foreign_ri(false);
+    let (gateway, _) = foreign_ri(false);
+
+    let store = DatabaseStore::new_router_info(
+        from,
+        &ri_bytes,
+        TOKEN,
+        Some(ReplyInstruction {
+            tunnel_id: TUNNEL_ID,
+            gateway,
+        }),
+    )
+    .expect("store");
+    router
+        .handle_message(
+            Transport::Ssu2,
+            &from,
+            I2npMessage::from_body(I2npBody::DatabaseStore(store)).expect("message"),
+        )
+        .await
+        .expect("store");
+
+    let sent = fake.sent();
+    assert_eq!(sent.len(), 1, "один DeliveryStatus");
+    assert_eq!(sent[0].0, gateway, "ответ идёт gateway'ю ответного туннеля");
+    assert_eq!(sent[0].1.message_type(), I2npMessageType::TunnelGateway);
+
+    let gateway_body = TunnelGatewayBody::from_buffer(sent[0].1.payload()).expect("TunnelGateway");
+    assert_eq!(gateway_body.tunnel_id, TUNNEL_ID);
+    let inner = I2npMessage::from_buffer(&gateway_body.data).expect("вложенный I2NP");
+    assert_eq!(inner.message_type(), I2npMessageType::DeliveryStatus);
+    // Токен лежит в теле `DeliveryStatus`, а не в `msg_id` заголовка
+    // (i2pd `CreateDeliveryStatusMsg` тоже ставит его в тело).
+    let I2npBody::DeliveryStatus(status) = inner.parse_body().expect("тело DeliveryStatus")
+    else {
+        panic!("ожидался DeliveryStatus");
+    };
+    assert_eq!(
+        status.msg_id, TOKEN,
+        "тело `DeliveryStatus` = `reply_token`"
+    );
+}
+
 // --- DatabaseLookup --------------------------------------------------------
 
 #[tokio::test]
@@ -515,6 +571,46 @@ async fn database_lookup_is_answered_by_floodfill() {
     let sent = fake.sent();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].1.message_type(), I2npMessageType::DatabaseStore);
+}
+
+#[tokio::test]
+async fn database_lookup_answer_goes_through_reply_tunnel() {
+    // i2pd `HandleDatabaseLookupMsg`: `replyTunnelID != 0` — ответ
+    // оборачивается в `TunnelGateway`; адресат — `from` **из payload'а**
+    // (роутер, который просил), а не тот, кто физически доставил запрос.
+    const REPLY_TUNNEL_ID: u32 = 0x00AA_BBCC;
+
+    let clock = FakeClock::new(NOW_MS);
+    let mut ctx = context(false);
+    let target = add_foreign_ri(&mut ctx, false);
+    let (mut router, _observer) = new_router(ctx, &clock, TestPolicy::answering());
+    let fake = attach_fake(&mut router, Transport::Ssu2);
+    let (asker, _) = foreign_ri(false);
+    let (carrier, _) = foreign_ri(false);
+
+    let lookup = DatabaseLookup::new_router_info(target, asker, Some(REPLY_TUNNEL_ID), Vec::new());
+    router
+        .handle_message(
+            Transport::Ssu2,
+            &carrier,
+            I2npMessage::from_body(I2npBody::DatabaseLookup(lookup)).expect("message"),
+        )
+        .await
+        .expect("lookup");
+
+    let sent = fake.sent();
+    assert_eq!(sent.len(), 1, "ожидался один ответ");
+    assert_eq!(
+        sent[0].0, asker,
+        "адресат — `from` из payload'а, а не физический отправитель"
+    );
+    assert_eq!(sent[0].1.message_type(), I2npMessageType::TunnelGateway);
+    let gateway_body = TunnelGatewayBody::from_buffer(sent[0].1.payload()).expect("TunnelGateway");
+    assert_eq!(gateway_body.tunnel_id, REPLY_TUNNEL_ID);
+    let inner = I2npMessage::from_buffer(&gateway_body.data).expect("вложенный I2NP");
+    assert_eq!(inner.message_type(), I2npMessageType::DatabaseStore);
+    let store = DatabaseStore::from_buffer(inner.payload()).expect("DatabaseStore");
+    assert_eq!(store.key, target, "отдаём именно запрошенный RI");
 }
 
 // --- DatabaseSearchReply ---------------------------------------------------

@@ -93,6 +93,7 @@ use crate::{
     router_info::FullRouterInfo,
     router_info_address::I2PAddress,
     ssu2_pool::{Ssu2Event, Ssu2Pool},
+    tunnel_messages::TunnelGatewayBody,
 };
 
 // --- константы (значения — из i2pd) --------------------------------------
@@ -1233,27 +1234,44 @@ impl Router {
         if store.reply_token == 0 || store.reply_token == u32::MAX {
             return Ok(());
         }
-        let target = match store.reply_instruction {
-            None => *from,
-            Some(reply) if reply.tunnel_id == 0 => reply.gateway,
-            Some(reply) => {
-                debug!(
-                    peer = %reply.gateway.to_base64(),
-                    tunnel_id = reply.tunnel_id,
-                    "router: DeliveryStatus через туннель — TODO(step-3b)"
-                );
-                return Ok(());
-            }
-        };
+        // i2pd `HandleDatabaseStoreMsg`: `replyInstruction` есть всегда,
+        // когда есть токен; `tunnelID == 0` — ответ прямо gateway'ю.
+        let (target, tunnel_id) = store
+            .reply_instruction
+            .map_or((*from, 0), |reply| (reply.gateway, reply.tunnel_id));
         let status = I2npMessage::from_body(I2npBody::DeliveryStatus(DeliveryStatus::now(
             store.reply_token,
         )))?;
+        let message = Self::wrap_tunnel_reply(tunnel_id, status)?;
         debug!(
             peer = %target.to_base64(),
             token = store.reply_token,
+            tunnel_id,
             "router: DeliveryStatus на DatabaseStore"
         );
-        self.send_via(kind, &target, status).await
+        self.send_via(kind, &target, message).await
+    }
+
+    /// Оборачивает сообщение в `TunnelGateway`, если ответ просят
+    /// прислать через туннель (i2pd `CreateTunnelGatewayMsg`).
+    ///
+    /// `tunnel_id == 0` — туннеля нет, отдаём сообщение как есть.
+    /// Gateway'ю шлём **напрямую**: сессия с ним у нас есть, и i2pd в
+    /// этом случае тоже выбирает прямой путь
+    /// (`transports.SendMessage (reply.gateway, msg)`).
+    ///
+    /// # Errors
+    ///
+    /// Ошибки сериализации вложенного сообщения и сборки
+    /// [`I2npMessage`].
+    fn wrap_tunnel_reply(tunnel_id: u32, message: I2npMessage) -> Result<I2npMessage> {
+        if tunnel_id == 0 {
+            return Ok(message);
+        }
+        I2npMessage::from_body(I2npBody::TunnelGateway(TunnelGatewayBody {
+            tunnel_id,
+            data: message.to_buffer()?,
+        }))
     }
 
     /// Пересылает `DatabaseStore` ближайшим флудфиллам (i2pd
@@ -1309,7 +1327,23 @@ impl Router {
             debug!(peer = %from.to_base64(), "router: DatabaseLookup — отвечать не нужно");
             return Ok(());
         };
-        self.send_via(kind, from, reply).await?;
+        // i2pd `HandleDatabaseLookupMsg`: адресат — `from` из payload'а
+        // (роутер, который просил), а не тот, кто физически доставил
+        // сообщение; `reply_tunnel_id` — туннель gateway'я для ответа.
+        let target = if lookup.from.is_zero() {
+            *from
+        } else {
+            lookup.from
+        };
+        let tunnel_id = lookup.reply_tunnel_id.unwrap_or(0);
+        let message = Self::wrap_tunnel_reply(tunnel_id, reply)?;
+        debug!(
+            peer = %target.to_base64(),
+            key = %lookup.key.to_base32(),
+            tunnel_id,
+            "router: ответ на DatabaseLookup"
+        );
+        self.send_via(kind, &target, message).await?;
         Ok(())
     }
 

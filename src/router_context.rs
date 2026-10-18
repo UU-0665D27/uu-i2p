@@ -881,6 +881,11 @@ impl RouterContext {
 
         // RI-ветка (`RouterInfo` и `Normal`) — как i2pd: отвечаем
         // и не-флудфилл.
+        //
+        // TODO(floodfill): не отдавать RI, помеченные недостижимыми
+        // (i2pd рядом проверяет `!router->IsUnreachable ()`). У `NetDb`
+        // пока нет учёта достижимости (`NetDb.cpp:1018`,
+        // `IsUnreachable` ставится по профилю пира).
         if matches!(
             lookup.lookup_type,
             LookupType::RouterInfo | LookupType::Normal
