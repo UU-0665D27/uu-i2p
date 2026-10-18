@@ -24,11 +24,13 @@ use std::{
 
 use tokio::sync::{mpsc, oneshot};
 use uu_i2p::{
-    Clock, DatabaseLookup, DatabaseSearchReply, DatabaseStore, I2PError, I2PTag, I2PX25519Keys,
-    I2npBody, I2npMessage, I2npMessageType, IdentHash, ReplyInstruction, Result, Router,
+    AeadChaCha20Poly1305, Clock, DatabaseLookup, DatabaseSearchReply, DatabaseStore, EciesDelivery,
+    EncryptedReply, GarlicBlock, GarlicBody, I2PError, I2PTag, I2PX25519Keys, I2npBody,
+    I2npMessage, I2npMessageType, IdentHash, LookupType, ReplyInstruction, Result, Router,
     RouterConfig, RouterContext, RouterObserver, RouterPolicy, StoreHandling, TransportEvent,
     TransportPool,
     config::Transport,
+    parse_blocks,
     private_keys::I2PPrivateKeys,
     router_info::{FullRouterInfo, RouterInfo, RouterInfoCaps},
     router_info_address::I2PAddress,
@@ -611,6 +613,119 @@ async fn database_lookup_answer_goes_through_reply_tunnel() {
     assert_eq!(inner.message_type(), I2npMessageType::DatabaseStore);
     let store = DatabaseStore::from_buffer(inner.payload()).expect("DatabaseStore");
     assert_eq!(store.key, target, "отдаём именно запрошенный RI");
+}
+
+/// Зашифрованный ответ на `DatabaseLookup`: запрашивающий прикладывает
+/// `reply key` и тег — i2pd (`NetDb.cpp:1077`) заворачивает ответ в
+/// `WrapECIESX25519Message` и только потом в `TunnelGateway`.
+#[tokio::test]
+async fn encrypted_database_lookup_reply_is_wrapped_in_garlic() {
+    const REPLY_TUNNEL_ID: u32 = 0x00CC_DDEE;
+    const SESSION_KEY: [u8; 32] = [0x5A; 32];
+    const TAG: u64 = 0x1122_3344_5566_7788;
+
+    let clock = FakeClock::new(NOW_MS);
+    let mut ctx = context(false);
+    let target = add_foreign_ri(&mut ctx, false);
+    let (mut router, _observer) = new_router(ctx, &clock, TestPolicy::answering());
+    let fake = attach_fake(&mut router, Transport::Ssu2);
+    let (asker, _) = foreign_ri(false);
+
+    let lookup = DatabaseLookup {
+        key: target,
+        from: asker,
+        lookup_type: LookupType::RouterInfo,
+        reply_tunnel_id: Some(REPLY_TUNNEL_ID),
+        excluded: Vec::new(),
+        encrypted_reply: Some(EncryptedReply {
+            session_key: SESSION_KEY,
+            tags: vec![TAG.to_le_bytes().to_vec()],
+        }),
+    };
+    router
+        .handle_message(
+            Transport::Ssu2,
+            &asker,
+            I2npMessage::from_body(I2npBody::DatabaseLookup(lookup)).expect("message"),
+        )
+        .await
+        .expect("lookup");
+
+    let sent = fake.sent();
+    assert_eq!(sent.len(), 1, "ожидался один зашифрованный ответ");
+    assert_eq!(sent[0].0, asker);
+    assert_eq!(sent[0].1.message_type(), I2npMessageType::TunnelGateway);
+    let gateway = TunnelGatewayBody::from_buffer(sent[0].1.payload()).expect("TunnelGateway");
+    assert_eq!(gateway.tunnel_id, REPLY_TUNNEL_ID);
+    let inner = I2npMessage::from_buffer(&gateway.data).expect("вложенный I2NP");
+    assert_eq!(inner.message_type(), I2npMessageType::Garlic);
+    let body = GarlicBody::from_buffer(inner.payload()).expect("Garlic");
+
+    // Расшифровываем так же, как это сделал бы запрашивающий:
+    // `tag(8) || AEAD(key, nonce = 0, AD = tag)`.
+    let (wire_tag, ciphertext) = body.payload.split_at(8);
+    assert_eq!(wire_tag, TAG.to_le_bytes(), "тег идёт в host-порядке");
+    let mut plaintext = vec![0u8; ciphertext.len()];
+    let len = AeadChaCha20Poly1305::new()
+        .decrypt(
+            &SESSION_KEY,
+            &[0u8; 12],
+            wire_tag,
+            ciphertext,
+            &mut plaintext,
+        )
+        .expect("decrypt");
+    plaintext.truncate(len);
+
+    let blocks = parse_blocks(&plaintext).expect("garlic blocks");
+    let clove = blocks
+        .iter()
+        .find_map(|block| match block {
+            GarlicBlock::EciesGarlicClove(clove) => Some(clove),
+            _ => None,
+        })
+        .expect("clove");
+    assert_eq!(clove.delivery, EciesDelivery::Local);
+    assert_eq!(clove.message_type, I2npMessageType::DatabaseStore);
+    let store = DatabaseStore::from_buffer(&clove.payload).expect("DatabaseStore");
+    assert_eq!(store.key, target, "внутри — ответ на запрошенный ключ");
+}
+
+/// Без тега шифрованный ответ собрать нечем: i2pd в таком случае пишет
+/// warning и не отвечает; открытым текстом отвечать нельзя.
+#[tokio::test]
+async fn encrypted_database_lookup_without_tags_is_not_answered() {
+    let clock = FakeClock::new(NOW_MS);
+    let mut ctx = context(false);
+    let target = add_foreign_ri(&mut ctx, false);
+    let (mut router, _observer) = new_router(ctx, &clock, TestPolicy::answering());
+    let fake = attach_fake(&mut router, Transport::Ssu2);
+    let (asker, _) = foreign_ri(false);
+
+    let lookup = DatabaseLookup {
+        key: target,
+        from: asker,
+        lookup_type: LookupType::RouterInfo,
+        reply_tunnel_id: Some(0x00CC_DDEE),
+        excluded: Vec::new(),
+        encrypted_reply: Some(EncryptedReply {
+            session_key: [0x11; 32],
+            tags: Vec::new(),
+        }),
+    };
+    router
+        .handle_message(
+            Transport::Ssu2,
+            &asker,
+            I2npMessage::from_body(I2npBody::DatabaseLookup(lookup)).expect("message"),
+        )
+        .await
+        .expect("lookup");
+
+    assert!(
+        fake.sent().is_empty(),
+        "без тега ответа быть не должно — запрашивающий ждёт шифр"
+    );
 }
 
 // --- DatabaseSearchReply ---------------------------------------------------

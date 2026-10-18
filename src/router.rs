@@ -82,9 +82,13 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     IdentHash,
     config::Transport as TransportKind,
+    database_lookup::DatabaseLookup,
     database_store::DatabaseStore,
     delivery_status::DeliveryStatus,
+    ecies_ratchet::wrap_symmetric_message,
     error::{I2PError, Result},
+    garlic_block::{EciesDelivery, EciesGarlicClove},
+    garlic_body::GarlicBody,
     i2np::I2npMessageType,
     i2np_message::{I2npBody, I2npMessage},
     ntcp2::Ntcp2Local,
@@ -1351,6 +1355,16 @@ impl Router {
             lookup.from
         };
         let tunnel_id = lookup.reply_tunnel_id.unwrap_or(0);
+        // Зашифрованный ответ — если запрашивающий прислал ключ с тегом
+        // (i2pd: только для ответов, идущих в туннель).
+        let Some(reply) = Self::wrap_encrypted_lookup_reply(&lookup, tunnel_id, reply)? else {
+            debug!(
+                peer = %target.to_base64(),
+                key = %lookup.key.to_base32(),
+                "router: зашифрованный ответ на DatabaseLookup собрать нельзя — молчим"
+            );
+            return Ok(());
+        };
         let message = Self::wrap_tunnel_reply(tunnel_id, reply)?;
         debug!(
             peer = %target.to_base64(),
@@ -1360,6 +1374,56 @@ impl Router {
         );
         self.send_via(kind, &target, message).await?;
         Ok(())
+    }
+
+    /// Заворачивает ответ на `DatabaseLookup` в ECIES-garlic по
+    /// одноразовому `reply key`/тегу из запроса.
+    ///
+    /// Зеркало `NetDb::HandleDatabaseLookupMsg`
+    /// (`libi2pd/NetDb.cpp:1077-1092`): i2pd шифрует ответ **только**
+    /// когда он идёт в туннель (`replyTunnelID != 0`) и только если
+    /// запрашивающий прислал ключ и хотя бы один тег; сам ответ —
+    /// `garlic::WrapECIESX25519Message` (у нас
+    /// [`wrap_symmetric_message`]).
+    ///
+    /// `Ok(None)` — шифрованный ответ собрать нечем (тегов нет либо
+    /// тег 32-байтовый, то есть `ElGamal/AES`, которого у нас нет):
+    /// отвечать открытым текстом нельзя — запрашивающий ждёт шифр.
+    fn wrap_encrypted_lookup_reply(
+        lookup: &DatabaseLookup,
+        tunnel_id: u32,
+        reply: I2npMessage,
+    ) -> Result<Option<I2npMessage>> {
+        let Some(encrypted) = &lookup.encrypted_reply else {
+            return Ok(Some(reply));
+        };
+        if tunnel_id == 0 {
+            // «encryption might be used though tunnel only» — без туннеля
+            // i2pd шифрование игнорирует.
+            return Ok(Some(reply));
+        }
+        let Some(tag) = encrypted.tags.first() else {
+            warn!("wrap_encrypted_lookup_reply: просили шифрованный ответ без тега");
+            return Ok(None);
+        };
+        let Ok(tag) = <[u8; 8]>::try_from(tag.as_slice()) else {
+            warn!(
+                tag_len = tag.len(),
+                "wrap_encrypted_lookup_reply: ElGamal/AES-тег не поддерживается, ответ не шлём"
+            );
+            return Ok(None);
+        };
+        let clove = EciesGarlicClove {
+            delivery: EciesDelivery::Local,
+            message_type: reply.message_type(),
+            message_id: reply.msg_id(),
+            expiration_secs: u32::try_from(reply.expiration_ms() / 1000).unwrap_or(u32::MAX),
+            payload: reply.payload().to_vec(),
+        };
+        let wire =
+            wrap_symmetric_message(&encrypted.session_key, u64::from_le_bytes(tag), &[clove])?;
+        let payload = GarlicBody::new(wire).to_buffer()?;
+        Ok(Some(I2npMessage::new(I2npMessageType::Garlic, payload)))
     }
 
     /// `DatabaseSearchReply`: исключаем названных и спрашиваем новых.
