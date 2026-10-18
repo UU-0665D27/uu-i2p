@@ -93,6 +93,7 @@ use crate::{
     router_info::FullRouterInfo,
     router_info_address::I2PAddress,
     ssu2_pool::{Ssu2Event, Ssu2Pool},
+    transport_ban::BanList,
     tunnel_messages::TunnelGatewayBody,
 };
 
@@ -337,6 +338,19 @@ impl Ntcp2Transport {
     pub fn with_local(local: Ntcp2Local) -> Self {
         let transport = Self::new();
         transport.pool.set_local(Arc::new(local));
+        transport
+    }
+
+    /// То же, что [`Self::with_local`], но с общим списком банов: i2pd
+    /// держит один `m_BanList` на все транспорты
+    /// (`libi2pd/Transports.h`), так что адрес, забаненный в SSU2, не
+    /// принимается и по NTCP2.
+    #[must_use]
+    pub fn with_local_and_ban(local: Ntcp2Local, ban: Arc<BanList>) -> Self {
+        let transport = Self {
+            pool: Ntcp2Pool::with_ban(ban),
+        };
+        transport.set_local(local);
         transport
     }
 

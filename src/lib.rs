@@ -61,6 +61,7 @@ pub mod ssu2_timers;
 pub mod ssu2_token;
 pub mod tag;
 pub mod timestamp;
+pub mod transport_ban;
 pub mod tunnel_build_crypto;
 pub mod tunnel_build_message;
 pub mod tunnel_build_record;
@@ -125,6 +126,7 @@ pub use short_tunnel_build::{SHORT_TUNNEL_BUILD_HEADER_SIZE, ShortTunnelBuildBod
 pub use signature::{CryptoKeyType, SigningKeyType};
 pub use ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool};
 pub use tag::{I2PAesKey, I2PTag, IdentHash, SessionTag};
+pub use transport_ban::{BanList, IP_BAN_TIME_MS, IP_BAN_TIME_VARIANCE_MS};
 pub use tunnel_build_crypto::{GarlicReplyKeys, HopCrypto, RecordKeys};
 pub use tunnel_build_message::{
     BuildReplyResult, STANDARD_NUM_RECORDS, ShortBuildRequest, build_short_tunnel_request,

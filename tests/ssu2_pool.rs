@@ -16,7 +16,7 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use uu_i2p::{
-    I2PTag, IdentHash,
+    BanList, I2PTag, IdentHash,
     config::{DEFAULT_NET_ID, DEFAULT_VERSION},
     crypto::I2PX25519Keys,
     i2np::{I2npHeader, I2npMessageType},
@@ -24,7 +24,10 @@ use uu_i2p::{
     private_keys::I2PPrivateKeys,
     router_info::{FullRouterInfo, RouterInfo, RouterInfoBuilder, RouterInfoCaps},
     router_info_address::I2PAddress,
-    ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool, check_session_confirmed_router_info},
+    ssu2_pool::{
+        Ssu2Event, Ssu2Local, Ssu2Pool, check_session_confirmed_router_info,
+        published_static_key_mismatch,
+    },
 };
 
 fn init_tracing() {
@@ -56,6 +59,11 @@ async fn make_node() -> Node {
     make_node_advertising(None).await
 }
 
+/// Поднимает узел с общим списком банов (i2pd `Transports::m_BanList`).
+async fn make_node_with_ban(ban: Arc<BanList>) -> Node {
+    make_node_full(None, Some(ban)).await
+}
+
 /// Поднимает узел: сокет на эфемерном порту 127.0.0.1 и **опубликованный**
 /// SSU2-адрес (иначе инициатор не найдёт, куда подключаться).
 ///
@@ -66,6 +74,10 @@ async fn make_node() -> Node {
 /// loopback-адрес (в реальном роутере это бессмысленно), а тесту нужен именно
 /// локальный адрес с настоящим портом сокета.
 async fn make_node_advertising(advertised_port: Option<u16>) -> Node {
+    make_node_full(advertised_port, None).await
+}
+
+async fn make_node_full(advertised_port: Option<u16>, ban: Option<Arc<BanList>>) -> Node {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
     let addr = socket.local_addr().expect("local_addr");
     let port = advertised_port.unwrap_or_else(|| addr.port());
@@ -97,7 +109,10 @@ async fn make_node_advertising(advertised_port: Option<u16>) -> Node {
         ident = %ri.ident_hash().to_base64(),
         "node ready"
     );
-    let pool = Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool");
+    let pool = match ban {
+        Some(ban) => Ssu2Pool::with_socket_and_ban(socket, local, ban).expect("Ssu2Pool"),
+        None => Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool"),
+    };
     Node {
         pool,
         ri: ri_bytes,
@@ -440,6 +455,54 @@ async fn connect_to_explicit_address() {
     );
 }
 
+/// Забаненный адрес не пускается в новую сессию: i2pd проверяет
+/// `Transports::IsBanned` до создания сессии (`SSU2.cpp:767`).
+#[tokio::test]
+async fn banned_address_gets_no_incoming_session() {
+    init_tracing();
+    let ban = Arc::new(BanList::new());
+    let bob = make_node_with_ban(Arc::clone(&ban)).await;
+    ban.ban(IpAddr::V4(Ipv4Addr::LOCALHOST), now_ms());
+    assert!(ban.is_banned(IpAddr::V4(Ipv4Addr::LOCALHOST), now_ms()));
+
+    let alice = make_node().await;
+    alice
+        .pool
+        .connect_to(&bob.ri, bob.addr)
+        .await
+        .expect("connect_to");
+    // Даём рукопожатию время, которого хватило бы при живом ответчике.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        bob.pool.session_idents().await.expect("idents").is_empty(),
+        "сессия с забаненного адреса не должна создаваться"
+    );
+
+    // Бан снят — тот же путь работает: значит, дело было именно в бане.
+    ban.clear();
+    let carol = make_node().await;
+    carol
+        .pool
+        .connect_to(&bob.ri, bob.addr)
+        .await
+        .expect("connect_to");
+    let mut events: Vec<Ssu2Event> = Vec::new();
+    let established = wait_event(&carol.pool, &mut events, "carol Established", |e| {
+        matches!(e, Ssu2Event::Established { .. })
+    })
+    .await;
+    assert_eq!(
+        established,
+        Ssu2Event::Established {
+            ident: *bob.pool.ident()
+        }
+    );
+    assert_eq!(
+        bob.pool.session_idents().await.expect("idents"),
+        vec![*carol.pool.ident()]
+    );
+}
+
 /// `RouterInfo` собеседника из `SessionConfirmed` — проверки ответчика
 /// (i2pd `SSU2Session::ProcessSessionConfirmed`, `SSU2Session.cpp:1353-1420`).
 ///
@@ -515,6 +578,21 @@ fn session_confirmed_router_info_checks() {
     assert!(
         check_session_confirmed_router_info(&bytes, remote, Some(wrong)).is_err(),
         "чужой статический ключ должен отвергаться"
+    );
+    // Этот же случай i2pd считает подменой и банит адрес источника.
+    assert!(
+        published_static_key_mismatch(&bytes, remote, Some(wrong)),
+        "чужой `s` при опубликованном адресе — повод для бана"
+    );
+    assert!(
+        !published_static_key_mismatch(&bytes, remote, Some(static_key)),
+        "свой `s` — не повод для бана"
+    );
+    // Пакет из другого семейства: SSU2-адреса в RI нет — банить не за что.
+    let v6: SocketAddr = "[::1]:12345".parse().expect("addr");
+    assert!(
+        !published_static_key_mismatch(&bytes, v6, Some(wrong)),
+        "без адреса семейства пакета бан не ставится"
     );
 }
 

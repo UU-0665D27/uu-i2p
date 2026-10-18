@@ -37,8 +37,18 @@
 //!   здесь — только то, без чего не работает data phase (наличие
 //!   SSU2-адреса нужного семейства, совпадение `s=` со статическим ключом из
 //!   `SessionConfirmed`, совпадение опубликованного `host` с источником).
-//! - **Ограничения на новые сессии** (`m_ReceivedPacketsQueue`,
-//!   `IsInReservedRange`, бан-лист).
+//! - **Размер очереди приёма** (`m_ReceivedPacketsQueue` /
+//!   `SSU2_STOP_ACCEPTING_NEW_SESSIONS_QUEUE_SIZE`): поток приёма у нас
+//!   один и не буферизует «на потом», ограничивать нечего.
+//! - **Фильтр reserved-адресов на приёме** (`transports.IsInReservedRange`,
+//!   `SSU2.cpp:766`) — опция `reservedrange`; см. замечание у
+//!   [`PoolState::maybe_send_path_challenge`].
+//!
+//! Бан-лист адресов — [`crate::transport_ban::BanList`]: проверяется до
+//! создания сессии (`SSU2.cpp:767`), а адрес попадает в него, когда
+//! собеседник подсунул чужой `s` при опубликованном адресе
+//! (`SSU2Session.cpp:1428`). Список задаётся
+//! [`Ssu2Pool::with_socket_and_ban`] — им же пользуется NTCP2.
 //! - **Полный обмен `Closing`/`ClosingConfirmed`**: [`Ssu2Pool::close`] шлёт
 //!   `Termination` и сразу сообщает наружу `Disconnected` (сессия исчезает из
 //!   карт и из `session_idents`), но сам `conn_id` ещё
@@ -52,6 +62,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
@@ -87,6 +98,7 @@ use crate::ssu2_policy::{
 };
 use crate::ssu2_send::{RandomSource, append_address};
 use crate::ssu2_token::{Token, TokenSource, TokenStore};
+use crate::transport_ban::BanList;
 
 /// Период тика обслуживания (i2pd `ScheduleResend`, `SSU2.cpp:1228`).
 const SSU2_POOL_TICK: Duration = Duration::from_millis(40);
@@ -388,17 +400,36 @@ impl Ssu2Pool {
     /// Нужен, когда адрес сокета должен быть известен до сборки своего
     /// `RouterInfo` (публикуемый SSU2-адрес с реальным портом).
     ///
+    /// Список банов — свой; чтобы делить его с NTCP2, см.
+    /// [`Self::with_socket_and_ban`].
+    ///
     /// # Errors
     ///
     /// [`I2PError::Io`] при ошибке `local_addr`.
     pub fn with_socket(socket: UdpSocket, local: Ssu2Local) -> Result<Self> {
+        Self::with_socket_and_ban(socket, local, Arc::new(BanList::new()))
+    }
+
+    /// То же, но со своим (общим с NTCP2) списком банов.
+    ///
+    /// i2pd держит один `m_BanList` на все транспорты
+    /// (`libi2pd/Transports.h`).
+    ///
+    /// # Errors
+    ///
+    /// [`I2PError::Io`] при ошибке `local_addr`.
+    pub fn with_socket_and_ban(
+        socket: UdpSocket,
+        local: Ssu2Local,
+        ban: Arc<BanList>,
+    ) -> Result<Self> {
         let local_addr = socket
             .local_addr()
             .map_err(|e| I2PError::Io(format!("ssu2 pool: local_addr: {e}")))?;
         let ident = *local.ident();
         let (cmds, cmds_rx) = mpsc::channel(COMMAND_QUEUE);
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
-        let task = tokio::spawn(run(socket, local, cmds_rx, events_tx));
+        let task = tokio::spawn(run(socket, local, cmds_rx, events_tx, ban));
         debug!(%local_addr, "Ssu2Pool::with_socket: pool started");
         Ok(Self {
             cmds,
@@ -618,13 +649,15 @@ struct PoolState {
     by_endpoint: HashMap<SocketAddr, ConnectionId>,
     /// Соединения по `IdentHash` (`m_SessionsByRouterHash`).
     by_ident: HashMap<IdentHash, ConnectionId>,
+    /// Забаненные адреса (i2pd `Transports::m_BanList`).
+    ban: Arc<BanList>,
     /// Канал событий наружу.
     events: mpsc::Sender<Ssu2Event>,
 }
 
 impl PoolState {
     /// Новое состояние.
-    fn new(local: Ssu2Local, events: mpsc::Sender<Ssu2Event>) -> Self {
+    fn new(local: Ssu2Local, events: mpsc::Sender<Ssu2Event>, ban: Arc<BanList>) -> Self {
         Self {
             local,
             policy: I2pdPolicy,
@@ -633,6 +666,7 @@ impl PoolState {
             sessions: HashMap::new(),
             by_endpoint: HashMap::new(),
             by_ident: HashMap::new(),
+            ban,
             events,
         }
     }
@@ -663,9 +697,17 @@ impl PoolState {
         } else {
             self.by_endpoint.get(&from).copied()
         };
-        match key {
-            Some(key) => self.deliver(key, &mut buf[..len], from, out),
-            None => self.start_incoming(&mut buf[..len], from, out),
+        if let Some(key) = key {
+            self.deliver(key, &mut buf[..len], from, out);
+        } else {
+            // i2pd (`SSU2.cpp:767`) до создания сессии проверяет
+            // banned-адрес: остальные датаграммы от него молча
+            // отбрасываются.
+            if self.ban.is_banned(from.ip(), unix_now().0) {
+                warn!(%from, "on_datagram: пакет от забаненного адреса; игнорируем");
+                return;
+            }
+            self.start_incoming(&mut buf[..len], from, out);
         }
     }
 
@@ -1488,7 +1530,22 @@ impl PoolState {
             return Err(I2PError::Malformed("ssu2 pool: session vanished"));
         };
         let (ident, intro_key, published) =
-            check_session_confirmed_router_info(ri_bytes, remote, static_key)?;
+            match check_session_confirmed_router_info(ri_bytes, remote, static_key) {
+                Ok(info) => info,
+                Err(error) => {
+                    // i2pd `SSU2Session.cpp:1428`: если у собеседника
+                    // *опубликованный* адрес, а `s` в его RI не совпал с
+                    // ключом рукопожатия — это подмена, баним адрес.
+                    if published_static_key_mismatch(ri_bytes, remote, static_key) {
+                        warn!(
+                            ip = %remote.ip(),
+                            "accept_remote_router_info: `s` не совпал с рукопожатием — баню адрес"
+                        );
+                        self.ban.ban(remote.ip(), unix_now().0);
+                    }
+                    return Err(error);
+                }
+            };
         let Some(session) = self.sessions.get_mut(&key) else {
             return Err(I2PError::Malformed("ssu2 pool: session vanished"));
         };
@@ -1923,6 +1980,31 @@ impl PoolState {
 
 // --- задача и вспомогательное -------------------------------------------
 
+/// Признак «у собеседника опубликованный SSU2-адрес, а `s` в его RI не
+/// совпал с ключом рукопожатия» — за это i2pd банит адрес источника
+/// (`SSU2Session.cpp:1428`).
+///
+/// Разбирает RI повторно: нужен только на пути ошибки
+/// [`check_session_confirmed_router_info`], поэтому публичен для тестов, а
+/// не как рабочий API пула.
+#[must_use]
+pub fn published_static_key_mismatch(
+    ri_bytes: &[u8],
+    remote: SocketAddr,
+    static_key: Option<[u8; 32]>,
+) -> bool {
+    let Some(expected) = static_key else {
+        return false;
+    };
+    let Ok(ri) = FullRouterInfo::from_buffer(ri_bytes) else {
+        return false;
+    };
+    let Some(addr) = ri.body().ssu2_address(remote.is_ipv6()) else {
+        return false;
+    };
+    addr.published && *addr.s.as_bytes() != expected
+}
+
 /// Проверяет `RouterInfo`, полученный в `SessionConfirmed` (ответчик).
 ///
 /// Зеркалит `SSU2Session::ProcessSessionConfirmed`
@@ -1994,8 +2076,9 @@ async fn run(
     local: Ssu2Local,
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<Ssu2Event>,
+    ban: Arc<BanList>,
 ) {
-    let mut state = PoolState::new(local, events);
+    let mut state = PoolState::new(local, events, ban);
     let mut buf = vec![0u8; 65536];
     let mut out: OutQueue = Vec::new();
     let mut tick = tokio::time::interval(SSU2_POOL_TICK);

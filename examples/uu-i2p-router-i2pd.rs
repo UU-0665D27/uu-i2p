@@ -104,9 +104,9 @@ use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use uu_i2p::{
-    DatabaseLookup, I2PTag, I2PX25519Keys, I2npBody, I2npMessage, I2npMessageType, IdentHash,
-    Ntcp2Local, Ntcp2Transport, Router, RouterConfig, RouterContext, RouterObserver, Ssu2Local,
-    Ssu2Pool, TransportEvent, TransportPool,
+    BanList, DatabaseLookup, I2PTag, I2PX25519Keys, I2npBody, I2npMessage, I2npMessageType,
+    IdentHash, Ntcp2Local, Ntcp2Transport, Router, RouterConfig, RouterContext, RouterObserver,
+    Ssu2Local, Ssu2Pool, TransportEvent, TransportPool,
     config::{DEFAULT_NET_ID, Transport},
     private_keys::I2PPrivateKeys,
     router_info::FullRouterInfo,
@@ -450,12 +450,15 @@ impl LocalRouter {
         let own_ri = ctx.own_ri().to_buffer().expect("own RouterInfo");
         let local = Ssu2Local::new(static_keys, intro, own_ri.clone(), DEFAULT_NET_ID, false)
             .expect("Ssu2Local");
+        // Один список банов на SSU2 и NTCP2 (i2pd `Transports::m_BanList`).
+        let ban = Arc::new(BanList::new());
         let mut pools: Vec<Arc<dyn TransportPool>> = vec![Arc::new(
-            Ssu2Pool::with_socket(socket, local).expect("Ssu2Pool"),
+            Ssu2Pool::with_socket_and_ban(socket, local, Arc::clone(&ban)).expect("Ssu2Pool"),
         )];
         if ntcp2_listen_addr.is_some() {
             let ntcp2_local = Ntcp2Local::from_config(ctx.config(), own_ri).expect("Ntcp2Local");
-            let transport = Arc::new(Ntcp2Transport::with_local(ntcp2_local));
+            // Список банов один на оба транспорта, как `m_BanList` в i2pd.
+            let transport = Arc::new(Ntcp2Transport::with_local_and_ban(ntcp2_local, ban));
             // Пул сам принимает входящие (i2pd `NTCP2Server::HandleAccept`);
             // published-адрес в RI и есть адрес listener'а.
             if let Some(listener) = ntcp2_listener {

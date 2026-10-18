@@ -1,12 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::net::{TcpListener, TcpStream};
     use uu_i2p::{
-        I2PError, I2PTag, IdentHash, Ntcp2Local, Ntcp2Pool, PoolEvent,
+        BanList, I2PError, I2PTag, IdentHash, Ntcp2Local, Ntcp2Pool, PoolEvent,
         crypto::I2PX25519Keys,
         i2np::I2npMessageType,
         i2np_message::I2npMessage,
@@ -535,6 +535,42 @@ mod tests {
         assert!(
             result.is_err(),
             "входящее с loopback должно быть отвергнуто"
+        );
+        assert!(bob_pool.is_empty().await);
+    }
+
+    /// Забаненный адрес не принимается accept-loop'ом (i2pd
+    /// `NTCP2.cpp:2017`: `!transports.IsBanned (...)`).
+    #[tokio::test]
+    async fn pool_listen_rejects_banned_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let bob = Side::new(0x33, server_addr);
+        let alice = Side::new(0x34, server_addr);
+        let bob_ri_bytes = bob.ri_bytes.clone();
+
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let ban = Arc::new(BanList::new());
+        ban.ban(IpAddr::V4(Ipv4Addr::LOCALHOST), now_ms);
+
+        let bob_pool = Ntcp2Pool::with_ban(Arc::clone(&ban));
+        // loopback — reserved, иначе отказ был бы по reserved-правилу,
+        // а не по бану.
+        bob_pool.set_local(Arc::new(bob.local().with_accept_reserved(true)));
+        bob_pool.listen(listener).expect("pool.listen");
+
+        let stream = TcpStream::connect(server_addr).await.unwrap();
+        let result = Ntcp2Session::connect(stream, &alice.config(), &bob_ri_bytes).await;
+        assert!(
+            result.is_err(),
+            "входящее с забаненного адреса должно быть отвергнуто"
         );
         assert!(bob_pool.is_empty().await);
     }

@@ -86,6 +86,7 @@ use crate::{
         Ntcp2Session, Ntcp2SessionRead, Ntcp2SessionWrite, Ntcp2TerminationReason,
     },
     router_info::FullRouterInfo,
+    transport_ban::BanList,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -243,6 +244,8 @@ struct Shared {
     local_ri: StdRwLock<Vec<u8>>,
     /// Счётчик номеров сессий.
     next_token: AtomicU64,
+    /// Забаненные адреса (i2pd `Transports::m_BanList`).
+    ban: Arc<BanList>,
 }
 
 /// Пул NTCP2-сессий.
@@ -266,6 +269,19 @@ impl Ntcp2Pool {
     /// Пул с нестандартными таймингами (тесты).
     #[must_use]
     pub fn with_timers(timers: Ntcp2Timers) -> Self {
+        Self::with_timers_and_ban(timers, Arc::new(BanList::new()))
+    }
+
+    /// Пул с таймингами i2pd и своим (общим с SSU2) списком банов.
+    #[must_use]
+    pub fn with_ban(ban: Arc<BanList>) -> Self {
+        Self::with_timers_and_ban(Ntcp2Timers::default(), ban)
+    }
+
+    /// Пул с нестандартными таймингами и своим (общим с SSU2) списком
+    /// банов: i2pd держит один `m_BanList` на все транспорты.
+    #[must_use]
+    pub fn with_timers_and_ban(timers: Ntcp2Timers, ban: Arc<BanList>) -> Self {
         let (incoming_tx, incoming_rx) = mpsc::channel(POOL_INCOMING_QUEUE);
         Self {
             shared: Arc::new(Shared {
@@ -274,6 +290,7 @@ impl Ntcp2Pool {
                 local: StdMutex::new(None),
                 local_ri: StdRwLock::new(Vec::new()),
                 next_token: AtomicU64::new(1),
+                ban,
             }),
             incoming_rx: Mutex::new(incoming_rx),
             listener: StdMutex::new(None),
@@ -580,6 +597,11 @@ async fn run_listener(
         };
         if !local.accept_reserved() && is_reserved_range(peer.ip()) {
             debug!(%peer, "ntcp2 pool: входящее с reserved-адреса отвергнуто");
+            continue;
+        }
+        // i2pd (`NTCP2.cpp:2017`): banned-адреса не принимаем.
+        if shared.ban.is_banned(peer.ip(), now_ms()) {
+            debug!(%peer, "ntcp2 pool: входящее с забаненного адреса отвергнуто");
             continue;
         }
         if !pending.lock().await.insert(peer.ip()) {
