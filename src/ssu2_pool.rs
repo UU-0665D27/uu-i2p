@@ -81,7 +81,8 @@ use crate::netdb::{
 use crate::router_info::FullRouterInfo;
 use crate::router_info_address::I2PAddress;
 use crate::ssu2_block::{
-    AddressBlock, NewTokenBlock, RouterInfoBlock, Ssu2Block, Ssu2TerminationReason,
+    AddressBlock, NewTokenBlock, PeerTestBlock, RouterInfoBlock, Ssu2Block, Ssu2PeerTestCode,
+    Ssu2TerminationReason,
 };
 use crate::ssu2_conn::{
     ConnContext, ConnParams, ConnReport, HandshakeRole, ResponderEnv, Ssu2Connection,
@@ -1663,7 +1664,7 @@ impl PoolState {
                 );
             }
         } else {
-            self.handle_payload_content(ident, report.i2np, report.pending);
+            self.handle_payload_content(ident, report.i2np, report.pending, out);
         }
         if let Some((expires, token)) = report.new_token {
             debug!(token, %remote, "apply_data_report: new outgoing token");
@@ -1750,10 +1751,11 @@ impl PoolState {
     /// Содержимое payload'а, которое обрабатывает вызывающий (в i2pd —
     /// уровень роутера): I2NP-сообщения и блоки вроде `RouterInfo`.
     fn handle_payload_content(
-        &self,
+        &mut self,
         ident: IdentHash,
         i2np: Vec<I2npMessage>,
         pending: Vec<PendingBlock>,
+        out: &mut OutQueue,
     ) {
         for message in i2np {
             self.emit(Ssu2Event::Message {
@@ -1786,12 +1788,133 @@ impl PoolState {
                         }
                     }
                 }
+                PendingBlock::PeerTest(body) => self.handle_peer_test(ident, &body, out),
                 other => {
                     // TODO(suu2-pool-relay): `RelayRequest`/`RelayResponse`/
-                    // `RelayIntro`/`PeerTest` (i2pd `HandlePayload`).
+                    // `RelayIntro` (i2pd `HandlePayload`).
                     debug!(ident = %ident.to_base64(), block = ?other, "handle_payload_content: block not handled");
                 }
             }
+        }
+    }
+
+    /// `HandlePeerTest` (i2pd `SSU2Session.cpp:2548`): сообщения 1–4
+    /// приходят внутри установленной data-сессии.
+    ///
+    /// Пока реализован ответ Боба «нет Charlie» (msg 4 с кодом
+    /// [`Ssu2PeerTestCode::BobNoCharlieAvailable`]) — это единственное,
+    /// что можно проверить в стенде с одним собеседником.
+    fn handle_peer_test(&mut self, ident: IdentHash, body: &[u8], out: &mut OutQueue) {
+        let block = match PeerTestBlock::parse(body) {
+            Ok(block) => block,
+            Err(error) => {
+                warn!(ident = %ident.to_base64(), %error, "handle_peer_test: malformed PeerTest block");
+                return;
+            }
+        };
+        let Some(key) = self.by_ident.get(&ident).copied() else {
+            return;
+        };
+        if !self
+            .sessions
+            .get(&key)
+            .is_some_and(|session| session.established)
+        {
+            warn!(
+                ident = %ident.to_base64(),
+                msg = block.msg,
+                "handle_peer_test: PeerTest from non-established session; dropped"
+            );
+            return;
+        }
+        match block.msg {
+            1 => self.handle_peer_test_msg1(ident, key, &block, out),
+            msg => {
+                // TODO(peer-test): msg 2/3 (Charlie и Боб при живом Charlie)
+                // и msg 4 (Alice). Для них нужны подпись
+                // `PeerTestValidate` и выбор второго роутера.
+                debug!(
+                    ident = %ident.to_base64(),
+                    msg,
+                    code = block.code,
+                    "handle_peer_test: message not implemented yet"
+                );
+            }
+        }
+    }
+
+    /// `PeerTest` msg 1: Alice просит Боба проверить её адрес.
+    ///
+    /// i2pd выбирает Charlie среди сессий, поддерживающих peer test
+    /// (`GetRandomPeerTestSession`), и шлёт ему msg 2. В стенде из одного
+    /// собеседника Charlie нет, поэтому отвечаем msg 4 с ошибкой — ровно
+    /// как i2pd в ветке `Charlie not found`.
+    fn handle_peer_test_msg1(
+        &mut self,
+        ident: IdentHash,
+        key: ConnectionId,
+        block: &PeerTestBlock<'_>,
+        out: &mut OutQueue,
+    ) {
+        let nonce = block
+            .data
+            .get(1..5)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_be_bytes);
+        let charlie = self
+            .sessions
+            .iter()
+            .find(|&(id, session)| *id != key && session.established)
+            .map(|(id, _)| *id);
+        if let Some(charlie) = charlie {
+            // TODO(peer-test): переслать Charlie msg 2 с RI Алисы,
+            // запомнить nonce → сессию Алисы и вернуть ей msg 4.
+            warn!(
+                ident = %ident.to_base64(),
+                ?nonce,
+                charlie = ?charlie,
+                "handle_peer_test_msg1: forwarding to Charlie is not implemented"
+            );
+            return;
+        }
+        let reply = PeerTestBlock {
+            msg: 4,
+            code: Ssu2PeerTestCode::BobNoCharlieAvailable.as_u8(),
+            flag: 0,
+            router_hash: Some([0u8; 32]),
+            data: block.data,
+        };
+        debug!(
+            ident = %ident.to_base64(),
+            ?nonce,
+            "handle_peer_test_msg1: no Charlie; sending msg 4 error"
+        );
+        self.send_peer_test(key, &reply, out);
+    }
+
+    /// Отправляет `Peer Test`-блок в указанную сессию (i2pd `SendData`).
+    fn send_peer_test(&mut self, key: ConnectionId, block: &PeerTestBlock<'_>, out: &mut OutQueue) {
+        let now = now();
+        let (now_ms, _) = unix_now();
+        let now_micros = micros(now);
+        let policy = self.policy;
+        let mut rng = rand::rng();
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        let remote = session.remote;
+        let Some(data) = session.conn.data_mut() else {
+            return;
+        };
+        let mut ctx = SendContext {
+            now,
+            now_ms,
+            now_micros,
+            rng: &mut rng,
+        };
+        match data.send_peer_test(&policy, &mut ctx, block) {
+            Ok(packet) => out.push((remote, packet)),
+            Err(error) => warn!(%error, "send_peer_test: failed"),
         }
     }
 

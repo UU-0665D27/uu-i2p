@@ -56,7 +56,7 @@ use crate::i2np_message::I2npMessage;
 use crate::ssu2_ack::Ssu2AckBlock;
 use crate::ssu2_block::{
     AddressBlock, FirstFragmentBlock, FollowOnFragmentBlock, NewTokenBlock, PathChallengeBlock,
-    PathResponseBlock, RelayTagBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType,
+    PathResponseBlock, PeerTestBlock, RelayTagBlock, RouterInfoBlock, Ssu2Block, Ssu2BlockType,
     Ssu2TerminationReason, TerminationBlock, write_block,
 };
 use crate::ssu2_crypto::{DataPhaseKey, DataPhaseKeys};
@@ -998,6 +998,35 @@ impl Ssu2DataSession {
             policy,
         )?;
         self.send_data(&payload.payload, payload.flags, ctx.now, false)
+    }
+
+    /// Отправляет блок `Peer Test` (i2pd `SendData` с payload'ом
+    /// `CreatePeerTestBlock`): `payload = PeerTest + Padding`, пакет
+    /// регистрируется для повторов.
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки сериализации и шифрования.
+    pub fn send_peer_test<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+        block: &PeerTestBlock<'_>,
+    ) -> crate::Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        block.write(&mut payload)?;
+        let roll = padding_roll(ctx.rng, policy);
+        let remaining = self.params.max_payload.saturating_sub(payload.len());
+        if let Some(size) = policy.padding_size(roll, remaining, 0) {
+            let zeros = vec![0u8; size];
+            write_block(&mut payload, Ssu2BlockType::Padding, &zeros)?;
+        }
+        debug!(
+            msg = block.msg,
+            code = block.code,
+            "send_peer_test: PeerTest sent"
+        );
+        self.send_data(&payload, 0, ctx.now, true)
     }
 
     /// Отправляет свой `RouterInfo` одним data-пакетом

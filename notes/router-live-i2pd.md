@@ -340,6 +340,35 @@ wakeup в `Tunnels::Run` (`libi2pd/Tunnel.cpp:602`) при
 - Суточная выборка флудфиллов (`andNextDay`) — `TODO(floodfill)` в
   `router_context.rs`.
 
+## PeerTest: ответ Боба «нет Charlie»
+
+i2pd периодически (раз в ~30–40 с) шлёт нам `PeerTest msg=1`: он выбрал
+нас Бобом и просит проверить его адрес. В стенде всего один собеседник,
+второго роутера (Charlie) взять негде, поэтому мы отвечаем `msg=4` с
+кодом `BobNoCharlieAvailable` (2) — ровно как i2pd в ветке
+`Charlie not found` (`SSU2Session.cpp:2601`), с нулевым хешем и эхом
+подписанных данных Алисы.
+
+Наша сторона:
+
+```
+handle_peer_test_msg1: no Charlie; sending msg 4 error ident=dM7B... nonce=3928607363
+send_peer_test: PeerTest sent msg=4 code=2
+```
+
+i2pd (`/tmp/opencode/i2pd-ssu2.log`):
+
+```
+SSU2: PeerTest msg=1 sent to MmjO
+SSU2: PeerTest msg=4 code=2
+SSU2: Peer test 4 error code 2 from MmjO
+```
+
+То есть блок разобран и ответ до него дошёл. Чего ещё нет:
+`msg 2/3` (Боб при живом Charlie), `msg 4` с `Accept` на стороне Alice,
+out-of-session `msg 5/6/7` (`SSU2PeerTestSession`, intro-key-крипта) и
+Relay/Introduce — для них нужен второй роутер.
+
 ## Что в логе шумит и почему
 
 - `ShortTunnelBuild` (17 «необработано») — i2pd строит туннели и выбрал
@@ -347,5 +376,5 @@ wakeup в `Tunnels::Run` (`libi2pd/Tunnel.cpp:602`) при
 - `router: флудфиллов нет — свой RouterInfo не публикуем`: в netDb
   только i2pd, а он не флудфилл (`notransit = true`). Публикация в тик
   включится, когда в netDb появится настоящий флудфилл.
-- `handle_payload_content: block not handled` с `PeerTest([1, ...])` —
-  i2pd запускает PeerTest; этап 3, пока только фиксируем.
+- `handle_peer_test: message not implemented yet` (msg 2/3/4) —
+  PeerTest за пределами ветки «нет Charlie»; этап 3, пока фиксируем.
