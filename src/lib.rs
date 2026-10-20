@@ -52,6 +52,7 @@ pub mod ssu2_fragments;
 pub mod ssu2_handshake;
 pub mod ssu2_header;
 pub mod ssu2_lifecycle;
+pub mod ssu2_peer_test;
 pub mod ssu2_policy;
 pub mod ssu2_pool;
 pub mod ssu2_recv;
