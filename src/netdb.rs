@@ -45,12 +45,14 @@ pub const NETDB_MIN_EXPIRATION_TIMEOUT: Duration = Duration::from_mins(90);
 /// не принимается.
 pub const NETDB_EXPIRATION_TIMEOUT_THRESHOLD: Duration = Duration::from_mins(2);
 
-/// Минимальная версия роутера (`NETDB_MIN_ALLOWED_VERSION`, 0.9.58).
+/// Минимальная версия роутера (`NETDB_MIN_ALLOWED_VERSION`, 0.9.57).
 ///
 /// Как и в i2pd, версия — это склейка цифр из property `router.version`
 /// (`MAKE_VERSION_NUMBER` там используется только для констант): роутер
 /// старее этой версии принимается, лишь если он high-bandwidth.
-pub const NETDB_MIN_ALLOWED_VERSION: u32 = 958;
+/// В i2pd 3.0 порог опущен с 0.9.58 до 0.9.57 ради Debian 12
+/// (`NetDb.hpp:58`).
+pub const NETDB_MIN_ALLOWED_VERSION: u32 = 957;
 
 /// Хранилище `RouterInfo` других роутеров.
 ///

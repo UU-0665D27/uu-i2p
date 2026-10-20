@@ -1641,6 +1641,11 @@ impl PoolState {
         let Some(ident) = session.ident else {
             return;
         };
+        // i2pd 3.0: `Path Challenge`, `Relay*` и `PeerTest` из
+        // не-установленной сессии не обрабатываются (`SSU2Session.cpp`
+        // `HandlePayload`). У нас до этой точки доходит и data-пакет,
+        // принятый в `SessionConfirmedSent`.
+        let established = session.conn.is_established();
         // Сессия, которую мы уже закрыли: содержимое — не наше дело (роутеру
         // про неё сказано), но мы продолжаем подтверждать чужие пакеты, чтобы
         // окно отправки у собеседника не висло.
@@ -1676,10 +1681,17 @@ impl PoolState {
 
         // `Path Challenge` от собеседника — отвечаем `Path Response` (i2pd
         // `HandlePayload` → `SendPathResponse`); ответ уходит на текущий
-        // `remote`.
+        // `remote`. Только из установленной сессии (i2pd 3.0).
         if let Some(challenge) = report.path_challenge {
-            debug!(ident = %ident.to_base64(), "apply_data_report: Path Challenge received");
-            self.send_path_response(key, &challenge, out);
+            if established {
+                debug!(ident = %ident.to_base64(), "apply_data_report: Path Challenge received");
+                self.send_path_response(key, &challenge, out);
+            } else {
+                warn!(
+                    ident = %ident.to_base64(),
+                    "apply_data_report: Path Challenge from non-established session; dropped"
+                );
+            }
         }
 
         // Наш `Path Challenge` подтверждён — только теперь меняем адрес

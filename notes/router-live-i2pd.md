@@ -281,76 +281,60 @@ SSU2: Packet was not Acked after 6 attempts. Terminate session
 
 ## Флудфилл: что видно живьём
 
-Режим флудфилла (`--floodfill`) — `lsdb` для `LeaseSet`'ов, ответы на
+Режим флудфилла — `lsdb` для `LeaseSet`'ов, ответы на
 `DatabaseLookup`, `DeliveryStatus` на `DatabaseStore` с `reply_token`,
 флуд вперёд. Ниже — что из этого удалось увидеть в прогоне против
 одиночного i2pd, а что эта среда проверить не даёт.
 
+**Стенд обновлён до i2pd 3.0.0-5-g9725b8b2 (0.9.71).** Это сняло оба
+старых блокера: i2pd теперь строит 0-hop туннели и его собственный
+`Tunnels: Test of ... successful`, поэтому destination публикует
+**свежий** `LeaseSet2`, а туннельный слой принимает наши
+`TunnelGateway`.
+
 **Что подтвердилось живьём.**
 
-- i2pd (не флудфилл, `notransit = true`) **сам публикует нам свой
-  `LeaseSet`**: в лог приходит роутерный garlic с `DatabaseStore`
+- i2pd (не флудфилл, `notransit = true`) публикует нам свой
+  `LeaseSet`: в лог приходит роутерный garlic с `DatabaseStore`
   `store_type = LeaseSet2`, мы его разбираем и валидируем
-  (`lsdb::insert`, `published_ms`, `expires_ms`, подпись) — весь путь
-  приёма и разбора LS отработан на настоящем i2pd.
-- Наши ответы на `DatabaseLookup` (i2pd регулярно шлёт нам RI-запросы,
-  когда исследует netDb) уходят и принимаются: `sender` получает
-  `DatabaseSearchReply`/`DatabaseStore` по нашим правилам
-  (`build_lookup_reply`).
-- `DeliveryStatus` на публикацию мы формируем и отправляем **через
-  `TunnelGateway`** на `reply.gateway` (`DeliveryStatus` вложен в тело
-  `TunnelGateway`, ID тела = `reply_token`) — так же, как i2pd
-  (`NetDb.cpp`, `CreateTunnelGatewayMsg`). Формат проверен тестом
-  `database_store_ack_goes_through_reply_tunnel`.
+  (`lsdb::insert`) — `published_ms = 1792538592000`,
+  `expires_ms = 1792538757000` (165 с), подпись сходится. Через 28 с
+  приходит обновление с новым `published_ms`, `lsdb` его принимает
+  (`router: LeaseSet обновлён`).
+- Ответ на `DatabaseLookup` за этим LS уходит **через туннель**:
+  `tunnel_id = 3247434602`, внутри `TunnelGateway` — `DatabaseStore`
+  (673 байта). В i2pd это видно как
+  `Tunnel: Gateway of 673 bytes for tunnel 3247434602, msg type 11`,
+  затем `Destination: Remote LeaseSet`, `Own remote LeaseSet dropped`,
+  `Published LeaseSet verified`. То есть lookup-ветка `build_lookup_reply`
+  проверена на настоящем i2pd.
+- `DeliveryStatus` (43 байта: `TunnelGateway` с вложенным `DeliveryStatus`,
+  `msg type 10`) i2pd принимает, и публикация подтверждается:
+  `Destination: Publishing LeaseSet confirmed`. Наш `reply_token`
+  доходит до адресата.
+- i2pd шлёт нам `SSU2: PeerTest msg=1 sent to ZLEa` — начало
+  PeerTest-сценария (msg 1–4 внутри сессии). У нас блок пока только
+  логируется (`block not handled`) — это следующий этап.
 
-**Почему i2pd не подтверждает публикацию.**
+**Как это выглядело до 3.0.0 (баг 11, историческое).**
 
-i2pd в этой среде всё равно пишет `Destination: Publish confirmation was
-not received` и `Can't publish LeaseSet`. Причины две, обе — на стороне
-i2pd и on этой конфигурации:
-
-1. **LeaseSet истёк.** i2pd публикует один и тот же `LeaseSet2` от
-   00:06 (`published_ms = 1792281988000`, `expires_ms = ...
-   1792282573000`), а прогон идёт в 00:45+. Мы его честно **отвергаем**:
-   `lsdb::insert` пишет `unpublished или истёкший LeaseSet`. Свежий LS
-   destination не строит: в синтетической сети из одного роутера его
-   туннели (0 хопов) не работают (см. ниже), а без новых лиз `UpdateLeaseSet`
-   не пересобирает LS.
-2. **Входящие gateway-сообщения через SSU2 в i2pd не доходят до
-   туннельного слоя.** Наш `TunnelGateway` (43 байта: `type = 19`,
-   `tunnel_id`, вложенный `DeliveryStatus`) i2pd на уровне SSU2
-   принимает (в логе `SSU2: Block type 3 of size 43` + `SSU2: I2NP
-   message`), но **ни одной** записи туннельного слоя о нём нет: ни
-   `Tunnel: Gateway of N bytes for tunnel ...`, ни `Tunnel: Tunnel not
-   found`. Проверка сроком жизни не при чём: копия того же сообщения с
-   `expiration +1 час` тоже исчезла молча. То же самое с собственным
-   тестом i2pd: `Tunnels: Test of tunnel <id> failed` для его же
-   0-hop inbound-туннеля вылетает с самого старта (00:06:28), задолго до
-   нашего подключения (00:44).
-
-Механика (по текущему master `79ae673d`, в 2.61.0 код тот же):
-`Tunnels::Run` (`libi2pd/Tunnel.cpp:602`) разбирает очередь только если
-`m_Queue.Wait (1,0)` вернул `true`; сам `Queue::Wait`
-(`libi2pd/Queue.h:75`) — это `wait_for` без проверки `IsEmpty ()`.
-Уведомление, пришедшее, пока поток занят, теряется, и сообщение ждёт
-следующего `Put`. Плюс просроченные элементы очереди отбрасываются
-молча (`Tunnel.cpp:612`: `if (!msg || msg->IsExpired (mts)) continue;` —
-ни одного лога). В **гипотеза**, не подтверждённая отдельным репро:
-нужен прогон с живым потоком через i2pd (два роутера) или повторная
-отправка `TunnelGateway` в тот момент, когда туннельный поток i2pd
-ждёт. Пока просто фиксируем: в одиночной конфигурации i2pd
-`DeliveryStatus` через туннель до destination не доходит, и наш ответ
-здесь ни при чём.
+На 2.61.0-822 i2pd публиковал один и тот же **истёкший** `LeaseSet2`
+(retry каждые ~11–33 с), а входящие gateway-сообщения через SSU2
+принимались на уровне SSU2 (`Block type 3 of size 43` + `SSU2: I2NP
+message`), но до туннельного слоя не доходили: ни `Tunnel: Gateway of`,
+ни `Tunnel not found`. Собственный тест 0-hop inbound-туннеля i2pd тоже
+падал (`Tunnels: Test of tunnel <id> failed`). Гипотеза — потерянный
+wakeup в `Tunnels::Run` (`libi2pd/Tunnel.cpp:602`) при
+`Queue::Wait` (`libi2pd/Queue.h:75`) без проверки `IsEmpty ()` и
+молчаливый дроп просроченных элементов (`Tunnel.cpp:612`); записана как
+баг 11. В 3.0.0 путь работает, отдельного репро бага так и нет.
 
 **Что ещё не проверяется в одиночном стенде.**
 
-- Запрос `LeaseSet` у флудфилла: i2pd всегда просит LS через свой
-  inbound-туннель (`Destination.cpp:SendLeaseSetRequest`), то есть ответ
-  обязан идти `TunnelGateway` — тот же неработающий путь. Ответить
-  напрямую нельзя, поэтому живьём эту ветку не увидеть.
 - Зашифрованный ответ на lookup (`reply key` + тег →
-  `WrapECIESX25519Message`): i2pd применяет шифрование, только когда ответ
-  идёт в туннель, — по той же причине не увидеть.
+  `WrapECIESX25519Message`): ответ идёт в туннель, и i2pd его разбирает,
+  но был ли в запросе `reply key`, из логов не видно — шифрование
+  по-прежнему не отличить от plaintext по внешнему поведению.
 - Флуд вперёд: нужен хотя бы один второй флудфилл в netDb (в стенде их
   ноль).
 - Суточная выборка флудфиллов (`andNextDay`) — `TODO(floodfill)` в
@@ -363,6 +347,5 @@ i2pd и on этой конфигурации:
 - `router: флудфиллов нет — свой RouterInfo не публикуем`: в netDb
   только i2pd, а он не флудфилл (`notransit = true`). Публикация в тик
   включится, когда в netDb появится настоящий флудфилл.
-- `router: LeaseSet отвергнут (unpublished/истёк)`: i2pd публикует нам
-  один и тот же истёкший `LeaseSet2` (см. выше) — правило верное, данные
-  старые.
+- `handle_payload_content: block not handled` с `PeerTest([1, ...])` —
+  i2pd запускает PeerTest; этап 3, пока только фиксируем.

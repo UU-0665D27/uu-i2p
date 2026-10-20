@@ -479,6 +479,11 @@ async fn banned_address_gets_no_incoming_session() {
     );
 
     // Бан снят — тот же путь работает: значит, дело было именно в бане.
+    // Alice отпускаем до снятия бана: иначе её повторный `SessionRequest`
+    // может прийти уже после `ban.clear()` и создать вторую сессию — тест
+    // начнёт зависеть от гонки таймеров.
+    drop(alice);
+    tokio::time::sleep(Duration::from_millis(100)).await;
     ban.clear();
     let carol = make_node().await;
     carol

@@ -37,8 +37,8 @@ use crate::{
 };
 use std::net::{IpAddr, SocketAddr};
 
-/// Версия протокола по умолчанию (`0.9.70` → `970`).
-pub const DEFAULT_VERSION: u32 = 970;
+/// Версия протокола по умолчанию (`0.9.71` → `971`, как i2pd 3.0).
+pub const DEFAULT_VERSION: u32 = 971;
 
 /// `netId` по умолчанию — основной I2P.
 pub const DEFAULT_NET_ID: u8 = 2;
@@ -369,7 +369,7 @@ impl std::fmt::Debug for RouterConfig {
 /// ## Дефолты
 ///
 /// - `net_id` = [`DEFAULT_NET_ID`] (2);
-/// - `version` = [`DEFAULT_VERSION`] (970);
+/// - `version` = [`DEFAULT_VERSION`] (971);
 /// - `caps` = `L` (low bandwidth, low congestion);
 /// - `is_floodfill` = `false`;
 /// - `listen` = пусто — **обязательно** заполнить через
