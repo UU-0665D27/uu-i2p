@@ -1318,7 +1318,9 @@ impl Router {
     /// Ошибки сборки [`I2npMessage`]; ошибки отправки отдельным
     /// адресатам — только `warn!`.
     async fn flood_database_store(&self, kind: TransportKind, store: &DatabaseStore) -> Result<()> {
-        let targets = self.context.database_store_flood_targets(&store.key);
+        let targets = self
+            .context
+            .database_store_flood_targets(&store.key, store.store_type);
         if targets.is_empty() {
             debug!(key = %store.key.to_base32(), "router: пересылать DatabaseStore некому");
             return Ok(());

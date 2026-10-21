@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use uu_i2p::{
     DatabaseLookup, DatabaseSearchReply, DatabaseStore, I2PError, I2PTag, I2PX25519Keys,
@@ -7,10 +8,13 @@ use uu_i2p::{
     garlic_body::GarlicBody,
     i2np::I2npMessageType,
     i2np_message::I2npBody,
+    ident_metrics::create_routing_key,
+    netdb::xor_distance,
     netdb_requests::SendAction,
     private_keys::I2PPrivateKeys,
     router_info::{FullRouterInfo, RouterInfo, RouterInfoCaps},
     router_info_address::I2PAddress,
+    timestamp::date_string,
 };
 
 /// Нулевое время для прямых вызовов `send_blocks`: `AckRequest` не
@@ -1203,30 +1207,214 @@ fn lookup_exploratory_to_non_floodfill_is_ignored() {
     );
 }
 
+/// Полдень 2026-01-01 UTC — далеко от порога «скоро полночь».
+const FLOOD_NOON_TS: u64 = 1_767_268_800;
+/// 2026-01-01 23:30 UTC — 30 минут до полуночи (порог RI = 45, LS = 10).
+const FLOOD_23_30_TS: u64 = 1_767_310_200;
+/// 2026-01-01 23:55 UTC — 5 минут до полуночи (порог и RI, и LS).
+const FLOOD_23_55_TS: u64 = 1_767_311_700;
+
+/// `n` ближайших по XOR к `target` из `ids`, кроме `excluded`.
+///
+/// Повторяет `NetDb::GetClosestFloodfill` в той части, где исключённые
+/// кандидаты не занимают место в результате.
+fn closest_of(
+    ids: &[IdentHash],
+    target: &IdentHash,
+    n: usize,
+    excluded: &[IdentHash],
+) -> Vec<IdentHash> {
+    let mut candidates: Vec<(IdentHash, [u8; 32])> = ids
+        .iter()
+        .filter(|id| !excluded.contains(id))
+        .map(|id| (*id, xor_distance(id, target)))
+        .collect();
+    candidates.sort_unstable_by_key(|(_, distance)| *distance);
+    candidates.into_iter().take(n).map(|(id, _)| id).collect()
+}
+
+/// Ожидаемые адресаты `DatabaseStore` по правилам i2pd `NetDb::Flood`.
+fn expected_flood_targets(
+    ids: &[IdentHash],
+    key: &IdentHash,
+    own: &IdentHash,
+    store_type: StoreType,
+    now_s: u64,
+) -> Vec<IdentHash> {
+    let base_excluded = [*own, *key];
+    let current_key = create_routing_key(key, &date_string(now_s));
+    let mut targets = closest_of(ids, &current_key, 3, &base_excluded);
+
+    let threshold = if store_type == StoreType::RouterInfo {
+        45
+    } else {
+        10
+    };
+    let minutes_before_midnight = 24 * 60 - (now_s % 86_400) / 60;
+    if minutes_before_midnight < threshold {
+        let next_key = create_routing_key(key, &date_string(now_s.saturating_add(86_400)));
+        for hash in closest_of(ids, &next_key, 2, &base_excluded) {
+            if !targets.contains(&hash) {
+                targets.push(hash);
+            }
+        }
+    }
+    targets
+}
+
 #[test]
 fn flood_targets_are_closest_floodfills() {
     let mut ctx = minimal_floodfill_ctx();
-    let f1 = add_ri_to_netdb(&mut ctx, 0x11, true);
-    let f2 = add_ri_to_netdb(&mut ctx, 0x22, true);
-    let f3 = add_ri_to_netdb(&mut ctx, 0x33, true);
-    let _non_ff = add_ri_to_netdb(&mut ctx, 0x44, false);
+    let ids = [
+        add_ri_to_netdb(&mut ctx, 0x11, true),
+        add_ri_to_netdb(&mut ctx, 0x22, true),
+        add_ri_to_netdb(&mut ctx, 0x33, true),
+        add_ri_to_netdb(&mut ctx, 0x44, true),
+    ];
+    let non_floodfill = add_ri_to_netdb(&mut ctx, 0x55, false);
+    let key = IdentHash::from_array([0x77u8; 32]);
 
-    let targets = ctx.database_store_flood_targets(&IdentHash::from_array([0x77u8; 32]));
-    assert!(targets.len() <= 3, "i2pd Flood шлёт не больше трём");
-    for target in &targets {
-        assert!(
-            *target == f1 || *target == f2 || *target == f3,
-            "пересылаем только флудфиллам"
-        );
-        assert_ne!(target, ctx.own_ident_hash(), "себе не пересылаем");
-    }
+    let targets = ctx.database_store_flood_targets_at(&key, StoreType::RouterInfo, FLOOD_NOON_TS);
+    let expected = expected_flood_targets(
+        &ids,
+        &key,
+        ctx.own_ident_hash(),
+        StoreType::RouterInfo,
+        FLOOD_NOON_TS,
+    );
+
+    assert_eq!(targets, expected, "порядок — как у NetDb::Flood");
+    assert_eq!(targets.len(), 3, "днём Flood шлёт ровно трём");
+    assert!(
+        !targets.contains(&non_floodfill),
+        "не-флудфилл не выбирается"
+    );
+    assert!(
+        !targets.contains(ctx.own_ident_hash()),
+        "себе не пересылаем"
+    );
+    assert!(!targets.contains(&key), "назад по ключу не пересылаем");
 }
 
 #[test]
 fn flood_targets_empty_without_floodfills() {
     let ctx = minimal_floodfill_ctx();
     assert_eq!(
-        ctx.database_store_flood_targets(&IdentHash::from_array([0x77u8; 32])),
+        ctx.database_store_flood_targets_at(
+            &IdentHash::from_array([0x77u8; 32]),
+            StoreType::RouterInfo,
+            FLOOD_NOON_TS,
+        ),
         Vec::<IdentHash>::new()
     );
+}
+
+#[test]
+fn flood_targets_use_current_day_routing_key() {
+    let mut ctx = minimal_floodfill_ctx();
+    let ids: Vec<IdentHash> = (1..=6)
+        .map(|seed| add_ri_to_netdb(&mut ctx, seed, true))
+        .collect();
+    let key = IdentHash::from_array([0x77u8; 32]);
+
+    let targets = ctx.database_store_flood_targets_at(&key, StoreType::RouterInfo, FLOOD_NOON_TS);
+    let routing_key = create_routing_key(&key, &date_string(FLOOD_NOON_TS));
+    let expected_closest = closest_of(&ids, &routing_key, 3, &[*ctx.own_ident_hash(), key]);
+
+    assert_eq!(targets, expected_closest);
+}
+
+/// Добавляет флудфиллы, пока выборка не начнёт включать завтрашних
+/// адресатов (то есть пока ближайшие два к next-day ключу не окажутся
+/// подмножеством текущих трёх).
+///
+/// Идентификаторы RI случайны, поэтому без такого условия тест на
+/// «плюс два на завтра» иногда проверял бы только отсутствие дублей.
+fn add_floodfills_until_next_day(
+    ctx: &mut RouterContext,
+    key: &IdentHash,
+    store_type: StoreType,
+    now_s: u64,
+) -> Vec<IdentHash> {
+    let mut ids = Vec::new();
+    for seed in 1..=200 {
+        ids.push(add_ri_to_netdb(ctx, seed, true));
+        if ctx
+            .database_store_flood_targets_at(key, store_type, now_s)
+            .len()
+            > 3
+        {
+            return ids;
+        }
+    }
+    panic!("не удалось получить выборку с next-day адресатами за 200 RI");
+}
+
+#[test]
+fn flood_targets_add_next_day_for_router_info_before_midnight() {
+    let mut ctx = minimal_floodfill_ctx();
+    let key = IdentHash::from_array([0x77u8; 32]);
+    let ids = add_floodfills_until_next_day(&mut ctx, &key, StoreType::RouterInfo, FLOOD_23_30_TS);
+
+    let targets = ctx.database_store_flood_targets_at(&key, StoreType::RouterInfo, FLOOD_23_30_TS);
+    let expected = expected_flood_targets(
+        &ids,
+        &key,
+        ctx.own_ident_hash(),
+        StoreType::RouterInfo,
+        FLOOD_23_30_TS,
+    );
+
+    assert_eq!(targets, expected);
+    assert!(
+        targets.len() > 3,
+        "за 30 минут до полуночи RI дублируется на завтра"
+    );
+    let unique: HashSet<IdentHash> = targets.iter().copied().collect();
+    assert_eq!(unique.len(), targets.len(), "дублей быть не должно");
+}
+
+#[test]
+fn flood_targets_skip_next_day_for_leaseset_at_30_minutes() {
+    let mut ctx = minimal_floodfill_ctx();
+    let ids: Vec<IdentHash> = (1..=8)
+        .map(|seed| add_ri_to_netdb(&mut ctx, seed, true))
+        .collect();
+    let key = IdentHash::from_array([0x77u8; 32]);
+
+    let targets = ctx.database_store_flood_targets_at(&key, StoreType::LeaseSet2, FLOOD_23_30_TS);
+    let expected = expected_flood_targets(
+        &ids,
+        &key,
+        ctx.own_ident_hash(),
+        StoreType::LeaseSet2,
+        FLOOD_23_30_TS,
+    );
+
+    assert_eq!(targets, expected);
+    assert_eq!(targets.len(), 3, "для LeaseSet порог — 10 минут");
+}
+
+#[test]
+fn flood_targets_add_next_day_for_leaseset_at_5_minutes() {
+    let mut ctx = minimal_floodfill_ctx();
+    let key = IdentHash::from_array([0x77u8; 32]);
+    let ids = add_floodfills_until_next_day(&mut ctx, &key, StoreType::LeaseSet2, FLOOD_23_55_TS);
+
+    let targets = ctx.database_store_flood_targets_at(&key, StoreType::LeaseSet2, FLOOD_23_55_TS);
+    let expected = expected_flood_targets(
+        &ids,
+        &key,
+        ctx.own_ident_hash(),
+        StoreType::LeaseSet2,
+        FLOOD_23_55_TS,
+    );
+
+    assert_eq!(targets, expected);
+    assert!(
+        targets.len() > 3,
+        "за 5 минут до полуночи LeaseSet тоже дублируется на завтра"
+    );
+    let unique: HashSet<IdentHash> = targets.iter().copied().collect();
+    assert_eq!(unique.len(), targets.len(), "дублей быть не должно");
 }

@@ -18,8 +18,6 @@
 //! - **`EncryptedLeaseSet2`/`MetaLeaseSet2`** — тела не разбираем,
 //!   флудфилл отвечает [`StoreHandling::NotStorable`] (i2pd тип 7 тоже
 //!   отвергает, тип 5 — принимает);
-//! - **суточная выборка флудфиллов** (`andNextDay` в `NetDb::Flood`) —
-//!   пересылка идёт только трём ближайшим на текущий день;
 //! - **туннельная доставка** ответов и приём `DatabaseLookup` с
 //!   `reply_tunnel_id` — шаг 3b; сейчас всё уходит напрямую
 //!   отправителю.
@@ -52,10 +50,12 @@ use crate::{
     garlic_body::GarlicBody,
     i2np::I2npMessageType,
     i2np_message::{I2npBody, I2npMessage},
+    ident_metrics::create_routing_key,
     lsdb::{Lsdb, LsdbOutcome},
     netdb::NetDb,
     netdb_requests::{NetDbRequests, SendAction},
     router_info::FullRouterInfo,
+    timestamp::{date_string, now_s},
 };
 use std::{
     collections::HashSet,
@@ -836,6 +836,13 @@ impl RouterContext {
     /// `GetExploratoryNonFloodfill`. Не выдумываем.
     const LOOKUP_REPLY_PEER_COUNT: usize = 3;
 
+    /// За сколько минут до полуночи `Flood` дублирует `RouterInfo` на
+    /// завтрашние флудфиллы (`NETDB_NEXT_DAY_ROUTER_INFO_THRESHOLD`).
+    pub const NETDB_NEXT_DAY_ROUTER_INFO_THRESHOLD_MIN: u64 = 45;
+
+    /// То же для `LeaseSet` (`NETDB_NEXT_DAY_LEASESET_THRESHOLD`).
+    pub const NETDB_NEXT_DAY_LEASESET_THRESHOLD_MIN: u64 = 10;
+
     /// Собирает ответ на `DatabaseLookup`.
     ///
     /// Не ходит по сети и не пишет в netdb — чистая функция от
@@ -935,24 +942,77 @@ impl RouterContext {
 
     /// Кому переслать обновление объекта `key` (i2pd `NetDb::Flood`).
     ///
-    /// Возвращает до [`Self::LOOKUP_REPLY_PEER_COUNT`] ближайших
-    /// флудфиллов, кроме себя и самого `key`. Пустой список — сеть
-    /// из одного роутера (наш случай в локальном тесте).
+    /// Возвращает до 3 ближайших флудфиллов к
+    /// [`create_routing_key`] текущего дня, кроме себя и самого `key`.
+    /// За 45 минут до полуночи для `RouterInfo` (и за 10 минут для
+    /// `LeaseSet`) добавляет ещё до двух флудфиллов, ближайших к
+    /// завтрашнему routing key, — чтобы объект пережил смену суток
+    /// (`NetDb.cpp:1127-1164`). Совпавшие с текущими пропускаются.
     ///
-    /// i2pd рядом с полуночью добавляет ещё двух флудфиллов «на
-    /// следующий день» (`andNextDay`, суточная выборка
-    /// `GetClosestFloodfill(..., true)`). Суточной выборки у нас нет,
-    /// см. `// TODO(floodfill): суточная выборка флудфиллов (next day).`
+    /// Пустой список — сеть из одного роутера (наш случай в локальном
+    /// тесте).
+    ///
+    /// Суточная часть зависит от текущего времени; для тестов есть
+    /// [`Self::database_store_flood_targets_at`].
     #[must_use]
-    pub fn database_store_flood_targets(&self, key: &IdentHash) -> Vec<IdentHash> {
+    pub fn database_store_flood_targets(
+        &self,
+        key: &IdentHash,
+        store_type: StoreType,
+    ) -> Vec<IdentHash> {
+        self.database_store_flood_targets_at(key, store_type, now_s())
+    }
+
+    /// [`Self::database_store_flood_targets`] с явным временем.
+    ///
+    /// `now_s` — unix-время в секундах; порог «скоро полночь» считается
+    /// по UTC-минутам, как `GetMinutesSinceEpoch` в i2pd.
+    #[must_use]
+    pub fn database_store_flood_targets_at(
+        &self,
+        key: &IdentHash,
+        store_type: StoreType,
+        now_s: u64,
+    ) -> Vec<IdentHash> {
         let our_hash = *self.own_ident_hash();
-        self.netdb
-            .closest_floodfills(key, Self::LOOKUP_REPLY_PEER_COUNT + 2)
+        let mut excluded = HashSet::with_capacity(2);
+        excluded.insert(our_hash);
+        excluded.insert(*key);
+
+        // Три ближайших к ключу текущего дня (`Flood`, первый цикл).
+        let current_key = create_routing_key(key, &date_string(now_s));
+        let mut targets: Vec<IdentHash> = self
+            .netdb
+            .closest_floodfills_excluding(&current_key, Self::LOOKUP_REPLY_PEER_COUNT, &excluded)
             .into_iter()
             .map(|ri| *ri.ident_hash())
-            .filter(|hash| *hash != our_hash && hash != key)
-            .take(Self::LOOKUP_REPLY_PEER_COUNT)
-            .collect()
+            .collect();
+
+        // i2pd `HandleDatabaseStoreMsg` (`NetDb.cpp:939-940`): для RI
+        // порог 45 минут, для любого LeaseSet — 10. За порогом
+        // `andNextDay=false`.
+        let threshold_min = if store_type == StoreType::RouterInfo {
+            Self::NETDB_NEXT_DAY_ROUTER_INFO_THRESHOLD_MIN
+        } else {
+            Self::NETDB_NEXT_DAY_LEASESET_THRESHOLD_MIN
+        };
+        let minutes_since_midnight = (now_s % 86_400) / 60;
+        let minutes_before_midnight = 24 * 60 - minutes_since_midnight;
+        if minutes_before_midnight < threshold_min {
+            let next_key = create_routing_key(key, &date_string(now_s.saturating_add(86_400)));
+            // Второй цикл `Flood` тоже исключает только себя и `key`,
+            // а совпавших с текущими адресатами просто не шлёт.
+            for ri in self
+                .netdb
+                .closest_floodfills_excluding(&next_key, 2, &excluded)
+            {
+                let hash = *ri.ident_hash();
+                if !targets.contains(&hash) {
+                    targets.push(hash);
+                }
+            }
+        }
+        targets
     }
 
     /// Полный цикл обработки входящего `DatabaseLookup`.

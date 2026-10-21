@@ -1,0 +1,49 @@
+# Текущая итерация: суточная выборка флудфиллов (`NetDb::Flood`)
+
+## Статус
+
+Реализовано (2026-10-21): `database_store_flood_targets[_at]`,
+`NetDb::closest_floodfills_excluding`, тесты в `tests/router_context.rs`
+и `tests/netdb.rs`.
+
+## Что делаем
+
+- `RouterContext::database_store_flood_targets` сейчас выбирает ближайшие
+  флудфиллы к **сырому** ключу объекта. В i2pd `NetDb::Flood`
+  (`NetDb.cpp:1127`) всегда ищет по `CreateRoutingKey(ident, nextDay)`
+  (`IdentMetrics.cpp:20`), то есть по `SHA256(ident || YYYYMMDD)`. Это
+  размазывает нагрузку между флудфиллами и переживает полночь.
+- За `NETDB_NEXT_DAY_ROUTER_INFO_THRESHOLD` (45 минут) до полуночи для
+  `RouterInfo` и за `NETDB_NEXT_DAY_LEASESET_THRESHOLD` (10 минут) для
+  `LeaseSet` i2pd добавляет ещё до двух флудфиллов, ближайших к
+  завтрашнему routing key (`NetDb.cpp:939-940`, `1144-1163`).
+  Совпавшие с текущими тремя пропускаются.
+- Итог: до 3 адресатов на текущий день + до 2 на следующий, без
+  дублей, себя и сам ключ не выбираем.
+
+## Тестируемый шов
+
+`database_store_flood_targets_at(key, store_type, now_s)` — та же логика,
+но с явным временем, чтобы тесты не зависели от момента запуска.
+Публичная обёртка `database_store_flood_targets(key, store_type)` берёт
+`timestamp::now_s()`.
+
+## Grep-выражения для следующей итерации
+
+```sh
+grep -rn "database_store_flood_targets" src tests
+grep -rn "create_routing_key" src tests
+grep -rn "NETDB_NEXT_DAY" /home/u_uu/FOR_LLM/libi2pd/NetDb.hpp
+grep -n "void NetDb::Flood" -A60 /home/u_uu/FOR_LLM/libi2pd/NetDb.cpp
+grep -n "CreateRoutingKey" /home/u_uu/FOR_LLM/libi2pd/IdentMetrics.cpp
+grep -n "andNextDay" /home/u_uu/FOR_LLM/libi2pd/NetDb.cpp
+```
+
+## Остаётся на потом
+
+- Недостижимые RI: i2pd не отдаёт их в `DatabaseLookup` и не выбирает
+  флудфиллами (`GetClosestFloodfill` проверяет `IsUnreachable`). У
+  `NetDb` пока нет учёта достижимости; TODO в
+  `RouterContext::build_lookup_reply`.
+- Суточная выборка exploratory-не-флудфиллов (`m_ExploratorySelection` в
+  i2pd) — у нас всё ещё линейный `closest_to`.

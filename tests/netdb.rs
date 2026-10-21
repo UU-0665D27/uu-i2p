@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use uu_i2p::{
         I2PTag, IdentHash, NetDb,
         netdb::xor_distance,
@@ -237,6 +239,31 @@ mod tests {
         for ri in &floods {
             assert!(ri.body().caps.is_floodfill());
         }
+    }
+
+    #[test]
+    fn closest_floodfills_excluding_skips_excluded() {
+        let mut db = NetDb::new();
+        for s in 0..10 {
+            db.insert(make_ri(s, 100, true));
+        }
+        let target = ident(0);
+        let all = db.closest_floodfills(&target, 4);
+        assert_eq!(all.len(), 4);
+
+        let excluded: HashSet<IdentHash> = [*all[0].ident_hash(), *all[2].ident_hash()]
+            .into_iter()
+            .collect();
+        let filtered = db.closest_floodfills_excluding(&target, 3, &excluded);
+
+        // Исключённые не занимают место в результате: берутся следующие
+        // по расстоянию, а не «n минус исключённые».
+        assert_eq!(filtered.len(), 3);
+        for ri in &filtered {
+            assert!(!excluded.contains(ri.ident_hash()));
+        }
+        assert_eq!(*filtered[0].ident_hash(), *all[1].ident_hash());
+        assert_eq!(*filtered[1].ident_hash(), *all[3].ident_hash());
     }
 
     #[test]

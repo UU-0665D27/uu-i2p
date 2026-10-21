@@ -33,7 +33,7 @@
 
 use crate::IdentHash;
 use crate::router_info::FullRouterInfo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// Минимальный срок годности `RouterInfo` (`NETDB_MIN_EXPIRATION_TIMEOUT`):
@@ -217,7 +217,25 @@ impl NetDb {
     /// Частный случай [`Self::closest_to`] с фильтром «floodfill».
     #[must_use]
     pub fn closest_floodfills(&self, target: &IdentHash, n: usize) -> Vec<&FullRouterInfo> {
-        self.closest_to(target, n, |ri| ri.body().caps.is_floodfill())
+        self.closest_floodfills_excluding(target, n, &HashSet::new())
+    }
+
+    /// `n` ближайших floodfill'ов к `target`, кроме `excluded`.
+    ///
+    /// Соответствует `NetDb::GetClosestFloodfill` в i2pd: кандидаты,
+    /// попавшие в `excluded`, не участвуют в выборе, поэтому в
+    /// результат попадают именно `n` следующих по расстоянию (если
+    /// они есть), а не «n минус исключённые».
+    #[must_use]
+    pub fn closest_floodfills_excluding(
+        &self,
+        target: &IdentHash,
+        n: usize,
+        excluded: &HashSet<IdentHash>,
+    ) -> Vec<&FullRouterInfo> {
+        self.closest_to(target, n, |ri| {
+            ri.body().caps.is_floodfill() && !excluded.contains(ri.ident_hash())
+        })
     }
 
     /// `n` ближайших роутеров к `target` без фильтра.
