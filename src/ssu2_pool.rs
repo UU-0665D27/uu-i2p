@@ -30,9 +30,11 @@
 //!
 //! ## Что НЕ реализовано
 //!
-//! - **Relay / Hole Punch / Peer Test** (`Introduce`, `WaitForIntroduction`,
-//!   `PeerTest`): блоки отдаются наружу через
-//!   [`crate::ssu2_engine::PendingBlock`], сессии этих типов не создаются.
+//! - **Relay / Hole Punch** (`Introduce`, `WaitForIntroduction`): блоки
+//!   отдаются наружу через [`crate::ssu2_engine::PendingBlock`], сессии этих
+//!   типов не создаются. `PeerTest` (msg 1–4 в data-сессии и out-of-session
+//!   msg 5–7) реализован здесь: пул — владелец сессий, ключей и кеша
+//!   `RouterInfo`.
 //! - **Проверки `RouterInfo`** целиком (подпись, версия, `isOlder`, профиль):
 //!   здесь — только то, без чего не работает data phase (наличие
 //!   SSU2-адреса нужного семейства, совпадение `s=` со статическим ключом из
@@ -65,6 +67,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rand::RngExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -78,7 +81,8 @@ use crate::i2np_message::I2npMessage;
 use crate::netdb::{
     NETDB_EXPIRATION_TIMEOUT_THRESHOLD, NETDB_MIN_ALLOWED_VERSION, NETDB_MIN_EXPIRATION_TIMEOUT,
 };
-use crate::router_info::FullRouterInfo;
+use crate::private_keys::I2PPrivateKeys;
+use crate::router_info::{FullRouterInfo, ROUTER_INFO_PROPERTY_VERSION};
 use crate::router_info_address::I2PAddress;
 use crate::ssu2_block::{
     AddressBlock, NewTokenBlock, PeerTestBlock, RouterInfoBlock, Ssu2Block, Ssu2PeerTestCode,
@@ -92,6 +96,11 @@ use crate::ssu2_engine::{PendingBlock, RecvReport, SendContext, TerminationActio
 use crate::ssu2_handshake::{HandshakeConfig, InitiatorHandshake, ResponderHandshake};
 use crate::ssu2_header::{ConnectionId, SSU2_MIN_PACKET_SIZE, SSU2_VERSION, Ssu2MessageType};
 use crate::ssu2_lifecycle::Ssu2SessionState;
+use crate::ssu2_peer_test::{
+    PEER_TEST_EXPIRATION, PEER_TEST_MIN_VERSION, PEER_TEST_RESEND_INTERVAL,
+    PEER_TEST_RESEND_VARIANCE_MS, PeerTestMessage, PeerTestPacket, PeerTestRole, PeerTestSession,
+    PeerTestSignedData, build_packet, open_packet, parse_payload, sign,
+};
 use crate::ssu2_policy::{
     DateTimeAction, I2pdCongestionPolicy, I2pdPolicy, SSU2_CLEANUP_INTERVAL, SSU2_MAX_PACKET_SIZE,
     SSU2_TERMINATION_CHECK_TIMEOUT, SSU2_TERMINATION_TIMEOUT, SSU2_TOKEN_EXPIRATION_THRESHOLD,
@@ -132,6 +141,9 @@ pub struct Ssu2Local {
     intro_key: [u8; 32],
     /// Свой подписанный `RouterInfo`.
     ri_bytes: Vec<u8>,
+    /// Приватные ключи для подписи `PeerTest`. `None` — `PeerTest` как Charlie/Alice
+    /// недоступен (пул поднимают из готовых частей без ключей).
+    keys: Option<I2PPrivateKeys>,
     /// `IdentHash` из `ri_bytes`.
     ident: IdentHash,
     /// `netId` для заголовков.
@@ -182,6 +194,7 @@ impl Ssu2Local {
             ipv6,
             testing: false,
             sync_clock_from_peers: false,
+            keys: Some(cfg.keys().clone()),
         })
     }
 
@@ -207,7 +220,15 @@ impl Ssu2Local {
             ipv6,
             testing: false,
             sync_clock_from_peers: false,
+            keys: None,
         })
+    }
+
+    /// Добавляет приватные ключи для подписи `PeerTest` (роли Alice и Charlie).
+    #[must_use]
+    pub fn with_private_keys(mut self, keys: I2PPrivateKeys) -> Self {
+        self.keys = Some(keys);
+        self
     }
 
     /// Роутер в тестовом режиме (i2pd `SetTesting`).
@@ -331,6 +352,17 @@ pub enum Ssu2Event {
         /// известен).
         from: Option<IdentHash>,
     },
+    /// `PeerTest` дошёл до конца: Charlie (msg 7) сообщил, каким видит нас.
+    /// i2pd по этим данным выставляет статус роутера
+    /// (`SSU2OutOfSession.cpp:138-166`); решение — за вызывающим.
+    PeerTestResult {
+        /// Боб, через которого шёл тест.
+        bob: IdentHash,
+        /// Charlie (если известен).
+        charlie: Option<IdentHash>,
+        /// Наш endpoint по мнению Charlie (блок `Address` в msg 7).
+        addr: Option<SocketAddr>,
+    },
 }
 
 /// Команда в задачу пула.
@@ -364,6 +396,13 @@ enum Command {
     Sessions {
         /// Ответ.
         reply: oneshot::Sender<Vec<IdentHash>>,
+    },
+    /// Начать `PeerTest` через установленную сессию (роль Alice).
+    StartPeerTest {
+        /// Боб — установленная сессия с ним.
+        ident: IdentHash,
+        /// Ответ: ошибка постановки/отправки msg 1.
+        reply: oneshot::Sender<Result<()>>,
     },
 }
 
@@ -524,6 +563,31 @@ impl Ssu2Pool {
             .map_err(|_| I2PError::Io("ssu2 pool: send task dropped".into()))?
     }
 
+    /// Запускает проверку своего внешнего адреса (`PeerTest`, роль Alice).
+    ///
+    /// Отправляет msg 1 Бобу `ident`; результат придёт событием
+    /// [`Ssu2Event::PeerTestResult`] (или не придёт — i2pd в этом случае
+    /// просто ждёт таймаут).
+    ///
+    /// # Errors
+    ///
+    /// - [`I2PError::Malformed`] — с `ident` нет установленной сессии, у
+    ///   `Ssu2Local` нет приватных ключей (см.
+    ///   [`Ssu2Local::with_private_keys`]);
+    /// - [`I2PError::Io`] — пул остановлен.
+    pub async fn start_peer_test(&self, ident: &IdentHash) -> Result<()> {
+        let (reply, wait) = oneshot::channel();
+        self.cmds
+            .send(Command::StartPeerTest {
+                ident: *ident,
+                reply,
+            })
+            .await
+            .map_err(|_| I2PError::Io("ssu2 pool: command channel closed".into()))?;
+        wait.await
+            .map_err(|_| I2PError::Io("ssu2 pool: peer test task dropped".into()))?
+    }
+
     /// Ждёт следующего события от любой сессии.
     ///
     /// # Errors
@@ -602,6 +666,9 @@ struct Session {
     ident: Option<IdentHash>,
     /// Соединение установлено.
     established: bool,
+    /// `RouterInfo` собеседника (если известен). Нужен для пересылки в
+    /// `PeerTest` msg 2/4: i2pd берёт `m_RemoteRouterInfo`.
+    remote_ri: Vec<u8>,
     /// Мы инициатор (`IsOutgoing`).
     outgoing: bool,
     /// Отправленный `Path Challenge` и адрес, на который он ушёл, — ждём
@@ -633,6 +700,26 @@ struct Session {
     disconnected: bool,
 }
 
+/// Состояние пересланного Бобом `PeerTest` (msg 1 → msg 2).
+#[derive(Debug, Clone, Copy)]
+struct ForwardedPeerTest {
+    /// Сессия Алисы (куда Боб вернёт msg 4).
+    alice: ConnectionId,
+    /// Когда запись создана (для уборки).
+    created: Duration,
+}
+
+/// Состояние `PeerTest`, запрошенного Алисой.
+#[derive(Debug, Clone, Copy)]
+struct RequestedPeerTest {
+    /// Out-of-session сессия Алисы (msg 5–7).
+    session: ConnectionId,
+    /// Боб, через которого идёт тест.
+    bob: IdentHash,
+    /// Когда запись создана (для уборки).
+    created: Duration,
+}
+
 /// Состояние задачи пула (всё синхронно).
 struct PoolState {
     /// Свои параметры.
@@ -650,6 +737,18 @@ struct PoolState {
     by_endpoint: HashMap<SocketAddr, ConnectionId>,
     /// Соединения по `IdentHash` (`m_SessionsByRouterHash`).
     by_ident: HashMap<IdentHash, ConnectionId>,
+    /// Кеш `RouterInfo` собеседников по `IdentHash`: нужен, чтобы найти
+    /// Charlie по хешу из msg 3/4 (i2pd держит RI в netDb).
+    ri_cache: HashMap<IdentHash, Vec<u8>>,
+    /// Пересланные Бобом `PeerTest`: `nonce` → сессия Алисы. Пока запись
+    /// жива, Боб принимает msg 3 и возвращает Алисе msg 4.
+    forwarded_peer_tests: HashMap<u32, ForwardedPeerTest>,
+    /// `PeerTest` Алисы: `nonce` → out-of-session сессия (ключ — наш
+    /// `sourceConnID`). Нужен, чтобы msg 4 в data-сессии нашёл сессию.
+    requested_peer_tests: HashMap<u32, RequestedPeerTest>,
+    /// Out-of-session сессии msg 5–7 по нашему `sourceConnID`
+    /// (i2pd `m_PeerTestSessions` в `SSU2Server`).
+    peer_test_sessions: HashMap<ConnectionId, PeerTestSession>,
     /// Забаненные адреса (i2pd `Transports::m_BanList`).
     ban: Arc<BanList>,
     /// Канал событий наружу.
@@ -667,6 +766,10 @@ impl PoolState {
             sessions: HashMap::new(),
             by_endpoint: HashMap::new(),
             by_ident: HashMap::new(),
+            ri_cache: HashMap::new(),
+            forwarded_peer_tests: HashMap::new(),
+            requested_peer_tests: HashMap::new(),
+            peer_test_sessions: HashMap::new(),
             ban,
             events,
         }
@@ -691,6 +794,11 @@ impl PoolState {
         let Some(dest) = peek_dest_conn_id(&buf[..len], self.local.intro_key()) else {
             return;
         };
+        // Out-of-session PeerTest (msg 5–7): ключ — наш `sourceConnID`.
+        if self.peer_test_sessions.contains_key(&dest) {
+            self.handle_peer_test_packet(&mut buf[..len], dest, from, out);
+            return;
+        }
         // Как в i2pd: сперва поиск по `destConnID` (`m_Sessions`), и только
         // если не нашли — по адресу (`m_PendingOutgoingSessions`).
         let key = if self.sessions.contains_key(&dest) {
@@ -737,6 +845,10 @@ impl PoolState {
             Command::Sessions { reply } => {
                 let _ = reply.send(self.by_ident.keys().copied().collect());
             }
+            Command::StartPeerTest { ident, reply } => {
+                let result = self.start_peer_test(&ident, out);
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -744,6 +856,7 @@ impl PoolState {
     fn on_tick(&mut self, out: &mut OutQueue) {
         let now = now();
         self.tokens.cleanup(unix_now().1);
+        self.tick_peer_tests(now, out);
         let keys: Vec<ConnectionId> = self.sessions.keys().copied().collect();
         for key in keys {
             if self.sessions.contains_key(&key) {
@@ -1212,6 +1325,7 @@ impl PoolState {
                 remote: from,
                 ident: None,
                 established: false,
+                remote_ri: Vec::new(),
                 outgoing: false,
                 queue: VecDeque::new(),
                 path_challenge: None,
@@ -1316,6 +1430,7 @@ impl PoolState {
                 remote,
                 ident: Some(ident),
                 established: false,
+                remote_ri: ri_bytes.to_vec(),
                 outgoing: true,
                 queue: VecDeque::new(),
                 path_challenge: None,
@@ -1325,6 +1440,7 @@ impl PoolState {
         );
         self.by_endpoint.insert(remote, source_conn_id);
         self.by_ident.insert(ident, source_conn_id);
+        self.ri_cache.insert(ident, ri_bytes.to_vec());
         for packet in packets {
             out.push((remote, packet));
         }
@@ -1552,6 +1668,7 @@ impl PoolState {
         };
         session.ident = Some(ident);
         session.conn.set_remote_intro_key(intro_key);
+        session.remote_ri = ri_bytes.to_vec();
         // i2pd `AddSessionByRouterHash`: на роутер — одна сессия, старая
         // завершается `ReplacedByNewSession`.
         if let Some(old) = self.by_ident.insert(ident, key)
@@ -1567,6 +1684,7 @@ impl PoolState {
             ident = %ident.to_base64(),
             published, "accept_remote_router_info: address and intro key accepted"
         );
+        self.ri_cache.insert(ident, ri_bytes.to_vec());
         Ok(ident)
     }
 
@@ -1772,15 +1890,23 @@ impl PoolState {
                     // проверяется, как при добавлении в netDb
                     // (`netdb.AddRouterInfo`).
                     match RouterInfoBlock::parse(&body).and_then(|block| block.body()) {
-                        Ok(ri_bytes) => match FullRouterInfo::from_buffer(&ri_bytes)
-                            .and_then(|ri| ri.verify(&ri_bytes))
-                        {
-                            Ok(()) => self.emit(Ssu2Event::RouterInfo {
-                                from: ident,
-                                ri_bytes: ri_bytes.into_owned(),
-                            }),
+                        Ok(ri_bytes) => match FullRouterInfo::from_buffer(&ri_bytes) {
+                            Ok(ri) => match ri.verify(&ri_bytes) {
+                                Ok(()) => {
+                                    // Кешируем до обработки PeerTest: msg 2/3
+                                    // несут RI в том же payload'е.
+                                    self.ri_cache.insert(*ri.ident_hash(), ri_bytes.to_vec());
+                                    self.emit(Ssu2Event::RouterInfo {
+                                        from: ident,
+                                        ri_bytes: ri_bytes.into_owned(),
+                                    });
+                                }
+                                Err(error) => {
+                                    warn!(ident = %ident.to_base64(), %error, "handle_payload_content: RouterInfo signature rejected");
+                                }
+                            },
                             Err(error) => {
-                                warn!(ident = %ident.to_base64(), %error, "handle_payload_content: RouterInfo signature rejected");
+                                warn!(ident = %ident.to_base64(), %error, "handle_payload_content: malformed RouterInfo");
                             }
                         },
                         Err(error) => {
@@ -1800,10 +1926,6 @@ impl PoolState {
 
     /// `HandlePeerTest` (i2pd `SSU2Session.cpp:2548`): сообщения 1–4
     /// приходят внутри установленной data-сессии.
-    ///
-    /// Пока реализован ответ Боба «нет Charlie» (msg 4 с кодом
-    /// [`Ssu2PeerTestCode::BobNoCharlieAvailable`]) — это единственное,
-    /// что можно проверить в стенде с одним собеседником.
     fn handle_peer_test(&mut self, ident: IdentHash, body: &[u8], out: &mut OutQueue) {
         let block = match PeerTestBlock::parse(body) {
             Ok(block) => block,
@@ -1829,26 +1951,83 @@ impl PoolState {
         }
         match block.msg {
             1 => self.handle_peer_test_msg1(ident, key, &block, out),
-            msg => {
-                // TODO(peer-test): msg 2/3 (Charlie и Боб при живом Charlie)
-                // и msg 4 (Alice). Для них нужны подпись
-                // `PeerTestValidate` и выбор второго роутера.
-                debug!(
-                    ident = %ident.to_base64(),
-                    msg,
-                    code = block.code,
-                    "handle_peer_test: message not implemented yet"
-                );
-            }
+            2 => self.handle_peer_test_msg2(ident, key, &block, out),
+            3 => self.handle_peer_test_msg3(ident, key, &block, out),
+            4 => self.handle_peer_test_msg4(ident, key, &block, out),
+            msg => debug!(
+                ident = %ident.to_base64(),
+                msg,
+                code = block.code,
+                "handle_peer_test: unexpected message"
+            ),
         }
+    }
+
+    /// Роль Alice: отправляет msg 1 Бобу и заводит out-of-session сессию
+    /// для msg 5–7 (i2pd `SSU2Session::SendPeerTest`, `:247`).
+    fn start_peer_test(&mut self, ident: &IdentHash, out: &mut OutQueue) -> Result<()> {
+        let key = *self
+            .by_ident
+            .get(ident)
+            .ok_or(I2PError::Malformed("ssu2 pool: no session for peer test"))?;
+        let remote = {
+            let session = self
+                .sessions
+                .get(&key)
+                .ok_or(I2PError::Malformed("ssu2 pool: session vanished"))?;
+            if !session.established {
+                return Err(I2PError::Malformed(
+                    "ssu2 pool: peer test needs an established session",
+                ));
+            }
+            session.remote
+        };
+        let keys = self.local.keys.clone().ok_or(I2PError::Malformed(
+            "ssu2 pool: no private keys for peer test",
+        ))?;
+        let our_endpoint = self.own_peer_test_endpoint(remote.is_ipv6())?;
+        let (_, now_secs) = unix_now();
+        let mut rng = rand::rng();
+        let nonce: u32 = rng.random();
+        let signed = sign(&keys, ident.as_bytes(), None, nonce, now_secs, our_endpoint)?;
+        let data = signed.to_bytes();
+
+        let now = now();
+        let session = PeerTestSession::new(PeerTestRole::Alice, nonce, now);
+        let session_id = session.source;
+        self.peer_test_sessions.insert(session_id, session);
+        self.requested_peer_tests.insert(
+            nonce,
+            RequestedPeerTest {
+                session: session_id,
+                bob: *ident,
+                created: now,
+            },
+        );
+
+        let block = PeerTestBlock {
+            msg: 1,
+            code: Ssu2PeerTestCode::Accept.as_u8(),
+            flag: 0,
+            router_hash: None,
+            data: &data,
+        };
+        debug!(
+            ident = %ident.to_base64(),
+            nonce,
+            %our_endpoint,
+            "start_peer_test: msg 1 sent"
+        );
+        self.send_peer_test(key, &block, out);
+        Ok(())
     }
 
     /// `PeerTest` msg 1: Alice просит Боба проверить её адрес.
     ///
-    /// i2pd выбирает Charlie среди сессий, поддерживающих peer test
-    /// (`GetRandomPeerTestSession`), и шлёт ему msg 2. В стенде из одного
-    /// собеседника Charlie нет, поэтому отвечаем msg 4 с ошибкой — ровно
-    /// как i2pd в ветке `Charlie not found`.
+    /// Боб выбирает Charlie среди установленных сессий с поддержкой peer
+    /// test (`GetRandomPeerTestSession`, `SSU2.cpp:601`), шлёт ему msg 2 с
+    /// RI Алисы и запоминает `nonce → сессия Алисы` для msg 3. Если Charlie
+    /// нет — msg 4 с кодом [`Ssu2PeerTestCode::BobNoCharlieAvailable`].
     fn handle_peer_test_msg1(
         &mut self,
         ident: IdentHash,
@@ -1856,44 +2035,581 @@ impl PoolState {
         block: &PeerTestBlock<'_>,
         out: &mut OutQueue,
     ) {
-        let nonce = block
-            .data
-            .get(1..5)
-            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-            .map(u32::from_be_bytes);
-        let charlie = self
-            .sessions
-            .iter()
-            .find(|&(id, session)| *id != key && session.established)
-            .map(|(id, _)| *id);
-        if let Some(charlie) = charlie {
-            // TODO(peer-test): переслать Charlie msg 2 с RI Алисы,
-            // запомнить nonce → сессию Алисы и вернуть ей msg 4.
-            warn!(
+        let signed = match PeerTestSignedData::parse(block.data) {
+            Ok(signed) => signed,
+            Err(error) => {
+                warn!(ident = %ident.to_base64(), %error, "handle_peer_test_msg1: malformed signed data");
+                return;
+            }
+        };
+        let nonce = signed.nonce;
+        let Some(charlie) = self.select_charlie(&ident, signed.endpoint.is_ipv6()) else {
+            let reply = PeerTestBlock {
+                msg: 4,
+                code: Ssu2PeerTestCode::BobNoCharlieAvailable.as_u8(),
+                flag: 0,
+                router_hash: Some([0u8; 32]),
+                data: block.data,
+            };
+            debug!(
                 ident = %ident.to_base64(),
-                ?nonce,
-                charlie = ?charlie,
-                "handle_peer_test_msg1: forwarding to Charlie is not implemented"
+                nonce,
+                "handle_peer_test_msg1: no Charlie; sending msg 4 error"
+            );
+            self.send_peer_test(key, &reply, out);
+            return;
+        };
+        if self.forwarded_peer_tests.contains_key(&nonce) {
+            debug!(
+                ident = %ident.to_base64(),
+                nonce, "handle_peer_test_msg1: nonce is already being tested"
             );
             return;
         }
-        let reply = PeerTestBlock {
-            msg: 4,
-            code: Ssu2PeerTestCode::BobNoCharlieAvailable.as_u8(),
+        let alice_ri = self
+            .sessions
+            .get(&key)
+            .map_or_default(|session| session.remote_ri.clone());
+        self.forwarded_peer_tests.insert(
+            nonce,
+            ForwardedPeerTest {
+                alice: key,
+                created: now(),
+            },
+        );
+        let block2 = PeerTestBlock {
+            msg: 2,
+            code: Ssu2PeerTestCode::Accept.as_u8(),
             flag: 0,
-            router_hash: Some([0u8; 32]),
+            router_hash: Some(*ident.as_bytes()),
             data: block.data,
         };
+        let ri = (!alice_ri.is_empty()).then_some(alice_ri.as_slice());
         debug!(
-            ident = %ident.to_base64(),
-            ?nonce,
-            "handle_peer_test_msg1: no Charlie; sending msg 4 error"
+            alice = %ident.to_base64(),
+            nonce,
+            charlie = ?charlie,
+            with_ri = ri.is_some(),
+            "handle_peer_test_msg1: forwarding msg 2 to Charlie"
         );
-        self.send_peer_test(key, &reply, out);
+        self.send_peer_test_with_ri(charlie, &block2, ri, out);
+    }
+
+    /// `PeerTest` msg 2 (Charlie от Боба): проверяет подпись Алисы,
+    /// подписывает данные своим ключом, отвечает msg 3 Бобу и, если адрес
+    /// поддерживается, шлёт Алисе msg 5 (`SSU2Session.cpp:2633-2692`).
+    fn handle_peer_test_msg2(
+        &mut self,
+        bob: IdentHash,
+        key: ConnectionId,
+        block: &PeerTestBlock<'_>,
+        out: &mut OutQueue,
+    ) {
+        let Some(ahash) = block.router_hash else {
+            warn!(bob = %bob.to_base64(), "handle_peer_test_msg2: router hash is missing");
+            return;
+        };
+        let alice = IdentHash::from_array(ahash);
+        let signed = match PeerTestSignedData::parse(block.data) {
+            Ok(signed) => signed,
+            Err(error) => {
+                warn!(alice = %alice.to_base64(), %error, "handle_peer_test_msg2: malformed signed data");
+                return;
+            }
+        };
+        let Some(keys) = self.local.keys.clone() else {
+            warn!("handle_peer_test_msg2: no private keys; msg 3 is not signed");
+            return;
+        };
+        // Charlie сохраняет заголовок Алисы и подписывает его своим ключом
+        // (`bhash` = Боб, `ahash` = Алиса).
+        let data = match sign(
+            &keys,
+            bob.as_bytes(),
+            Some(&ahash),
+            signed.nonce,
+            signed.timestamp,
+            signed.endpoint,
+        ) {
+            Ok(signed) => signed.to_bytes(),
+            Err(error) => {
+                warn!(alice = %alice.to_base64(), %error, "handle_peer_test_msg2: signing failed");
+                return;
+            }
+        };
+        let mut code = Ssu2PeerTestCode::Accept;
+        let mut alice_intro_key = None;
+        match self.cached_ri(&alice) {
+            None => code = Ssu2PeerTestCode::CharlieAliceIsUnknown,
+            Some(alice_ri) => match signed.verify(alice_ri.identity(), bob.as_bytes(), None) {
+                Err(error) => {
+                    warn!(alice = %alice.to_base64(), %error, "handle_peer_test_msg2: Alice signature rejected");
+                    code = Ssu2PeerTestCode::CharlieSignatureFailure;
+                }
+                Ok(()) if self.by_ident.contains_key(&alice) => {
+                    code = Ssu2PeerTestCode::CharlieAliceIsAlreadyConnected;
+                }
+                Ok(()) => {
+                    let address = find_ssu2_address(&alice_ri, signed.endpoint.is_ipv6()).ok();
+                    if signed.endpoint.ip().is_unspecified()
+                        || signed.endpoint.port() == 0
+                        || address.is_none_or(|a| !a.is_peer_testing())
+                    {
+                        code = Ssu2PeerTestCode::CharlieUnsupportedAddress;
+                    } else if let Some(address) = address {
+                        alice_intro_key = Some(*address.i.as_bytes());
+                    }
+                }
+            },
+        }
+        if code == Ssu2PeerTestCode::Accept
+            && let Some(intro_key) = alice_intro_key
+        {
+            let now = now();
+            let mut session = PeerTestSession::new(PeerTestRole::Charlie, signed.nonce, now);
+            // i2pd шлёт msg 5 на endpoint, который Алиса указала в подписи.
+            session.remote = Some(signed.endpoint);
+            session.remote_ident = Some(alice);
+            session.remote_intro_key = Some(intro_key);
+            session.signed_data.clone_from(&data);
+            session.address_known = true;
+            let session_id = session.source;
+            self.peer_test_sessions.insert(session_id, session);
+            debug!(
+                alice = %alice.to_base64(),
+                nonce = signed.nonce,
+                endpoint = %signed.endpoint,
+                "handle_peer_test_msg2: sending msg 5 to Alice"
+            );
+            self.send_peer_test_session(session_id, 5, out);
+        }
+        let block3 = PeerTestBlock {
+            msg: 3,
+            code: code.as_u8(),
+            flag: 0,
+            router_hash: None,
+            data: &data,
+        };
+        self.send_peer_test(key, &block3, out);
+    }
+
+    /// `PeerTest` msg 3 (Боб от Charlie): пересылает Алисе msg 4 с RI
+    /// Charlie (`SSU2Session.cpp:2695-2718`).
+    fn handle_peer_test_msg3(
+        &mut self,
+        charlie: IdentHash,
+        key: ConnectionId,
+        block: &PeerTestBlock<'_>,
+        out: &mut OutQueue,
+    ) {
+        let signed = match PeerTestSignedData::parse(block.data) {
+            Ok(signed) => signed,
+            Err(error) => {
+                warn!(charlie = %charlie.to_base64(), %error, "handle_peer_test_msg3: malformed signed data");
+                return;
+            }
+        };
+        let Some(forwarded) = self.forwarded_peer_tests.remove(&signed.nonce) else {
+            debug!(
+                charlie = %charlie.to_base64(),
+                nonce = signed.nonce, "handle_peer_test_msg3: unknown nonce"
+            );
+            return;
+        };
+        let charlie_ri = self
+            .sessions
+            .get(&key)
+            .map_or_default(|session| session.remote_ri.clone());
+        let block4 = PeerTestBlock {
+            msg: 4,
+            code: block.code,
+            flag: 0,
+            router_hash: Some(*charlie.as_bytes()),
+            data: block.data,
+        };
+        let ri = (!charlie_ri.is_empty()).then_some(charlie_ri.as_slice());
+        debug!(
+            nonce = signed.nonce,
+            alice = ?forwarded.alice,
+            with_ri = ri.is_some(),
+            "handle_peer_test_msg3: forwarding msg 4 to Alice"
+        );
+        self.send_peer_test_with_ri(forwarded.alice, &block4, ri, out);
+    }
+
+    /// `PeerTest` msg 4 (Alice от Боба): проверяет подпись Charlie, берёт
+    /// его адрес/intro-ключ из RI и либо шлёт msg 6 сразу (msg 5 уже был),
+    /// либо планирует его с задержкой (`SSU2Session.cpp:2719-2800`).
+    fn handle_peer_test_msg4(
+        &mut self,
+        bob: IdentHash,
+        _key: ConnectionId,
+        block: &PeerTestBlock<'_>,
+        out: &mut OutQueue,
+    ) {
+        let signed = match PeerTestSignedData::parse(block.data) {
+            Ok(signed) => signed,
+            Err(error) => {
+                warn!(bob = %bob.to_base64(), %error, "handle_peer_test_msg4: malformed signed data");
+                return;
+            }
+        };
+        let Some(request) = self.requested_peer_tests.get(&signed.nonce).copied() else {
+            debug!(
+                bob = %bob.to_base64(),
+                nonce = signed.nonce, "handle_peer_test_msg4: unknown nonce"
+            );
+            return;
+        };
+        if block.code != Ssu2PeerTestCode::Accept.as_u8() {
+            warn!(
+                bob = %bob.to_base64(),
+                code = block.code, "handle_peer_test_msg4: Bob rejected peer test"
+            );
+            self.remove_peer_test_session(request.session);
+            return;
+        }
+        let Some(charlie_hash) = block.router_hash else {
+            warn!("handle_peer_test_msg4: router hash is missing");
+            self.remove_peer_test_session(request.session);
+            return;
+        };
+        let charlie = IdentHash::from_array(charlie_hash);
+        let Some(charlie_ri) = self.cached_ri(&charlie) else {
+            warn!(charlie = %charlie.to_base64(), "handle_peer_test_msg4: Charlie RI is unknown");
+            self.remove_peer_test_session(request.session);
+            return;
+        };
+        if let Err(error) = signed.verify(
+            charlie_ri.identity(),
+            bob.as_bytes(),
+            Some(self.local.ident.as_bytes()),
+        ) {
+            warn!(charlie = %charlie.to_base64(), %error, "handle_peer_test_msg4: Charlie signature rejected");
+            self.remove_peer_test_session(request.session);
+            return;
+        }
+        let address = find_ssu2_address(&charlie_ri, signed.endpoint.is_ipv6())
+            .ok()
+            .filter(|address| address.is_peer_testing() && is_reachable_address(address));
+        let Some(address) = address else {
+            warn!(charlie = %charlie.to_base64(), "handle_peer_test_msg4: Charlie has no usable SSU2 address");
+            self.remove_peer_test_session(request.session);
+            return;
+        };
+        let remote = SocketAddr::new(address.host, address.port);
+        let intro_key = *address.i.as_bytes();
+        let now = now();
+        let send_now = {
+            let Some(session) = self.peer_test_sessions.get_mut(&request.session) else {
+                return;
+            };
+            session.remote = Some(remote);
+            session.remote_intro_key = Some(intro_key);
+            session.remote_ident = Some(charlie);
+            session.signed_data = block.data.to_vec();
+            session.address_known = true;
+            if session.msg_received >= 5 {
+                session.msg_received == 5
+            } else {
+                let jitter = rand::rng().random::<u64>() % PEER_TEST_RESEND_VARIANCE_MS;
+                session.pending_msg = 6;
+                session.resend_at =
+                    Some(now + PEER_TEST_RESEND_INTERVAL + Duration::from_millis(jitter));
+                session.resends = 0;
+                false
+            }
+        };
+        debug!(
+            charlie = %charlie.to_base64(),
+            nonce = signed.nonce,
+            %remote,
+            send_now,
+            "handle_peer_test_msg4: Charlie accepted peer test"
+        );
+        if send_now {
+            self.send_peer_test_session(request.session, 6, out);
+        }
+    }
+
+    /// Out-of-session пакет `PeerTest` (msg 5–7). Ключ — наш `sourceConnID`,
+    /// расшифровка — своим intro-ключом (i2pd `SSU2PeerTestSession::
+    /// ProcessPeerTest`, `SSU2OutOfSession.cpp:36`).
+    fn handle_peer_test_packet(
+        &mut self,
+        packet: &mut [u8],
+        dest: ConnectionId,
+        from: SocketAddr,
+        out: &mut OutQueue,
+    ) {
+        let intro_key = *self.local.intro_key();
+        let opened = match open_packet(&intro_key, packet) {
+            Ok(opened) => opened,
+            Err(error) => {
+                warn!(%from, %error, "handle_peer_test_packet: cannot open packet");
+                return;
+            }
+        };
+        if opened.dest != dest {
+            warn!(%from, "handle_peer_test_packet: destConnID mismatch");
+            return;
+        }
+        let Some(session) = self.peer_test_sessions.get(&dest) else {
+            return;
+        };
+        let expected_source = session.dest;
+        let expected_nonce = session.nonce;
+        if opened.source != expected_source {
+            warn!(%from, "handle_peer_test_packet: sourceConnID mismatch");
+            return;
+        }
+        let payload = parse_payload(&opened.payload);
+        let Some(peer_test) = payload.peer_test else {
+            warn!(%from, "handle_peer_test_packet: PeerTest block is missing");
+            return;
+        };
+        let signed = match PeerTestSignedData::parse(&peer_test.data) {
+            Ok(signed) => signed,
+            Err(error) => {
+                warn!(%from, %error, "handle_peer_test_packet: malformed signed data");
+                return;
+            }
+        };
+        if signed.nonce != expected_nonce {
+            warn!(
+                %from,
+                nonce = signed.nonce,
+                expected_nonce, "handle_peer_test_packet: nonce mismatch"
+            );
+            return;
+        }
+        // i2pd `SSU2.cpp:733`: перед обработкой endpoint сессии заменяется
+        // на отправителя пакета.
+        if let Some(session) = self.peer_test_sessions.get_mut(&dest) {
+            session.remote = Some(from);
+        }
+        match peer_test.msg {
+            5 => self.handle_peer_test_msg5(dest, &peer_test, out),
+            6 => self.handle_peer_test_msg6(dest, payload.address, &peer_test, out),
+            7 => self.handle_peer_test_msg7(dest, payload.address),
+            msg => warn!(%from, msg, "handle_peer_test_packet: unexpected message"),
+        }
+    }
+
+    /// `PeerTest` msg 5 (Alice от Charlie): запоминает подпись Charlie и,
+    /// если адрес уже известен из msg 4, сразу отправляет msg 6.
+    fn handle_peer_test_msg5(
+        &mut self,
+        key: ConnectionId,
+        peer_test: &PeerTestMessage,
+        out: &mut OutQueue,
+    ) {
+        let send6 = {
+            let Some(session) = self.peer_test_sessions.get_mut(&key) else {
+                return;
+            };
+            if session.accept_msg(5) {
+                session.signed_data.clone_from(&peer_test.data);
+                session.address_known
+            } else {
+                false
+            }
+        };
+        if send6 {
+            self.send_peer_test_session(key, 6, out);
+        }
+    }
+
+    /// `PeerTest` msg 6 (Charlie от Alice): отвечает msg 7 с endpoint'ом
+    /// Алисы и закрывает out-of-session сессию.
+    fn handle_peer_test_msg6(
+        &mut self,
+        key: ConnectionId,
+        our_endpoint: Option<SocketAddr>,
+        peer_test: &PeerTestMessage,
+        out: &mut OutQueue,
+    ) {
+        let send7 = {
+            let Some(session) = self.peer_test_sessions.get_mut(&key) else {
+                return;
+            };
+            if session.accept_msg(6) {
+                session.our_endpoint = our_endpoint;
+                session.signed_data.clone_from(&peer_test.data);
+                true
+            } else {
+                false
+            }
+        };
+        if send7 {
+            self.send_peer_test_session(key, 7, out);
+            self.remove_peer_test_session(key);
+        }
+    }
+
+    /// `PeerTest` msg 7 (Alice от Charlie): тест завершён, сообщаем
+    /// наружу наш внешний endpoint.
+    fn handle_peer_test_msg7(&mut self, key: ConnectionId, our_endpoint: Option<SocketAddr>) {
+        let accepted = self
+            .peer_test_sessions
+            .get_mut(&key)
+            .is_some_and(|session| session.accept_msg(7));
+        if !accepted {
+            return;
+        }
+        if let Some(session) = self.peer_test_sessions.get_mut(&key) {
+            session.our_endpoint = our_endpoint;
+        }
+        let nonce = self
+            .peer_test_sessions
+            .get(&key)
+            .map(|session| session.nonce);
+        let bob = nonce.and_then(|nonce| self.requested_peer_tests.get(&nonce).map(|r| r.bob));
+        let charlie = self
+            .peer_test_sessions
+            .get(&key)
+            .and_then(|session| session.remote_ident);
+        if let Some(bob) = bob {
+            debug!(
+                bob = %bob.to_base64(),
+                ?charlie,
+                ?our_endpoint,
+                "handle_peer_test_msg7: peer test finished"
+            );
+            self.emit(Ssu2Event::PeerTestResult {
+                bob,
+                charlie,
+                addr: our_endpoint,
+            });
+        }
+        self.remove_peer_test_session(key);
+    }
+
+    /// Отправляет/повторяет msg 5–7 out-of-session сессии.
+    fn send_peer_test_session(&mut self, key: ConnectionId, msg: u8, out: &mut OutQueue) {
+        let now = now();
+        let (_, now_secs) = unix_now();
+        let mut rng = rand::rng();
+        let jitter = rng.random::<u64>() % PEER_TEST_RESEND_VARIANCE_MS;
+        let Some(session) = self.peer_test_sessions.get(&key) else {
+            return;
+        };
+        let Some(remote) = session.remote else {
+            warn!(conn_id = ?key, msg, "send_peer_test_session: no remote endpoint");
+            return;
+        };
+        let Some(intro_key) = session.remote_intro_key else {
+            warn!(conn_id = ?key, msg, "send_peer_test_session: no intro key");
+            return;
+        };
+        // Блок `Address` есть только в msg 6/7 (i2pd `SendPeerTest`).
+        let address = (msg == 6 || msg == 7).then_some(remote);
+        let packet = PeerTestPacket {
+            intro_key: &intro_key,
+            dest: session.dest,
+            source: session.source,
+            msg,
+            signed_data: &session.signed_data,
+            address,
+            packet_num: rng.random(),
+            net_id: self.local.net_id,
+            timestamp_secs: now_secs,
+            max_payload: Ssu2Local::max_payload(remote.is_ipv6()),
+        };
+        match build_packet(&packet) {
+            Ok(bytes) => {
+                out.push((remote, bytes));
+                if let Some(session) = self.peer_test_sessions.get_mut(&key) {
+                    session.pending_msg = msg;
+                    session.sent(now, jitter);
+                }
+            }
+            Err(error) => {
+                warn!(%error, conn_id = ?key, msg, "send_peer_test_session: failed");
+            }
+        }
+    }
+
+    /// Тик `PeerTest`: повторы msg 5/6, истечение сессий и записей Боба/Алисы.
+    fn tick_peer_tests(&mut self, now: Duration, out: &mut OutQueue) {
+        let due: Vec<(ConnectionId, u8)> = self
+            .peer_test_sessions
+            .iter()
+            .filter(|(_, session)| session.pending_msg != 0 && session.resend_due(now))
+            .map(|(key, session)| (*key, session.pending_msg))
+            .collect();
+        for (key, msg) in due {
+            self.send_peer_test_session(key, msg, out);
+        }
+        let expired: Vec<ConnectionId> = self
+            .peer_test_sessions
+            .iter()
+            .filter(|(_, session)| session.is_expired(now))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expired {
+            debug!(conn_id = ?key, "tick_peer_tests: session expired");
+            self.remove_peer_test_session(key);
+        }
+        self.forwarded_peer_tests
+            .retain(|_, entry| now.saturating_sub(entry.created) < PEER_TEST_EXPIRATION);
+        self.requested_peer_tests
+            .retain(|_, entry| now.saturating_sub(entry.created) < PEER_TEST_EXPIRATION);
+    }
+
+    /// Убирает out-of-session сессию и связанную запись Алисы.
+    fn remove_peer_test_session(&mut self, key: ConnectionId) {
+        self.peer_test_sessions.remove(&key);
+        self.requested_peer_tests
+            .retain(|_, entry| entry.session != key);
+    }
+
+    /// Наш опубликованный SSU2-endpoint нужного семейства (для подписи
+    /// msg 1, i2pd `FindLocalAddress`).
+    fn own_peer_test_endpoint(&self, ipv6: bool) -> Result<SocketAddr> {
+        let ri = FullRouterInfo::from_buffer(&self.local.ri_bytes)?;
+        let address = find_ssu2_address(&ri, ipv6)?;
+        if !is_reachable_address(address) {
+            return Err(I2PError::Malformed(
+                "ssu2 pool: local SSU2 address is not published",
+            ));
+        }
+        Ok(SocketAddr::new(address.host, address.port))
+    }
+
+    /// `RouterInfo` из кеша по хешу.
+    fn cached_ri(&self, ident: &IdentHash) -> Option<FullRouterInfo> {
+        let bytes = self.ri_cache.get(ident)?;
+        FullRouterInfo::from_buffer(bytes).ok()
+    }
+
+    /// Выбирает Charlie для Алисы: установленная сессия, поддержка peer
+    /// test, версия ≥ 0.9.62, не сама Алиса (`SSU2.cpp:601`).
+    fn select_charlie(&self, alice: &IdentHash, ipv6: bool) -> Option<ConnectionId> {
+        self.sessions.iter().find_map(|(key, session)| {
+            let ident = session.ident?;
+            if !session.established || ident == *alice {
+                return None;
+            }
+            let ri = FullRouterInfo::from_buffer(&session.remote_ri).ok()?;
+            peer_test_route(&ri, ipv6).map(|()| *key)
+        })
     }
 
     /// Отправляет `Peer Test`-блок в указанную сессию (i2pd `SendData`).
     fn send_peer_test(&mut self, key: ConnectionId, block: &PeerTestBlock<'_>, out: &mut OutQueue) {
+        self.send_peer_test_with_ri(key, block, None, out);
+    }
+
+    /// То же, но с блоком `RouterInfo` перед `PeerTest` (msg 2/4 в i2pd
+    /// пересылают RI Алисы/Charlie).
+    fn send_peer_test_with_ri(
+        &mut self,
+        key: ConnectionId,
+        block: &PeerTestBlock<'_>,
+        router_info: Option<&[u8]>,
+        out: &mut OutQueue,
+    ) {
         let now = now();
         let (now_ms, _) = unix_now();
         let now_micros = micros(now);
@@ -1912,9 +2628,9 @@ impl PoolState {
             now_micros,
             rng: &mut rng,
         };
-        match data.send_peer_test(&policy, &mut ctx, block) {
+        match data.send_peer_test_with_router_info(&policy, &mut ctx, block, router_info) {
             Ok(packet) => out.push((remote, packet)),
-            Err(error) => warn!(%error, "send_peer_test: failed"),
+            Err(error) => warn!(%error, "send_peer_test_with_ri: failed"),
         }
     }
 
@@ -2274,6 +2990,35 @@ fn find_ssu2_address(ri: &FullRouterInfo, prefer_v6: bool) -> Result<&I2PAddress
 /// Можно ли подключаться по этому адресу: опубликован, с хостом и портом.
 const fn is_reachable_address(addr: &I2PAddress) -> bool {
     addr.published && !addr.host.is_unspecified() && addr.port != 0
+}
+
+/// Подходит ли `RouterInfo` для роли Charlie: есть SSU2-адрес семейства
+/// `ipv6` с флагом `SSU_TESTING` и версия ≥ 0.9.62
+/// (i2pd `GetRandomPeerTestSession`, `SSU2.cpp:601`).
+fn peer_test_route(ri: &FullRouterInfo, ipv6: bool) -> Option<()> {
+    let address = find_ssu2_address(ri, ipv6).ok()?;
+    if !address.is_peer_testing() {
+        return None;
+    }
+    let version = ri.body().get_property(ROUTER_INFO_PROPERTY_VERSION)?;
+    (parse_version_property(version)? >= PEER_TEST_MIN_VERSION).then_some(())
+}
+
+/// Версия из свойства `router.version` так же, как её читает i2pd
+/// (`RouterInfo.cpp:457`): все цифры подряд, нецифры пропускаются
+/// («0.9.62» → 962).
+fn parse_version_property(value: &[u8]) -> Option<u32> {
+    let mut version = 0u32;
+    let mut seen = false;
+    for byte in value.iter().copied() {
+        if byte.is_ascii_digit() {
+            version = version
+                .checked_mul(10)?
+                .checked_add(u32::from(byte - b'0'))?;
+            seen = true;
+        }
+    }
+    seen.then_some(version)
 }
 
 /// Текущее время — миллисекунды since epoch (как i2pd

@@ -1013,7 +1013,31 @@ impl Ssu2DataSession {
         ctx: &mut SendContext<'_, R>,
         block: &PeerTestBlock<'_>,
     ) -> crate::Result<Vec<u8>> {
+        self.send_peer_test_with_router_info(policy, ctx, block, None)
+    }
+
+    /// То же, но с блоком `RouterInfo` перед `PeerTest` — так i2pd пересылает
+    /// `RouterInfo` Алисы/Charlie в msg 2/4 (`SSU2Session.cpp:2584-2596`).
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки сериализации и шифрования.
+    pub fn send_peer_test_with_router_info<P: Ssu2Policy, R: RandomSource>(
+        &mut self,
+        policy: &P,
+        ctx: &mut SendContext<'_, R>,
+        block: &PeerTestBlock<'_>,
+        router_info: Option<&[u8]>,
+    ) -> crate::Result<Vec<u8>> {
         let mut payload = Vec::new();
+        if let Some(ri) = router_info {
+            RouterInfoBlock {
+                flags: 0,
+                frag: 1,
+                router_info: ri,
+            }
+            .write(&mut payload)?;
+        }
         block.write(&mut payload)?;
         let roll = padding_roll(ctx.rng, policy);
         let remaining = self.params.max_payload.saturating_sub(payload.len());
@@ -1024,6 +1048,7 @@ impl Ssu2DataSession {
         debug!(
             msg = block.msg,
             code = block.code,
+            router_info = router_info.is_some(),
             "send_peer_test: PeerTest sent"
         );
         self.send_data(&payload, 0, ctx.now, true)

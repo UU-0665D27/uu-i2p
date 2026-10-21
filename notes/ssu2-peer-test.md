@@ -41,69 +41,62 @@
   `SSU2OutOfSession.h:19-21` (3 с ± 2 с, максимум 3 повтора);
 - `AddConnectedRecently` — `SSU2.cpp:1130+`.
 
-## Что уже есть у нас
+## Что реализовано
 
-- `src/ssu2_peer_test.rs`: разбор/сборка подписанных данных, подпись и
-  проверка `PeerTestValidate` (EdDSA), IPv4/IPv6 endpoint, тесты
-  (`tests/ssu2_peer_test.rs`).
-- `PoolState::handle_peer_test`: дроп из неустановленной сессии
-  (как i2pd 3.0), разбор блока; msg 1 → `handle_peer_test_msg1`.
-- `handle_peer_test_msg1`: если другой установленной сессии нет —
-  msg 4 с `BobNoCharlieAvailable` и эхом подписанных данных Алисы.
-  Живой прогон: i2pd пишет `PeerTest msg=4 code=2` и
-  `Peer test 4 error code 2 from MmjO` (см. `router-live-i2pd.md`).
+- `src/ssu2_peer_test.rs`: подписанные данные (`PeerTestValidate`,
+  bhash/ahash, IPv4/IPv6), подпись/проверка, `PeerTestSession` (conn ID
+  из nonce, повторы, истечение) и сборка/разбор out-of-session пакета
+  (заголовок + `headerX` ChaCha20 + AEAD + `DateTime`/`Address`/
+  `PeerTest`/`Padding`). Тесты — `tests/ssu2_peer_test.rs`.
+- `Ssu2Local`: `keys: Option<I2PPrivateKeys>` (`with_private_keys`,
+  `from_router_config` берёт из `RouterConfig::keys()`); `I2PPrivateKeys`
+  теперь `Clone`.
+- `Session.remote_ri` + `PoolState.ri_cache`: RI собеседника хранится в
+  сессии, RI из блока кладётся в кеш **до** обработки PeerTest в том же
+  payload'е. Это закрывает msg 2/3/4.
+- Роли:
+  - Боб (msg 1): выбор Charlie (`SSU2_TESTING`, версия ≥ 0.9.62,
+    семейство из `asz`, не Алиса), `nonce → сессия Алисы`, msg 2 с RI
+    Алисы; нет Charlie — msg 4 с `BobNoCharlieAvailable`.
+  - Charlie (msg 2): проверка подписи Алисы по RI из кеша, подпись
+    `bhash = Боб`, `ahash = Алиса`, msg 3 Бобу, msg 5 Алисе на endpoint
+    из подписи.
+  - Боб (msg 3 → 4): RI Charlie + подпись, `router hash` = Charlie.
+  - Алиса (msg 4): проверка подписи Charlie (`ahash` = свой хеш), адрес
+    и intro-ключ Charlie из RI; msg 6 сразу, если msg 5 уже пришёл, иначе
+    с задержкой 3–5 с.
+  - Out-of-session msg 5/6/7: повторы 3 с ± 2 с (максимум 3), ответы
+    6/7 отменяют таймер, сессия живёт 60 с; msg 6/7 несут блок
+    `Address`. Результат — событие `Ssu2Event::PeerTestResult`
+    (`TransportEvent` в роутере), решение о статусе остаётся вызывающему
+    (шов сознательный: пул не знает про `RouterContext`).
+- Публичный запуск: `Ssu2Pool::start_peer_test(&IdentHash)` (роль Alice).
+- Проверка: `tests/ssu2_pool.rs::peer_test_between_three_pools` —
+  три наших пула A/B/C, весь путь msg 1 → 2 → 3 → 4 → 5 → 6 → 7,
+  включая out-of-session и проверку подписей. Плюс round-trip пакета
+  в `tests/ssu2_peer_test.rs`.
 
 ## Что осталось
 
-1. **RI собеседника в сессии.** Bob'у нужен `RouterInfo` Алисы для msg 2,
-   а Charlie — для проверки её подписи (в msg 2 он приходит блоком, но
-   его надо сохранить до обработки PeerTest). Сейчас пул отдаёт RI
-   наружу событием и не хранит. План: поле `remote_ri: Option<Vec<u8>>`
-   в `Session` (заполнять в `accept_remote_router_info` и в
-   `start_connect`) + маленький кеш `HashMap<IdentHash, Vec<u8>>` для
-   RI, пришедших блоком.
-2. **Ключи для подписи Charlie.** Нужен `I2PPrivateKeys` в `Ssu2Local`
-   (сейчас там только X25519/intro/RI) — добавить `keys` из
-   `RouterConfig::keys()`; `I2PPrivateKeys` сделать `Clone`.
-3. **Bob, msg 1 с Charlie.** Выбрать Charlie: установленная сессия,
-   семейство из `asz` Алисы, `SSU2_TESTING` в его RI, версия ≥ 0.9.62,
-   не Алиса. Запомнить `nonce → сессия Алисы` (60 с), отправить msg 2
-   с RI Алисы.
-4. **Charlie, msg 2.** Взять RI Алисы (блок в том же payload'е), проверить
-   подпись с `bhash` = Боб, подписать msg 3 (`bhash` = Боб,
-   `ahash` = Алиса), отправить msg 3; затем out-of-session msg 5
-   (см. п. 6). Коды ошибок: `CharlieAliceIsUnknown`,
-   `CharlieSignatureFailure`, `CharlieUnsupportedAddress`,
-   `CharlieAliceIsAlreadyConnected`.
-5. **Bob, msg 3 → msg 4.** По nonce найти сессию Алисы, переслать
-   подпись Charlie, приложить RI Charlie, `router hash` = Charlie.
-   Если сессия пропала — молча дропнуть (`Unknown peer test 3 nonce`).
-6. **Out-of-session msg 5–7.** Формат пакета:
-   - 16-байтовый заголовок: `destConnID (8)`, случайный `packetNum (4)`,
-     `type = PeerTest`, `ver = 2`, `netId`, `flag = 0`;
-   - обе половины заголовка XOR с `header_mask(intro_key, last-24/-12)`;
-   - 16 байт после заголовка: `sourceConnID (8) || 0 (8)`, зашифрованы
-     ChaCha20 с intro-ключом и нулевым nonce;
-   - payload — AEAD ChaCha20-Poly1305 с intro-ключом, nonce из
-     `packetNum`, AD = 32-байтовый заголовок; внутри `DateTime`,
-     `Address` (только msg 6/7), `PeerTest`, `Padding`;
-   - повторы msg 5/6 через 3 с ± 2 с, не больше 3 раз; ответы 6/7
-     отменяют таймер; сессия живёт 60 с.
-7. **Alice, msg 4.** Проверить подпись Charlie (`bhash` = Боб,
-   `ahash` = свой хеш), обновить `router status`/`error` по результату
-   msg 5–7; для этого нужен шов политики состояния роутера, которого
-   сейчас нет (пул не знает про `RouterContext`).
-8. **Тест без второго хоста.** Поднять три пула A/B/C: A↔B и C↔B;
-   A шлёт msg 1; B пересылает msg 2; C отвечает msg 3; B пересылает
-   msg 4; A проверяет подпись. Для этого нужен публичный способ
-   отправить PeerTest-блок из теста (сейчас есть только внутренние
-   ответы), например `Ssu2Pool::send_peer_test_block(ident, body)`.
-   Out-of-session 5–7 в такой тест не входят — их проверять отдельно.
+1. **Статус роутера по результату.** i2pd в msg 4/5/7 меняет
+   `RouterStatus`/`RouterError` (OK, Firewalled, SymmetricNAT). У нас
+   событие `PeerTestResult` только сообщает endpoint; политику (и публикацию
+   адреса) должен решать роутер. Отдельный шов `PeerTestPolicy` не заводили,
+   пока нет потребителя.
+2. **`IsConnectedRecently`.** i2pd не шлёт msg 5, если недавно был hole
+   punch; у нас это состояние не ведётся, поэтому Charlie всегда отвечает
+   msg 5. Для NAT-сценариев — TODO(`floodfill`/`suu2-pool-relay`).
+3. **Лимиты.** Нет счётчика одновременных PeerTest на роутер
+   (`BobLimitExceeded`/`CharlieLimitExceeded`); сейчас ограничение только
+   по таймауту 60 с.
+4. **Живой стенд.** С одним i2pd наблюдаема только ветка «Charlie нет»
+   (i2pd — и Alice, и единственный роутер; второго роутера для Charlie
+   нет). Полный сценарий проверяется тремя нашими пулами; живой
+   трёхроутерный стенд по-прежнему нужен для interop msg 5–7.
 
 ## Живой стенд
 
-С одним собеседником наблюдаем только ветку «Charlie нет»: i2pd —
-и Alice, и единственный роутер, поэтому `GetRandomPeerTestSession`
-выбирает только нас (Боба), а второго роутера для Charlie нет.
-Полный сценарий требует трёх роутеров, поэтому TODO(peer-test) закрывать
-нельзя — только держать код под тестами с фейками/тремя пулами.
+Запуск прежний: i2pd пишет `PeerTest msg=4 code=2` и
+`Peer test 4 error code 2 from ...` (см. `router-live-i2pd.md`) — это
+ветка «нет Charlie». Для полного теста нужны два внешних роутера или
+наши пулы A/B/C.

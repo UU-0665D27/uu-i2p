@@ -226,3 +226,30 @@ fn charlie_signature_is_reused_in_msg4() {
     msg4.verify(charlie.public(), &BHASH, Some(&AHASH))
         .expect("msg 4");
 }
+
+#[test]
+fn out_of_session_packet_roundtrip() {
+    let key = [7u8; 32];
+    let source = uu_i2p::ssu2_header::ConnectionId::new([1u8; 8]);
+    let dest = uu_i2p::ssu2_header::ConnectionId::new([2u8; 8]);
+    let signed = vec![9u8; 70];
+    let packet = uu_i2p::ssu2_peer_test::build_packet(&uu_i2p::ssu2_peer_test::PeerTestPacket {
+        intro_key: &key,
+        dest,
+        source,
+        msg: 5,
+        signed_data: &signed,
+        address: None,
+        packet_num: 0x1234_5678,
+        net_id: 2,
+        timestamp_secs: 1_700_000_000,
+        max_payload: 1452,
+    })
+    .expect("build");
+    let mut raw = packet;
+    let opened = uu_i2p::ssu2_peer_test::open_packet(&key, &mut raw).expect("open");
+    assert_eq!(opened.dest, dest);
+    assert_eq!(opened.source, source);
+    let payload = uu_i2p::ssu2_peer_test::parse_payload(&opened.payload);
+    assert_eq!(payload.peer_test.expect("block").msg, 5);
+}

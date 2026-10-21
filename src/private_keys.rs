@@ -44,7 +44,7 @@ use crate::{
 };
 
 /// Приватные ключи роутера или destination'а.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct I2PPrivateKeys {
     public: IdentityEx,
     crypto_private: Vec<u8>,

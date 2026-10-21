@@ -190,6 +190,15 @@ pub enum TransportEvent {
         /// Через какую сессию узнали.
         from: Option<IdentHash>,
     },
+    /// `PeerTest` завершён: Charlie прислал msg 7 и сообщил наш endpoint.
+    PeerTestResult {
+        /// Боб, через которого шёл тест.
+        bob: IdentHash,
+        /// Charlie (если известен).
+        charlie: Option<IdentHash>,
+        /// Наш endpoint по мнению Charlie.
+        addr: Option<SocketAddr>,
+    },
 }
 
 // --- трейт транспорта ----------------------------------------------------
@@ -296,6 +305,9 @@ impl TransportPool for Ssu2Pool {
                 Ssu2Event::Disconnected { ident } => TransportEvent::Disconnected { ident },
                 Ssu2Event::ExternalAddress { addr, from } => {
                     TransportEvent::ExternalAddress { addr, from }
+                }
+                Ssu2Event::PeerTestResult { bob, charlie, addr } => {
+                    TransportEvent::PeerTestResult { bob, charlie, addr }
                 }
             })
         })
@@ -1061,6 +1073,11 @@ impl Router {
             TransportEvent::ExternalAddress { addr, from } => {
                 let peer = from.map_or_else(|| "-".to_owned(), |i| i.to_base64());
                 debug!(transport = %kind, %addr, peer = %peer, "router: наш внешний адрес по мнению собеседника");
+            }
+            TransportEvent::PeerTestResult { bob, charlie, addr } => {
+                let bob = bob.to_base64();
+                let charlie = charlie.map_or_else(|| "-".to_owned(), |i| i.to_base64());
+                debug!(transport = %kind, %bob, %charlie, ?addr, "router: PeerTest завершён");
             }
         }
         Ok(())

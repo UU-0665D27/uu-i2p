@@ -101,7 +101,8 @@ async fn make_node_full(advertised_port: Option<u16>, ban: Option<Arc<BanList>>)
     let ri = FullRouterInfo::from_keys(&keys, body).expect("own RouterInfo");
     let ri_bytes = ri.to_buffer().expect("serialize own RouterInfo");
     let local = Ssu2Local::new(static_keys, intro, ri_bytes.clone(), DEFAULT_NET_ID, false)
-        .expect("Ssu2Local");
+        .expect("Ssu2Local")
+        .with_private_keys(keys);
     info!(
         %addr,
         published_port = port,
@@ -916,4 +917,108 @@ async fn path_challenge_without_response_keeps_endpoint() {
             "без `Path Response` трафик идёт на старый адрес (проба {probe})"
         );
     }
+}
+
+/// Полный `PeerTest` тремя нашими пулами: A (Alice) ↔ B (Bob) и C (Charlie)
+/// ↔ B. С одним i2pd видна только ветка «нет Charlie», поэтому здесь
+/// проверяется весь путь msg 1 → 2 → 3 → 4 → 5 → 6 → 7, включая
+/// out-of-session сообщения и подписи.
+#[tokio::test]
+async fn peer_test_between_three_pools() {
+    init_tracing();
+    let alice = make_node().await;
+    let bob = make_node().await;
+    let charlie = make_node().await;
+    let alice_ident = *alice.pool.ident();
+    let bob_ident = *bob.pool.ident();
+    let charlie_ident = *charlie.pool.ident();
+    assert_ne!(alice_ident, bob_ident);
+    assert_ne!(alice_ident, charlie_ident);
+    assert_ne!(bob_ident, charlie_ident);
+
+    let mut alice_events: Vec<Ssu2Event> = Vec::new();
+    let mut bob_events: Vec<Ssu2Event> = Vec::new();
+    let mut charlie_events: Vec<Ssu2Event> = Vec::new();
+
+    // --- A ↔ B -----------------------------------------------------------
+
+    alice.pool.connect(&bob.ri).await.expect("alice connect");
+    wait_event(
+        &alice.pool,
+        &mut alice_events,
+        "alice Established",
+        |e| matches!(e, Ssu2Event::Established { ident } if *ident == bob_ident),
+    )
+    .await;
+    // Боб должен знать RI Алисы: msg 2 несёт его Charlie.
+    wait_event(
+        &bob.pool,
+        &mut bob_events,
+        "bob got alice RI",
+        |e| matches!(e, Ssu2Event::RouterInfo { from, .. } if *from == alice_ident),
+    )
+    .await;
+
+    // --- C ↔ B -----------------------------------------------------------
+
+    charlie
+        .pool
+        .connect(&bob.ri)
+        .await
+        .expect("charlie connect");
+    wait_event(
+        &charlie.pool,
+        &mut charlie_events,
+        "charlie Established",
+        |e| matches!(e, Ssu2Event::Established { ident } if *ident == bob_ident),
+    )
+    .await;
+    wait_event(
+        &bob.pool,
+        &mut bob_events,
+        "bob got charlie RI",
+        |e| matches!(e, Ssu2Event::RouterInfo { from, .. } if *from == charlie_ident),
+    )
+    .await;
+    wait_event(
+        &bob.pool,
+        &mut bob_events,
+        "bob Established with charlie",
+        |e| matches!(e, Ssu2Event::Established { ident } if *ident == charlie_ident),
+    )
+    .await;
+
+    // --- A запускает PeerTest через B; Charlie выбирается автоматически --
+
+    alice
+        .pool
+        .start_peer_test(&bob_ident)
+        .await
+        .expect("start peer test");
+    let event = wait_event(
+        &alice.pool,
+        &mut alice_events,
+        "alice PeerTestResult",
+        |e| matches!(e, Ssu2Event::PeerTestResult { .. }),
+    )
+    .await;
+    match event {
+        Ssu2Event::PeerTestResult { bob, charlie, addr } => {
+            assert_eq!(bob, bob_ident, "peer test went through Bob");
+            assert_eq!(charlie, Some(charlie_ident), "Bob picked Charlie");
+            assert_eq!(addr, Some(alice.addr), "Charlie sees Alice's real address");
+        }
+        _ => unreachable!(),
+    }
+
+    // Сессия out-of-session закрыта после msg 7; data-сессии живы.
+    assert!(
+        alice
+            .pool
+            .session_idents()
+            .await
+            .expect("alice sessions")
+            .contains(&bob_ident),
+        "SSU2-сессия с Бобом не должна закрываться PeerTest'ом"
+    );
 }

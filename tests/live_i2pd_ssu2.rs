@@ -172,6 +172,9 @@ async fn connect_to_live_i2pd_ssu2_and_receive_router_info() {
             Ssu2Event::ExternalAddress { addr, .. } => {
                 info!("i2pd sees us as {addr}");
             }
+            Ssu2Event::PeerTestResult { addr, .. } => {
+                info!("PeerTest result: {addr:?}");
+            }
         }
     }
     assert!(established, "session never reached Established");
