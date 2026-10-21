@@ -2,6 +2,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use rand::Rng;
 use uu_i2p::error::I2PError;
 use uu_i2p::private_keys::I2PPrivateKeys;
 use uu_i2p::ssu2_peer_test::{PEER_TEST_PROLOGUE, PEER_TEST_VERSION, PeerTestSignedData, sign};
@@ -252,4 +253,23 @@ fn out_of_session_packet_roundtrip() {
     assert_eq!(opened.source, source);
     let payload = uu_i2p::ssu2_peer_test::parse_payload(&opened.payload);
     assert_eq!(payload.peer_test.expect("block").msg, 5);
+}
+
+/// Примитивный фаззинг разборщиков out-of-session пакета: случайные байты
+/// не должны паниковать (ошибка разбора — нормальный результат).
+#[test]
+fn out_of_session_packet_fuzz_smoke() {
+    let key = [3u8; 32];
+    let mut rng = rand::rng();
+    for len in 0..320usize {
+        for _ in 0..10 {
+            let mut packet = vec![0u8; len];
+            rng.fill_bytes(&mut packet);
+            let _ = uu_i2p::ssu2_peer_test::open_packet(&key, &mut packet);
+            let payload = vec![0u8; len];
+            let mut payload = payload;
+            rng.fill_bytes(&mut payload);
+            let _ = uu_i2p::ssu2_peer_test::parse_payload(&payload);
+        }
+    }
 }
