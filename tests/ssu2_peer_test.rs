@@ -238,9 +238,9 @@ fn out_of_session_packet_roundtrip() {
         intro_key: &key,
         dest,
         source,
-        msg: 5,
+        msg: 6,
         signed_data: &signed,
-        address: None,
+        address: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345)),
         packet_num: 0x1234_5678,
         net_id: 2,
         timestamp_secs: 1_700_000_000,
@@ -252,7 +252,11 @@ fn out_of_session_packet_roundtrip() {
     assert_eq!(opened.dest, dest);
     assert_eq!(opened.source, source);
     let payload = uu_i2p::ssu2_peer_test::parse_payload(&opened.payload);
-    assert_eq!(payload.peer_test.expect("block").msg, 5);
+    assert_eq!(payload.peer_test.expect("block").msg, 6);
+    assert_eq!(
+        payload.address,
+        Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345))
+    );
 }
 
 /// Примитивный фаззинг разборщиков out-of-session пакета: случайные байты
@@ -272,4 +276,39 @@ fn out_of_session_packet_fuzz_smoke() {
             let _ = uu_i2p::ssu2_peer_test::parse_payload(&payload);
         }
     }
+}
+
+/// Conn ID из nonce и таймеры out-of-session сессии.
+#[test]
+fn peer_test_session_ids_and_timers() {
+    use std::time::Duration;
+    use uu_i2p::ssu2_peer_test::{
+        PEER_TEST_EXPIRATION, PEER_TEST_MAX_RESENDS, PEER_TEST_RESEND_INTERVAL, PeerTestRole,
+        PeerTestSession,
+    };
+
+    let now = Duration::from_secs(1_000_000);
+    let alice = PeerTestSession::new(PeerTestRole::Alice, 0xdead_beef, now);
+    let charlie = PeerTestSession::new(PeerTestRole::Charlie, 0xdead_beef, now);
+    assert_eq!(alice.source, charlie.dest);
+    assert_eq!(alice.dest, charlie.source);
+    assert_ne!(alice.source, alice.dest);
+    assert_eq!(alice.expires_at, now + PEER_TEST_EXPIRATION);
+    assert!(!alice.is_expired(now));
+    assert!(alice.is_expired(now + PEER_TEST_EXPIRATION));
+
+    let mut session = alice;
+    session.schedule(6, now, 0);
+    assert!(session.resend_due(now + PEER_TEST_RESEND_INTERVAL));
+    assert!(!session.resend_due(now));
+    for _ in 0..PEER_TEST_MAX_RESENDS {
+        session.sent(now, 0);
+    }
+    assert_eq!(session.resends, PEER_TEST_MAX_RESENDS);
+    assert!(session.resend_at.is_none(), "после лимита повторов нет");
+
+    assert!(session.accept_msg(5));
+    assert!(!session.accept_msg(5));
+    assert!(!session.accept_msg(4));
+    assert!(session.accept_msg(6));
 }
