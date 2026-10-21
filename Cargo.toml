@@ -7,7 +7,7 @@ edition = "2024"
 #anyhow = "1.0.104"
 rand = "0.10"
 sha2 = "0.11.1"
-tokio = { version = "1.53.3", features = ["full"] }
+tokio = { version = "1.54.0", features = ["full"] }
 
 # RustCrypto: чистый Rust, без системного OpenSSL
 chacha20 = "0.10"
