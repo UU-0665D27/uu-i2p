@@ -183,7 +183,7 @@ impl SendState {
 
     /// Число неподтверждённых пакетов.
     #[must_use]
-    pub fn in_flight(&self) -> usize {
+    pub const fn in_flight(&self) -> usize {
         self.sent.len()
     }
 

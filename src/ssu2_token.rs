@@ -146,13 +146,13 @@ impl TokenStore {
 
     /// Сколько входящих токенов помним.
     #[must_use]
-    pub fn incoming_len(&self) -> usize {
+    pub const fn incoming_len(&self) -> usize {
         self.incoming.len()
     }
 
     /// Сколько исходящих токенов помним.
     #[must_use]
-    pub fn outgoing_len(&self) -> usize {
+    pub const fn outgoing_len(&self) -> usize {
         self.outgoing.len()
     }
 

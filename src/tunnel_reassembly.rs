@@ -328,7 +328,7 @@ impl FragmentReassembler {
 
     /// Сколько сообщений ждут выдачи.
     #[must_use]
-    pub fn ready_len(&self) -> usize {
+    pub const fn ready_len(&self) -> usize {
         self.ready.len()
     }
 

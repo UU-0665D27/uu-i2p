@@ -436,7 +436,7 @@ impl Ssu2DataSession {
 
     /// Длина очереди отправки (`m_SendQueue.size ()`).
     #[must_use]
-    pub fn queue_len(&self) -> usize {
+    pub const fn queue_len(&self) -> usize {
         self.out_queue.len()
     }
 
