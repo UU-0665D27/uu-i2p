@@ -1,0 +1,103 @@
+diff --git a/daemon/UnixDaemon.cpp b/daemon/UnixDaemon.cpp
+index 47ad2041..b069ec94 100644
+--- a/daemon/UnixDaemon.cpp
++++ b/daemon/UnixDaemon.cpp
+@@ -28,6 +28,77 @@
+ #include "Transports.h"
+ #include "util.h"
+ 
++
++
++
++//
++
++
++
++
++
++
++
++
++
++
++#include <boost/stacktrace.hpp>
++#include <iostream>
++#include <cstdlib> // для abort()
++
++// Объявление функции, которую мы переопределяем.
++// Сигнатура должна в точности соответствовать определению в libstdc++.
++namespace std {
++    // Атрибут noexcept обязателен, как в оригинале.
++    // _GLIBCXX_NORETURN также подразумевается, так как функция не должна возвращать управление.
++    void __glibcxx_assert_fail(const char* __file, int __line,
++                               const char* __function, const char* __condition) noexcept {
++        // 1. Выводим информацию о сработавшем ассерте.
++        std::cerr << "libstdc++ assert failed: " << __condition << "\n"
++                  << "  in function: " << __function << "\n"
++                  << "  at file: " << __file << ":" << __line << std::endl;
++
++        // 2. Выводим полный стектрейс с помощью Boost.Stacktrace.
++        std::cerr << "Stack trace:\n" << boost::stacktrace::stacktrace() << std::endl;
++
++        // 3. Завершаем программу (аналог abort()).
++        std::abort();
++    }
++} // namespace std
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++//
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+ const int GRACEFUL_SHUTDOWN_INTERVAL = 10*60; // in seconds
+ 
+ // a handler may only touch volatile sig_atomic_t, everything else is done by the daemon loop
+@@ -81,6 +152,9 @@ static void HandlePendingSignals()
+ 			case SIGCONT:
+ 				LogPrint(eLogInfo, "Daemon: Got SIGCONT, restoring connection to network...");
+ 				i2p::transport::transports.SetOnline(true);
++			case SIGUSR2:
++
++			break;
+ 			break;
+ 		}
+ 	}
+@@ -223,6 +297,10 @@ namespace i2p
+ 			sigaction(SIGTERM, &sa, 0);
+ 			sigaction(SIGINT, &sa, 0);
+ 			sigaction(SIGPIPE, &sa, 0);
++
++			#ifdef SSU2_ACK_OVERFLOW_POC
++    			sigaction(SIGUSR2, &sa, 0);
++			#endif
+ 			if (handleTSTP)
+ 			{
+ 				sigaction(SIGTSTP, &sa, 0);
