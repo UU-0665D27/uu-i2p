@@ -25,6 +25,11 @@
 //!   проверкой `IsUnreachable` и `MAX_NUM_ROUTERS`. У нас — без
 //!   лимита, но есть [`NetDb::retain`], чтобы caller мог чистить
 //!   вручную по своему критерию.
+//! - **Недостижимость по профилю пира**: i2pd помечает RI недостижимым,
+//!   если профиль пира это говорит (`NetDb::SetUnreachable`,
+//!   `NetDb.cpp:704`), и снимает флаг на обновлении RI. У нас профилей
+//!   нет, поэтому признак считается из самого RI
+//!   ([`RouterInfo::is_unreachable`]); см. [`Reachability`].
 //! - **Floodfill-подмножество**: отдельного индекса нет, `floodfills()`
 //!   фильтрует по `is_floodfill()`. Когда floodfill'ов станет много,
 //!   можно добавить отдельный `HashSet` — сейчас преждевременно.
@@ -32,9 +37,83 @@
 //!   только хранилище; логика поиска — в `RouterContext` (шаг 3a-3).
 
 use crate::IdentHash;
+use crate::config::DEFAULT_NET_ID;
 use crate::router_info::FullRouterInfo;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+/// Политика «этот RI недостижим» для выбора из netDb.
+///
+/// Шов для решения, которое i2pd принимает флагом
+/// `RouterInfo::m_IsUnreachable`. У i2pd флаг выставляется в трёх
+/// местах: при разборе RI (`RouterInfo.cpp:508`), по профилю пира
+/// (`NetDb.cpp:704`) и снимается на обновлении (`RouterInfo.cpp:100`).
+/// У нас RI неизменяем, поэтому политика — отдельный объект, а не флаг
+/// в записи.
+///
+/// Дефолт — [`I2pdReachability`]: правила из `RouterInfo::ReadFromBuffer`.
+/// [`AcceptAllReachability`] нужен там, где RI синтетический (тесты,
+/// подделки) и адресов заведомо нет.
+pub trait Reachability: std::fmt::Debug + Send + Sync {
+    /// Считать ли `ri` недостижимым (не отдавать в `DatabaseLookup`,
+    /// не выбирать флудфиллом, не слать ему запросы).
+    fn is_unreachable(&self, ri: &FullRouterInfo) -> bool;
+}
+
+/// Правила i2pd: нет валидных адресов, чужой/отсутствующий `netId`
+/// или нет `router.version` → RI недостижим.
+///
+/// См. [`crate::router_info::RouterInfo::is_unreachable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct I2pdReachability {
+    net_id: i32,
+}
+
+impl I2pdReachability {
+    /// Политика для сети `net_id`.
+    #[must_use]
+    pub const fn new(net_id: i32) -> Self {
+        Self { net_id }
+    }
+
+    /// Политика для сети по умолчанию ([`DEFAULT_NET_ID`]).
+    #[must_use]
+    pub const fn for_default_network() -> Self {
+        Self::new(DEFAULT_NET_ID as i32)
+    }
+
+    /// `netId`, по которому проверяются RI.
+    #[must_use]
+    pub const fn net_id(self) -> i32 {
+        self.net_id
+    }
+}
+
+impl Default for I2pdReachability {
+    fn default() -> Self {
+        Self::for_default_network()
+    }
+}
+
+impl Reachability for I2pdReachability {
+    fn is_unreachable(&self, ri: &FullRouterInfo) -> bool {
+        ri.is_unreachable(self.net_id)
+    }
+}
+
+/// Политика «все достижимы»: фильтра нет.
+///
+/// Нужна для тестов и для хранилищ, собранных из поддельных RI без
+/// адресов — иначе такие записи не участвуют ни в выборе флудфиллов,
+/// ни в ответах на `DatabaseLookup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AcceptAllReachability;
+
+impl Reachability for AcceptAllReachability {
+    fn is_unreachable(&self, _ri: &FullRouterInfo) -> bool {
+        false
+    }
+}
 
 /// Минимальный срок годности `RouterInfo` (`NETDB_MIN_EXPIRATION_TIMEOUT`):
 /// RI старше этого с момента `timestamp` не принимается.
@@ -63,18 +142,56 @@ pub const NETDB_MIN_ALLOWED_VERSION: u32 = 957;
 /// - В мапе для каждого `IdentHash` лежит ровно один RI — при
 ///   добавлении более новой версии старая заменяется;
 /// - Порядок итерации не гарантирован (это `HashMap`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NetDb {
     entries: HashMap<IdentHash, FullRouterInfo>,
+    reachability: Box<dyn Reachability>,
+}
+
+impl Default for NetDb {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NetDb {
-    /// Создаёт пустое хранилище.
+    /// Создаёт пустое хранилище с правилами достижимости i2pd
+    /// ([`I2pdReachability`] для [`DEFAULT_NET_ID`]).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_reachability(I2pdReachability::for_default_network())
+    }
+
+    /// Пустое хранилище с явной политикой достижимости.
+    #[must_use]
+    pub fn with_reachability(reachability: impl Reachability + 'static) -> Self {
         Self {
             entries: HashMap::new(),
+            reachability: Box::new(reachability),
         }
+    }
+
+    /// Пустое хранилище для сети `net_id`.
+    #[must_use]
+    pub fn with_net_id(net_id: i32) -> Self {
+        Self::with_reachability(I2pdReachability::new(net_id))
+    }
+
+    /// Достижим ли RI: `!reachability.is_unreachable (ri)`.
+    #[must_use]
+    pub fn is_reachable(&self, ri: &FullRouterInfo) -> bool {
+        !self.reachability.is_unreachable(ri)
+    }
+
+    /// Есть ли в хранилище RI с таким `IdentHash`, и если есть —
+    /// недостижим ли он.
+    ///
+    /// `None` — записи нет.
+    #[must_use]
+    pub fn unreachable(&self, ident: &IdentHash) -> Option<bool> {
+        self.entries
+            .get(ident)
+            .map(|ri| self.reachability.is_unreachable(ri))
     }
 
     /// Количество роутеров в хранилище.
@@ -107,6 +224,14 @@ impl NetDb {
     /// Сравнение по timestamp, а не по байтам: в I2P timestamp
     /// монотонно растёт при каждой публикации, а байты могут отличаться
     /// от порядка полей в `RouterInfo` (см. i2pd `RouterInfo::IsNewer`).
+    ///
+    /// Недостижимые RI тоже принимаются: в i2pd новая запись с
+    /// `IsUnreachable`/без валидных адресов не попадает в netDb вообще
+    /// (`NetDb.cpp:315`), а обновление существующей — выкидывает её
+    /// (`NetDb.cpp:272`). У нас проверка живёт в выборе
+    /// ([`Self::is_reachable`]), чтобы вызывающий мог посмотреть, что
+    /// именно отвергнуто; — TODO(floodfill): повторить и отказ на
+    /// вставке, когда все источники RI будут давать валидные адреса.
     pub fn insert(&mut self, ri: FullRouterInfo) -> bool {
         let ident = *ri.ident_hash();
         if let Some(existing) = self.entries.get_mut(&ident) {
@@ -226,6 +351,12 @@ impl NetDb {
     /// попавшие в `excluded`, не участвуют в выборе, поэтому в
     /// результат попадают именно `n` следующих по расстоянию (если
     /// они есть), а не «n минус исключённые».
+    ///
+    /// Недостижимые RI (по политике [`Self::is_reachable`]) и RI без
+    /// валидных адресов **пропускаются**: i2pd в
+    /// `GetClosestFloodfill` проверяет `!IsUnreachable () &&
+    /// HasValidAddresses ()` (`NetDb.cpp:537`), иначе выбрал бы
+    /// флудфиллом того, до кого нельзя достучаться.
     #[must_use]
     pub fn closest_floodfills_excluding(
         &self,
@@ -234,14 +365,18 @@ impl NetDb {
         excluded: &HashSet<IdentHash>,
     ) -> Vec<&FullRouterInfo> {
         self.closest_to(target, n, |ri| {
-            ri.body().caps.is_floodfill() && !excluded.contains(ri.ident_hash())
+            ri.body().caps.is_floodfill() && !excluded.contains(ri.ident_hash()) && self.is_reachable(ri)
         })
     }
 
-    /// `n` ближайших роутеров к `target` без фильтра.
+    /// `n` ближайших роутеров к `target` без фильтра по caps.
+    ///
+    /// Недостижимые RI пропускаются — как `NetDb::FindRandomRouter` /
+    /// обход `m_RouterInfos` в i2pd (`NetDb.cpp:704`), которые
+    /// отбрасывают `IsUnreachable` и неполные RI.
     #[must_use]
     pub fn closest_routers(&self, target: &IdentHash, n: usize) -> Vec<&FullRouterInfo> {
-        self.closest_to(target, n, |_| true)
+        self.closest_to(target, n, |ri| self.is_reachable(ri))
     }
 }
 

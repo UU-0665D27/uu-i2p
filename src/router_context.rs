@@ -478,12 +478,15 @@ impl RouterContext {
     pub fn new(config: RouterConfig) -> Result<Self> {
         let own_ri = config.build_router_info(now_ms())?;
         let ecies = EciesGarlicDestination::new(Self::ecies_static(&config)?);
+        // Достижимость RI проверяется по нашей сети: i2pd сравнивает
+        // `netId` из RI с `context.GetNetID ()` (`RouterInfo.cpp:508`).
+        let netdb = NetDb::with_net_id(i32::from(config.net_id()));
 
         Ok(Self {
             config,
             netdb_requests: NetDbRequests::new(),
             own_ri,
-            netdb: NetDb::new(),
+            netdb,
             lsdb: Lsdb::new(),
             ecies,
         })
@@ -889,14 +892,18 @@ impl RouterContext {
         // RI-ветка (`RouterInfo` и `Normal`) — как i2pd: отвечаем
         // и не-флудфилл.
         //
-        // TODO(floodfill): не отдавать RI, помеченные недостижимыми
-        // (i2pd рядом проверяет `!router->IsUnreachable ()`). У `NetDb`
-        // пока нет учёта достижимости (`NetDb.cpp:1018`,
-        // `IsUnreachable` ставится по профилю пира).
+        // Недостижимые RI не отдаём: i2pd рядом проверяет
+        // `!router->IsUnreachable ()` (`NetDb.cpp:1018`), поэтому такой
+        // запрос проваливается в LeaseSet-ветку и получает
+        // `DatabaseSearchReply`. Признак считается по политике netDb:
+        // нет валидных адресов / чужой `netId` / нет `router.version`.
+        // Проверка по профилю пира (`NetDb.cpp:704`) пока не портирована
+        // — профилей у нас нет.
         if matches!(
             lookup.lookup_type,
             LookupType::RouterInfo | LookupType::Normal
         ) && let Some(ri) = self.netdb.get(&lookup.key)
+            && self.netdb.is_reachable(ri)
         {
             let ri_bytes = ri.to_buffer()?;
             let ds = DatabaseStore::new_router_info(lookup.key, &ri_bytes, 0, None)?;
@@ -1060,6 +1067,11 @@ impl RouterContext {
     /// расписанию. У нас пока netdb небольшой — делаем напрямую
     /// через `closest_to` с фильтром. Когда роутеров станет много,
     /// переделаем по образцу i2pd.
+    ///
+    /// Недостижимые RI в ответ не попадают: отдавать пиру хеш роутера,
+    /// до которого нельзя достучаться, бессмысленно (в i2pd
+    /// `m_ExploratorySelection` тоже наполняется только из
+    /// `m_RouterInfos`, прошедших проверку при вставке).
     fn exploratory_non_floodfills(
         &self,
         target: &IdentHash,
@@ -1067,7 +1079,7 @@ impl RouterContext {
     ) -> Vec<IdentHash> {
         self.netdb
             .closest_to(target, Self::LOOKUP_REPLY_PEER_COUNT, |ri| {
-                !ri.body().caps.is_floodfill()
+                !ri.body().caps.is_floodfill() && self.netdb.is_reachable(ri)
             })
             .into_iter()
             .filter(|ri| !excluded.contains(ri.ident_hash()))

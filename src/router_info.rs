@@ -31,7 +31,9 @@ use crate::{
     error::{I2PError, Result},
     identity::IdentityEx,
     private_keys::I2PPrivateKeys,
-    router_info_address::{I2PAddress, Introducer, SsuExt, TransportStyle, caps as addr_caps},
+    router_info_address::{
+        CompatibleTransports, I2PAddress, Introducer, SsuExt, TransportStyle, caps as addr_caps,
+    },
 };
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -888,6 +890,70 @@ impl RouterInfo {
         self.caps.is_hidden()
     }
 
+    /// Маска транспортов, которыми роутер в принципе достижим.
+    ///
+    /// Объединение [`I2PAddress::supported_transports`] по всем адресам —
+    /// как `m_SupportedTransports` в i2pd (`RouterInfo.cpp:412`).
+    #[must_use]
+    pub fn supported_transports(&self) -> CompatibleTransports {
+        self.addresses.iter().fold(
+            CompatibleTransports::NONE,
+            |acc, addr| acc | addr.supported_transports(),
+        )
+    }
+
+    /// Маска транспортов, опубликованных в этом RI
+    /// (`m_PublishedTransports`).
+    #[must_use]
+    pub fn published_transports(&self) -> CompatibleTransports {
+        self.addresses.iter().fold(
+            CompatibleTransports::NONE,
+            |acc, addr| acc | addr.published_transports(),
+        )
+    }
+
+    /// Маска транспортов, которыми роутер реально достижим
+    /// (`m_ReachableTransports`): публикация или introducer'ы.
+    #[must_use]
+    pub fn reachable_transports(&self) -> CompatibleTransports {
+        self.addresses.iter().fold(
+            CompatibleTransports::NONE,
+            |acc, addr| acc | addr.reachable_transports(),
+        )
+    }
+
+    /// Есть ли хоть один адрес с рабочим транспортом
+    /// (`RouterInfo::HasValidAddresses` = `m_SupportedTransports != 0`).
+    #[must_use]
+    pub fn has_valid_addresses(&self) -> bool {
+        !self.supported_transports().is_empty()
+    }
+
+    /// Недостижим ли RI для нашей сети.
+    ///
+    /// Порт хвоста `RouterInfo::ReadFromBuffer`
+    /// (`RouterInfo.cpp:508`):
+    ///
+    /// ```text
+    ///   if (!m_SupportedTransports || !isNetId || !m_Version) SetUnreachable (true);
+    /// ```
+    ///
+    /// то есть RI недостижим, если у него нет ни одного валидного адреса,
+    /// `netId` отсутствует/не наш или нет `router.version` (`0` в i2pd
+    /// тоже ложь). Проверка `netId` идёт по нашей сети, поэтому `net_id`
+    /// — параметр.
+    ///
+    /// В i2pd это **флаг**, который ещё и меняется по профилю пира
+    /// (`NetDb::SetUnreachable`, `NetDb.cpp:704`) и на обновлении RI.
+    /// У нас флаг не хранится: RI неизменяем после разбора, так что
+    /// признак считается из данных.
+    #[must_use]
+    pub fn is_unreachable(&self, net_id: i32) -> bool {
+        !self.has_valid_addresses()
+            || self.net_id != Some(net_id)
+            || !matches!(self.version, Some(v) if v != 0)
+    }
+
     /// Первый NTCP2-адрес для v4.
     #[must_use]
     pub fn ntcp2_v4_address(&self) -> Option<&I2PAddress> {
@@ -1195,6 +1261,19 @@ impl FullRouterInfo {
     #[must_use]
     pub const fn ident_hash(&self) -> &IdentHash {
         self.identity.ident_hash()
+    }
+
+    /// Недостижим ли роутер для нашей сети — см.
+    /// [`RouterInfo::is_unreachable`].
+    #[must_use]
+    pub fn is_unreachable(&self, net_id: i32) -> bool {
+        self.body.is_unreachable(net_id)
+    }
+
+    /// Есть ли у роутера хоть один адрес с рабочим транспортом.
+    #[must_use]
+    pub fn has_valid_addresses(&self) -> bool {
+        self.body.has_valid_addresses()
     }
 
     /// Собирает полный `RouterInfo` из приватных ключей и тела.

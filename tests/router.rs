@@ -312,6 +312,12 @@ fn foreign_ri(floodfill: bool) -> (IdentHash, Vec<u8>) {
     let body = RouterInfo::builder()
         .timestamp(NOW_MS)
         .caps(RouterInfoCaps::parse(caps))
+        // Без `netId` и `router.version` i2pd-правила достижимости
+        // (`RouterInfo.cpp:508`) пометили бы RI недостижимым, и он не
+        // участвовал бы ни в выборе флудфиллов, ни в ответах на
+        // `DatabaseLookup`.
+        .version(970)
+        .net_id(2)
         .add_address(addr)
         .build();
     let ri = FullRouterInfo::from_keys(&keys, body).expect("ri");

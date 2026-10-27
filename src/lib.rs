@@ -108,7 +108,7 @@ pub use lease_set2::{
 pub use lsdb::{
     LEASE_ENDDATE_THRESHOLD_MS, Lsdb, LsdbEntry, LsdbOutcome, MAX_LS_BUFFER_SIZE, MAX_LSDB_BYTES,
 };
-pub use netdb::NetDb;
+pub use netdb::{AcceptAllReachability, I2pdReachability, NetDb, Reachability};
 pub use ntcp2::Ntcp2Local;
 pub use ntcp2_pool::{Ntcp2Pool, Ntcp2Timers, PoolEvent};
 pub use private_keys::I2PPrivateKeys;
@@ -122,7 +122,9 @@ pub use router_context::{RouterContext, StoreHandling};
 pub use router_info::{
     Congestion, MAX_RI_BUFFER_SIZE, RouterInfo, RouterInfoCaps, extract_param, extract_string,
 };
-pub use router_info_address::{I2PAddress, Introducer, SsuExt, TransportStyle};
+pub use router_info_address::{
+    CompatibleTransports, I2PAddress, Introducer, SsuExt, TransportStyle,
+};
 pub use short_tunnel_build::{SHORT_TUNNEL_BUILD_HEADER_SIZE, ShortTunnelBuildBody};
 pub use signature::{CryptoKeyType, SigningKeyType};
 pub use ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool};

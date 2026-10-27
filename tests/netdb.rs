@@ -3,21 +3,22 @@ mod tests {
     use std::collections::HashSet;
 
     use uu_i2p::{
-        I2PTag, IdentHash, NetDb,
+        I2PAddress, I2PTag, IdentHash, NetDb,
         netdb::xor_distance,
         private_keys::I2PPrivateKeys,
         router_info::{FullRouterInfo, RouterInfo, RouterInfoCaps},
     };
 
+    /// Собирает «достижимый по правилам i2pd» RI: опубликованный
+    /// NTCP2-адрес, `netId` и `router.version`.
+    ///
+    /// Иначе `I2pdReachability` (дефолт [`NetDb`]) отбросил бы такой RI
+    /// из выбора флудфиллов и ответов на `DatabaseLookup` — см.
+    /// `RouterInfo.cpp:508`.
     fn make_ri(seed: u8, timestamp: u64, floodfill: bool) -> FullRouterInfo {
-        // Детерминированный ключ: seed подмешиваем в Ed25519 seed.
-        let mut ed_seed = [0u8; 32];
-        ed_seed[0] = seed;
-        ed_seed[31] = 0xAA;
         let keys = I2PPrivateKeys::generate_default().unwrap();
-        // Используем `keys` как есть — идентичность разная из-за rand.
-        // Для тестов netDb важен только уникальный IdentHash.
-        let _ = ed_seed;
+        // Идентичность разная из-за rand; `seed` нужен только чтобы у
+        // вызывающего было чем различать RI в отладочном выводе.
         let _ = seed;
 
         let caps = if floodfill {
@@ -28,6 +29,31 @@ mod tests {
         let body = RouterInfo::builder()
             .timestamp(timestamp)
             .caps(caps)
+            .version(970)
+            .net_id(2)
+            .add_address(I2PAddress::ntcp2_published(
+                "127.0.0.1".parse().unwrap(),
+                9000,
+                I2PTag::from_array([0x11; 32]),
+                [0x22; 16],
+            ))
+            .build();
+        FullRouterInfo::from_keys(&keys, body).unwrap()
+    }
+
+    /// RI без единого адреса — i2pd считает такой недостижимым.
+    fn make_unreachable_ri(timestamp: u64, floodfill: bool) -> FullRouterInfo {
+        let keys = I2PPrivateKeys::generate_default().unwrap();
+        let caps = if floodfill {
+            RouterInfoCaps::parse(b"fR")
+        } else {
+            RouterInfoCaps::parse(b"R")
+        };
+        let body = RouterInfo::builder()
+            .timestamp(timestamp)
+            .caps(caps)
+            .version(970)
+            .net_id(2)
             .build();
         FullRouterInfo::from_keys(&keys, body).unwrap()
     }
@@ -318,5 +344,108 @@ mod tests {
         for (h, ri) in db.iter() {
             assert_eq!(db.get(h).unwrap().ident_hash(), ri.ident_hash());
         }
+    }
+
+    // ---- достижимость ---------------------------------------------------
+
+    #[test]
+    fn reachable_ri_has_valid_addresses_and_transport_mask() {
+        let ri = make_ri(1, 100, false);
+        assert!(ri.has_valid_addresses());
+        assert!(!ri.is_unreachable(2));
+        assert_eq!(
+            ri.body().reachable_transports().bits(),
+            uu_i2p::CompatibleTransports::NTCP2_V4.bits()
+        );
+    }
+
+    #[test]
+    fn ri_without_addresses_is_unreachable() {
+        let ri = make_unreachable_ri(100, true);
+        assert!(!ri.has_valid_addresses());
+        assert!(ri.is_unreachable(2));
+    }
+
+    #[test]
+    fn foreign_net_id_is_unreachable() {
+        let keys = I2PPrivateKeys::generate_default().unwrap();
+        let body = RouterInfo::builder()
+            .timestamp(100)
+            .caps(RouterInfoCaps::parse(b"R"))
+            .version(970)
+            .net_id(42)
+            .add_address(I2PAddress::ntcp2_published(
+                "127.0.0.1".parse().unwrap(),
+                9000,
+                I2PTag::from_array([0x11; 32]),
+                [0x22; 16],
+            ))
+            .build();
+        let ri = FullRouterInfo::from_keys(&keys, body).unwrap();
+        assert!(ri.is_unreachable(2));
+        assert!(!ri.is_unreachable(42));
+    }
+
+    #[test]
+    fn missing_router_version_is_unreachable() {
+        let keys = I2PPrivateKeys::generate_default().unwrap();
+        let body = RouterInfo::builder()
+            .timestamp(100)
+            .caps(RouterInfoCaps::parse(b"R"))
+            .net_id(2)
+            .add_address(I2PAddress::ntcp2_published(
+                "127.0.0.1".parse().unwrap(),
+                9000,
+                I2PTag::from_array([0x11; 32]),
+                [0x22; 16],
+            ))
+            .build();
+        let ri = FullRouterInfo::from_keys(&keys, body).unwrap();
+        assert!(ri.is_unreachable(2));
+    }
+
+    #[test]
+    fn closest_routers_skips_unreachable() {
+        let mut db = NetDb::new();
+        db.insert(make_ri(1, 100, false));
+        let bad = make_unreachable_ri(100, false);
+        let bad_hash = *bad.ident_hash();
+        db.insert(bad);
+
+        assert_eq!(db.unreachable(&bad_hash), Some(true));
+        let picked = db.closest_routers(&ident(0), 5);
+        assert_eq!(picked.len(), 1);
+        assert_ne!(*picked[0].ident_hash(), bad_hash);
+    }
+
+    #[test]
+    fn closest_floodfills_skips_unreachable() {
+        let mut db = NetDb::new();
+        db.insert(make_ri(1, 100, true));
+        db.insert(make_unreachable_ri(100, true));
+
+        let floods = db.closest_floodfills(&ident(0), 5);
+        assert_eq!(floods.len(), 1);
+        assert!(floods[0].has_valid_addresses());
+    }
+
+    #[test]
+    fn accept_all_reachability_keeps_synthetic_ris() {
+        let mut db = NetDb::with_reachability(uu_i2p::AcceptAllReachability);
+        db.insert(make_unreachable_ri(100, true));
+        db.insert(make_unreachable_ri(100, false));
+
+        assert_eq!(db.closest_routers(&ident(0), 5).len(), 2);
+        assert_eq!(db.closest_floodfills(&ident(0), 5).len(), 1);
+        for (h, _) in db.iter() {
+            assert_eq!(db.unreachable(h), Some(false));
+        }
+    }
+
+    #[test]
+    fn net_db_for_foreign_network_rejects_default_ris() {
+        let mut db = NetDb::with_net_id(42);
+        db.insert(make_ri(1, 100, true));
+        assert_eq!(db.closest_floodfills(&ident(0), 5).len(), 0);
     }
 }

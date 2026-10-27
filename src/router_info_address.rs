@@ -466,3 +466,171 @@ impl I2PAddress {
         }
     }
 }
+
+// --- совместимые транспорты ---------------------------------------------
+
+/// Маска «какими транспортами и в каком семействе нас можно достать».
+///
+/// Порт `CompatibleTransports` из `RouterInfo.hpp`: те же биты, чтобы
+/// один в один повторять решения i2pd (`m_SupportedTransports`,
+/// `m_PublishedTransports`, `m_ReachableTransports`).
+///
+/// Mesh-семейство (Yggdrasil, `eNTCP2V6Mesh`) объявлено, но у нас пока
+/// не выставляется: распознавания `200::/7` в порте нет.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CompatibleTransports(u8);
+
+impl CompatibleTransports {
+    /// Пустая маска.
+    pub const NONE: Self = Self(0);
+    /// NTCP2, IPv4.
+    pub const NTCP2_V4: Self = Self(0x01);
+    /// NTCP2, IPv6.
+    pub const NTCP2_V6: Self = Self(0x02);
+    /// SSU2, IPv4.
+    pub const SSU2_V4: Self = Self(0x04);
+    /// SSU2, IPv6.
+    pub const SSU2_V6: Self = Self(0x08);
+    /// NTCP2 по Yggdrasil-адресу (mesh).
+    pub const NTCP2_V6_MESH: Self = Self(0x10);
+
+    /// Маска пуста.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Все биты `other` выставлены и здесь.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Сырые биты (для логов и сравнений).
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Пересекаются ли маски: хотя бы один общий транспорт.
+    ///
+    /// `RouterInfo::IsCompatible` в i2pd.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl std::ops::BitOr for CompatibleTransports {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for CompatibleTransports {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl std::fmt::Display for CompatibleTransports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = [
+            (Self::NTCP2_V4, "NTCP2v4"),
+            (Self::NTCP2_V6, "NTCP2v6"),
+            (Self::SSU2_V4, "SSU2v4"),
+            (Self::SSU2_V6, "SSU2v6"),
+            (Self::NTCP2_V6_MESH, "NTCP2v6-mesh"),
+        ];
+        let mut first = true;
+        for (bit, name) in names {
+            if self.contains(bit) {
+                if !first {
+                    f.write_str("|")?;
+                }
+                f.write_str(name)?;
+                first = false;
+            }
+        }
+        if first {
+            f.write_str("none")?;
+        }
+        Ok(())
+    }
+}
+
+impl I2PAddress {
+    /// Транспорты, которыми адрес **в принципе** достижим.
+    ///
+    /// Соответствует накоплению `supportedTransports` в
+    /// `RouterInfo::ReadFromBuffer` (`RouterInfo.cpp:360-420`):
+    ///
+    /// - NTCP2: опубликованный адрес даёт семейство по `host`,
+    ///   неопубликованный — по `caps`, а без `caps` считается v4
+    ///   («most likely, since we don't have host»);
+    /// - SSU2: семейства по `caps`/`host`; адрес без `host` не
+    ///   публикуется, но остаётся достижимым через introducer'ы.
+    ///
+    /// Ключи (`s`, `i`) и `v=2` уже проверены при разборе RI: адрес с
+    /// битыми ключами до нас не доходит (в i2pd такой адрес живёт с
+    /// `transportStyle = eTransportUnknown` и в маску не попадает).
+    #[must_use]
+    pub fn supported_transports(&self) -> CompatibleTransports {
+        match self.transport_style {
+            TransportStyle::Ntcp2 => {
+                if self.published {
+                    if self.host.is_ipv6() {
+                        CompatibleTransports::NTCP2_V6
+                    } else {
+                        CompatibleTransports::NTCP2_V4
+                    }
+                } else if self.is_v4() {
+                    CompatibleTransports::NTCP2_V4
+                } else if self.is_v6() {
+                    CompatibleTransports::NTCP2_V6
+                } else {
+                    // i2pd: «most likely, since we don't have host».
+                    CompatibleTransports::NTCP2_V4
+                }
+            }
+            TransportStyle::Ssu2 => {
+                let mut mask = CompatibleTransports::NONE;
+                if self.is_v4() {
+                    mask |= CompatibleTransports::SSU2_V4;
+                }
+                if self.is_v6() {
+                    mask |= CompatibleTransports::SSU2_V6;
+                }
+                mask
+            }
+            TransportStyle::Unknown => CompatibleTransports::NONE,
+        }
+    }
+
+    /// Транспорты, **опубликованные** в RI (`m_PublishedTransports`).
+    ///
+    /// Неопубликованный адрес (без `host`/`port`) в эту маску не
+    /// попадает, даже если транспорт поддерживается.
+    #[must_use]
+    pub fn published_transports(&self) -> CompatibleTransports {
+        if self.published {
+            self.supported_transports()
+        } else {
+            CompatibleTransports::NONE
+        }
+    }
+
+    /// Транспорты, которыми адрес реально достижим
+    /// (`m_ReachableTransports`): опубликован или есть introducer'ы.
+    #[must_use]
+    pub fn reachable_transports(&self) -> CompatibleTransports {
+        let published = self.published_transports();
+        if published.is_empty() && self.is_ssu2() && self.uses_introducer() {
+            self.supported_transports()
+        } else {
+            published
+        }
+    }
+}
