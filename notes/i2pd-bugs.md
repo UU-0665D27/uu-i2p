@@ -7,7 +7,7 @@
 
 Пункты 1-4 найдены на HEAD `7ab983ac`, пункты 5-11 — на `79ae673d`,
 пункт 12 — на `5bcf6101` (там же он и исправлен), пункт 13 — на
-`3.0.0-40-g67714be7` (не исправлен). При обновлении зеркала до
+`3.0.0-40-g67714be7` (исправлен в `bbfd3485`). При обновлении зеркала до
 `5bcf6101` (2026-10-25) статусы 1-11 перепроверены по diff'у: в
 `9725b8b2..5bcf6101` менялись только `libi2pd/Signature.cpp`,
 `libi2pd_client/Torrents*`, `Makefile.linux` и UPnP-патч, ни один из
@@ -374,9 +374,20 @@
   invalid when saved packet gets handled»). Для **известного** потока
   (`m_IncomingStreams`/`m_Streams`) вызов идёт напрямую в
   `Stream::HandleNextPacket`, обнуления нет — дыра остаётся.
-- Фикс в i2pd: не исправлено на `3.0.0-40-g67714be7` (issue #2617).
+- Фикс в i2pd: **`bbfd3485`** («reset from before saving packet»,
+  `3.0.0-41-gbbfd3485`) — `Stream::SavePacket` теперь первым делом делает
+  `packet->from = nullptr;` (плюс `insert` → `emplace`, для
+  `std::set<Packet*>` это косметика). Проверено живьём на том же PoC:
+  ASan-отчётов нет, вместо UAF в логе
+  `Streaming: Process seqn=2, flags=2` →
+  `Streaming: Missing signature` → `closing stream ... status=5`.
+  Побочный эффект: у сохранённого CLOSE/RESET `verified` остаётся
+  `false`, поэтому легитимное «отложенное» закрытие идёт не по
+  graceful-ветке, а по отказу (`Missing signature` +
+  `Unexpected stream status=5`). Поток всё равно завершается, но
+  static-ключ больше не сверяется, а лог шумит `error`/`warn`.
 - Репро: `examples/uu-i2p-poc-i2pd-streaming-uaf.rs`. Снятый трейс
-  (i2pd `3.0.0-40-g67714be7`, ASan+UBSan):
+  до фикса (i2pd `3.0.0-40-g67714be7`, ASan+UBSan):
 
   ```text
   ERROR: AddressSanitizer: heap-use-after-free ... READ of size 32

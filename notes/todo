@@ -57,7 +57,11 @@ grep -n "andNextDay" /home/u_uu/FOR_LLM/libi2pd/NetDb.cpp
 Сделано: `src/streaming.rs` (кодек `StreamingPacket`, обёртка I2NP
 `Data`), `tests/streaming.rs`, `examples/uu-i2p-poc-i2pd-streaming-uaf.rs`.
 Живой прогон подтвердил `heap-use-after-free` в `Stream::ProcessOptions`
-(`Streaming.cpp:578`) — см. `notes/i2pd-bugs.md` §13.
+(`Streaming.cpp:578`) — см. `notes/i2pd-bugs.md` §13. Баг закрыт
+апстримом в `bbfd3485` (`SavePacket` обнуляет `packet->from`); PoC
+перепроверен на `3.0.0-41-gbbfd3485` — UAF не воспроизводится,
+отложенный CLOSE уходит в `Missing signature` + `Unexpected stream
+status=5`.
 
 ## Что мешало дойти до NS (и как обошли)
 
