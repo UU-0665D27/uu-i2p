@@ -60,6 +60,7 @@ pub mod ssu2_send;
 pub mod ssu2_session;
 pub mod ssu2_timers;
 pub mod ssu2_token;
+pub mod streaming;
 pub mod tag;
 pub mod timestamp;
 pub mod transport_ban;
@@ -128,6 +129,9 @@ pub use router_info_address::{
 pub use short_tunnel_build::{SHORT_TUNNEL_BUILD_HEADER_SIZE, ShortTunnelBuildBody};
 pub use signature::{CryptoKeyType, SigningKeyType};
 pub use ssu2_pool::{Ssu2Event, Ssu2Local, Ssu2Pool};
+pub use streaming::{
+    DataMessage, StreamingPacket, unwrap_data_message, wrap_data_message,
+};
 pub use tag::{I2PAesKey, I2PTag, IdentHash, SessionTag};
 pub use transport_ban::{BanList, IP_BAN_TIME_MS, IP_BAN_TIME_VARIANCE_MS};
 pub use tunnel_build_crypto::{GarlicReplyKeys, HopCrypto, RecordKeys};
