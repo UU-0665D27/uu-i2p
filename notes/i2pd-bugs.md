@@ -6,7 +6,8 @@
 коммитов и заметок.
 
 Пункты 1-4 найдены на HEAD `7ab983ac`, пункты 5-11 — на `79ae673d`,
-пункт 12 — на `5bcf6101` (там же он и исправлен). При обновлении зеркала до
+пункт 12 — на `5bcf6101` (там же он и исправлен), пункт 13 — на
+`3.0.0-40-g67714be7` (не исправлен). При обновлении зеркала до
 `5bcf6101` (2026-10-25) статусы 1-11 перепроверены по diff'у: в
 `9725b8b2..5bcf6101` менялись только `libi2pd/Signature.cpp`,
 `libi2pd_client/Torrents*`, `Makefile.linux` и UPnP-патч, ни один из
@@ -333,6 +334,94 @@
   `get0`.
 
 ---
+
+## 13. Streaming: `packet->from` — use-after-free при CLOSE/RESET из сохранённого пакета (crash)
+
+- Файл: `libi2pd/Streaming.cpp`, `Stream::ProcessOptions` (CLOSE/RESET-ветка,
+  строка 578) + `Stream::SavePacket` (406).
+- Что не так: `SavePacket` кладёт `Packet*` в `m_SavedPackets` вместе с
+  `packet->from` — **сырым** указателем на
+  `ECIESX25519AEADRatchetSession`. Сессия живёт только на время
+  `GarlicDestination::HandleGarlicMessage` (`Garlic.cpp:550`, локальный
+  `shared_ptr` умирает на выходе). Когда отложенный пакет позже достаёт
+  цикл `Stream::HandleNextPacket` (301-310), `ProcessOptions` для флагов
+  CLOSE/RESET делает `packet->from->GetRemoteStaticKey()` на уже
+  освобождённой сессии.
+- Триггер (все условия обязательны):
+  1. у потокового destination'а i2pd уже есть **живая** сессия S2 с нашим
+     static-ключом (`ECIESX25519_RESTART_TIMEOUT` = 120 c ещё не вышло);
+  2. приходит garlic с **New Session** от того же static-ключа: i2pd
+     создаёт одноразовую сессию S, `AddECIESx25519Session`
+     (`Garlic.cpp:1108`) видит S2, `CanBeRestarted()` = false, пишет
+     `ECIESx25519 session with static key ... already exists` и делает
+     `return`, **не сохраняя S**;
+  3. внутри этого NS лежит clove `I2NP Data` со streaming-пакетом с
+     «дыркой» по seqn (например `seqn=2 | FLAG_CLOSE` при ожидаемом 1) —
+     `HandlePayload` обрабатывает его несмотря на отказ, а S идёт в
+     `packet->from`;
+  4. NS должен прийти не раньше `INCOMING_SESSIONS_MINIMAL_INTERVAL`
+     = 200 мс после предыдущего входящего NS (`Garlic.h:58`), иначе он
+     вообще не разбирается (`Garlic: Incoming sessions come too often`);
+  5. по живой S2 приходит пакет с закрывающим дырку seqn — срабатывает
+     цикл сохранённых пакетов и читается освобождённая S.
+- Последствие: чтение 32 байт из освобождённой кучи; под ASan —
+  `heap-use-after-free` в `memcmp`, без ASan — сравнение с мусором
+  (ложный `Remote LeaseSet static key mismatch`/рассинхрон состояния) и
+  потенциальный remote-crash.
+- Почему не спасает соседняя ветка: в `StreamingDestination::HandleNextPacket`
+  (`Streaming.cpp:2331`) перед сохранением пакета для **неизвестного**
+  потока стоит `packet->from = nullptr;` (комментарий «session might be
+  invalid when saved packet gets handled»). Для **известного** потока
+  (`m_IncomingStreams`/`m_Streams`) вызов идёт напрямую в
+  `Stream::HandleNextPacket`, обнуления нет — дыра остаётся.
+- Фикс в i2pd: не исправлено на `3.0.0-40-g67714be7` (issue #2617).
+- Репро: `examples/uu-i2p-poc-i2pd-streaming-uaf.rs`. Снятый трейс
+  (i2pd `3.0.0-40-g67714be7`, ASan+UBSan):
+
+  ```text
+  ERROR: AddressSanitizer: heap-use-after-free ... READ of size 32
+      #0 memcmp
+      #2 Stream::ProcessOptions            Streaming.cpp:578
+      #3 Stream::ProcessPacket             Streaming.cpp:418
+      #4 Stream::HandleNextPacket          Streaming.cpp:304
+      #6 StreamingDestination::HandleDataMessagePayload  Streaming.cpp:2532
+  0x... is located 202 bytes inside of 544-byte region ...
+  freed by thread T20 here:
+      #12 GarlicDestination::HandleGarlicMessage  Garlic.cpp:550
+  ```
+
+  Плюс UBSan до ASan:
+  `Streaming.cpp:578:32: runtime error: member call on address ... which
+  does not point to an object of type 'ECIESX25519AEADRatchetSession'`.
+
+### Как воспроизвести (ран-бук)
+
+Нужен destination i2pd, который сам пойдёт на наш адрес, — HTTP-прокси
+стенда. Со стороны uu-i2p POC играет сервер D и флудфилл:
+
+```sh
+# 1. чистый стенд, лог в файл (ASan пишет в stderr!)
+~/.local/opt/i2pd-uu/run-ssu2.sh > /tmp/opencode/i2pd-ssu2.log 2>&1 &
+
+# 2. наполнить netDb: без ~20 роутеров i2pd не публикует LS destination'а
+#    и не доходит до LeaseSet-lookup. Соседи — НЕ флудфиллы, иначе
+#    GetClosestFloodfill уводит lookup от POC к соседу.
+for i in $(seq 1 50); do
+    UU_I2P_FLOODFILL=0 UU_I2P_SECS=1800 \
+    UU_I2P_LIVE_RI=~/.local/opt/i2pd-uu/datadir/router.info \
+    UU_I2P_LIVE_SSU2=127.0.0.1:12345 \
+        target/debug/examples/uu-i2p-router-i2pd >/dev/null 2>&1 &
+done
+
+# 3. POC и запрос через прокси
+UU_I2P_LIVE_RI=~/.local/opt/i2pd-uu/datadir/router.info \
+UU_I2P_LIVE_SSU2=127.0.0.1:12345 \
+    target/debug/examples/uu-i2p-poc-i2pd-streaming-uaf &
+curl -x http://127.0.0.1:4445 --max-time 30 http://<b32-адрес из вывода POC>/
+```
+
+Что должно быть в логе: `ECIESx25519 session with static key ... already
+exists`, затем `Streaming: Process seqn=2, flags=2` и ASan-трейс.
 
 ## Шаблон новой записи
 

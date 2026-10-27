@@ -47,3 +47,60 @@ grep -n "andNextDay" /home/u_uu/FOR_LLM/libi2pd/NetDb.cpp
   `RouterContext::build_lookup_reply`.
 - Суточная выборка exploratory-не-флудфиллов (`m_ExploratorySelection` в
   i2pd) — у нас всё ещё линейный `closest_to`.
+
+---
+
+# Итерация 2026-10-27: PoC для i2pd #2617 (streaming UAF)
+
+## Статус
+
+Сделано: `src/streaming.rs` (кодек `StreamingPacket`, обёртка I2NP
+`Data`), `tests/streaming.rs`, `examples/uu-i2p-poc-i2pd-streaming-uaf.rs`.
+Живой прогон подтвердил `heap-use-after-free` в `Stream::ProcessOptions`
+(`Streaming.cpp:578`) — см. `notes/i2pd-bugs.md` §13.
+
+## Что мешало дойти до NS (и как обошли)
+
+- i2pd не публикует LeaseSet destination'а и не шлёт LeaseSet-lookup,
+  пока в netDb мало роутеров. Рабочий порог — ~20: поднимаем 50
+  соседей `examples/uu-i2p-router-i2pd`.
+- Соседи не должны быть флудфиллами (`UU_I2P_FLOODFILL=0`): иначе
+  `NetDb::GetClosestFloodfill` выбирает их, и lookup за нашим LS уходит
+  к соседу (`Destination: ... was not found on 7 floodfills`), а не к PoC.
+- i2pd присылает `DatabaseLookup` за LeaseSet **garlic'ом** с
+  `reply_tunnel` и зашифрованным ответом, а exploratory-lookup'ы —
+  прямым I2NP без туннеля. Обрабатывать нужно обе ветки.
+- Static-ключ destination'а i2pd берётся из самого NS
+  (`HandleResult::remote_static`), а не из `LeaseSet`'а: в LS лежит
+  ключ другого криптотипа, и `encryption_public_key()` не 32 байта.
+- ASan пишет в **stderr**: при `--log=file` его всё равно надо
+  перенаправлять в файл (`i2pd ... 2>&1 | tee log`).
+
+## Grep-выражения для следующей итерации
+
+```sh
+# наш кодек и PoC
+grep -rn "StreamingPacket\|wrap_data_message" src tests examples
+grep -rn "FLAG_CLOSE\|FLAG_SYNCHRONIZE" src examples
+
+# эталон i2pd
+grep -n "void Stream::SavePacket" -A5 /home/u_uu/FOR_LLM/libi2pd/Streaming.cpp
+grep -n "packet->from = nullptr" /home/u_uu/FOR_LLM/libi2pd/Streaming.cpp
+grep -n "void Stream::ProcessOptions" -A50 /home/u_uu/FOR_LLM/libi2pd/Streaming.cpp
+grep -n "void Stream::HandleNextPacket" -A200 /home/u_uu/FOR_LLM/libi2pd/Streaming.cpp
+grep -n "m_SavedPackets" /home/u_uu/FOR_LLM/libi2pd/Streaming.cpp
+grep -n "already exists" -B10 -A5 /home/u_uu/FOR_LLM/libi2pd/Garlic.cpp
+grep -n "INCOMING_SESSIONS_MINIMAL_INTERVAL" /home/u_uu/FOR_LLM/libi2pd/Garlic.h
+grep -n "ECIESX25519_RESTART_TIMEOUT" /home/u_uu/FOR_LLM/libi2pd/ECIESX25519AEADRatchetSession.cpp
+
+# чем наполнять netDb стенда
+UU_I2P_FLOODFILL=0 target/debug/examples/uu-i2p-router-i2pd ...
+```
+
+## Остаётся на потом
+
+- Соседи по стенду набивают netDb только своими RI; для чистого
+  воспроизведения стоит сделать один пример-«рой» (N роутеров в одном
+  процессе) вместо 50 форков.
+- Проверить, воспроизводится ли UAF без UBSan-сообщения (только ASan) на
+  релизной сборке i2pd — сейчас стенд всегда asan+ubsan.
