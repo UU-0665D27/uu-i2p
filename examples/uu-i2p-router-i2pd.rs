@@ -438,7 +438,10 @@ impl LocalRouter {
             .ntcp2_keys(ntcp2_static, [0x42; 16])
             .listen_ssu2_published(addr, IpAddr::V4(Ipv4Addr::LOCALHOST))
             .ssu2_intro_key(intro)
-            .floodfill(true)
+            // `UU_I2P_FLOODFILL=0` — сосед для POC-стенда: набивает netDb
+            // i2pd, но не перебивает наш флудфилл в `m_Floodfills`,
+            // иначе `GetClosestFloodfill` уводит LeaseSet-lookup к соседу.
+            .floodfill(std::env::var("UU_I2P_FLOODFILL").map_or(true, |v| v != "0"))
             .allow_reserved_advertise(true);
         if let Some(ntcp2_addr) = ntcp2_listen_addr {
             builder = builder.listen_published(ntcp2_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
